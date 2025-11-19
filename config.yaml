@@ -1,0 +1,20 @@
+Postgres:
+  port: 5432
+  username: your_username
+  password: your_password
+  database: your_database
+
+Snowflake:
+  account: your_account
+  user: your_user
+  password: your_password
+  warehouse: your_warehouse
+  database: your_database
+  schema: your_schema
+
+dbt_output_path: C:\Users\Max\Github\proigia_dbt\models\dm_dash_new
+dbt_macro_path: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new
+
+ignored_keywords:
+  - aggregate
+  - column_properties
