@@ -4,6 +4,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.snowflake import Snowflake
 
+from code.functions.crosstabs import parse_crosstab_sql
+
 
 # ---- Custom Dialect Definition ----
 class FixedSnowflake(Snowflake):
@@ -145,22 +147,21 @@ def convert_unnest_array_to_values(sql: str) -> str:
 
 def handle_crosstab(sql: str) -> str:
     """
-    Comment out the entire crosstab block using a Jinja comment, replacing any inner Jinja or SQL comments with SQL comments.
+    Replace crosstab block with a dbt-compatible crosstab SQL using parse_crosstab_sql.
     """
-    # Find the start of the crosstab block
-    start_idx = sql.lower().find('select * from')
-    if start_idx == -1:
-        start_idx = 0
-    # Find the end of the crosstab block (first closing parenthesis and semicolon after 'as (')
-    end_idx = sql.find(');', start_idx)
-    if end_idx == -1:
-        end_idx = len(sql)
-    else:
-        end_idx += 2  # include the ');'
-    # Delete everything inside the crosstab block and replace with a warning comment
-    commented = "{# WARNING: crosstab() not supported for compilation, block deleted for dbt compile #}"
-    # Return the commented block plus any remaining SQL after the crosstab
-    return sql[:start_idx] + commented + sql[end_idx:]
+
+    # Remove all -- comments before parsing
+    sql_no_comments = re.sub(r'--[^\n]*', '', sql)
+    print("Crosstab function detected, converting to dbt-compatible SQL.")
+    print(sql_no_comments)
+    try:
+        converted_sql = parse_crosstab_sql(sql_no_comments)
+        print("Converted crosstab SQL:")
+        print(converted_sql)
+        return converted_sql
+    except Exception as e:
+        print(f"[WARNING] Error in parse_crosstab_sql: {e}")
+        return "{# WARNING: crosstab() block could not be converted, skipped for dbt compile #}"
 
 def convert_generate_series_to_snowflake(sql: str) -> str:
     """
