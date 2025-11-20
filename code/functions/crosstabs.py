@@ -12,6 +12,7 @@ def parse_crosstab_sql(sql_content: str):
     pattern_3 = r'SELECT(.*?)FROM'      # between SELECT and FROM
     pattern_4 = r'FROM(.*?)ORDER'       # between FROM and ORDER
     pattern_5 = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\b(?!\s*\.|\s*\(|::)'
+    pattern_6 = r'(WITH\s+.*\))\s*(?=SELECT|FROM|$)' # Ten behoeve van het WITH statement 
 
     # Extract statements
     statements = re.findall(pattern_1, sql_content, re.DOTALL)
@@ -24,14 +25,22 @@ def parse_crosstab_sql(sql_content: str):
     if 'JOIN' in pivot_statement.upper():
             print("Unsupported JOIN found in pivot_statement.")
             return ''
-    if 'WITH' in cte_statement.upper() or 'DISTINCT ON (' in cte_statement.upper():
-            print("Unsupported WITH clause or DISTINCT ON found in cte_statement.")
-            return ''
 
     # Extract pivot column and from statements safely
     m_pivot_col = re.search(pattern_3, pivot_statement, re.IGNORECASE | re.DOTALL)
     if not m_pivot_col:
         return ''
+    
+    # Find WITH statement if present within the CROSSTAB satement
+    # If so, split the statement between the WITH-block and the SELECT-block
+    m_with_match = re.search(pattern_6, cte_statement, re.IGNORECASE | re.DOTALL)
+    if m_with_match:
+        with_statement = m_with_match.group(1)
+        # Remove the WITH block from cte_statement to get just the SELECT part
+        cte_statement = cte_statement[m_with_match.end():].strip()
+    else:
+        with_statement = None
+
     pivot_col = m_pivot_col.group(1).strip()
     m_from_statements = re.search(pattern_4, pivot_statement, re.IGNORECASE | re.DOTALL)
     if not m_from_statements:
@@ -103,19 +112,26 @@ def parse_crosstab_sql(sql_content: str):
     #Kolommen voor de select en group by:
     cols_to_select = list(set(input_cols) & set(output_cols))
     select_col = ''
-    for col in cols_to_select:
-        select_col += col + ', '
+    for idx, col in enumerate(cols_to_select):
+        if idx == len(cols_to_select) - 1:
+            select_col += col
+        else:
+            select_col += col + ', '
 
     table = re.findall(pattern_5, cte_statement, re.IGNORECASE | re.DOTALL)
 
-    for t in table:
-        cte_statement = cte_statement.replace(t[1], "{{ ref('" + t[1] + "') }}")
+    if with_statement:
+        cte_statement = with_statement + "\n ,cte1 AS (\n" + cte_statement + "\n)\n"
+    else: 
+        for t in table:
+            cte_statement = cte_statement.replace(t[1], "{{ ref('" + t[1] + "') }}")
+        cte_statement= "WITH cte1 AS (\n" + cte_statement + ")\n"
 
     # Remove trailing comma and space from select_col and group by
     select_col_clean = select_col.rstrip(', ').strip()
     # Build the actual dbt crosstab SQL statement
     dbt_sql = (
-        f"WITH cte1 AS (\n{cte_statement}\n)\n"
+        f"{cte_statement}"
         f"SELECT {select_col_clean}\n"
         f", {str_dbt_get_column_values}\n"
         f"FROM cte1\n"
