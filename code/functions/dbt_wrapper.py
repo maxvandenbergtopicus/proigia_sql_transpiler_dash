@@ -3,7 +3,7 @@ from typing import Any, Dict
 import re
 from code.functions.dialect_converter import convert_postgres_to_snowflake
 from code.functions.general import *
-
+import traceback
 
 def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=None) -> set:
     """Convert PRY file to dbt models.
@@ -138,6 +138,17 @@ def generate_dbt_model(
             "{%- set view_name = '" + view_name + "' %}",
             "{%- set praktijk_agb = var(\"praktijk_agb\", none) %}",
         ]
+        # Extract all external variables like ${varname} in the SQL
+        external_vars = set(re.findall(r'\$\{([a-zA-Z_][\w]*)\}', converted_sql))
+        # Exclude praktijk_agb (already set)
+        external_vars.discard('praktijk_agb')
+        # Add each as a dbt variable
+        for var in sorted(external_vars):
+            variables.append(f"{{%- set {var} = var(\"{var}\", none) %}}")
+        # First replace quoted '${varname}' or "${varname}" with unquoted dbt variable
+        converted_sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", lambda m: f"{{{{ var('{m.group(2)}', none) }}}}", converted_sql)
+        # Then replace any remaining unquoted ${varname}
+        converted_sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', lambda m: f"{{{{ var('{m.group(1)}', none) }}}}", converted_sql)
         if 'type' in view_metadata:
             variables.append("{%- set view_type = '" + view_metadata['type'] + "' %}")
         if 'displayname' in view_metadata:
@@ -170,7 +181,6 @@ def generate_dbt_model(
         print(f"[OK] Generated: {output_file}\n")
     except Exception as e:
         print(f"[ERROR] Error processing {view_name}: {e}")
-        import traceback
         traceback.print_exc()
 
 

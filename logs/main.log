@@ -1,5 +1,5 @@
 
---- Run started at 2025-11-19T14:26:13.682776 ---
+--- Run started at 2025-11-19T15:28:15.955064 ---
 
 Searching for PRY files in: C:\Users\Max\Github\proigia_definition
 [SKIPPED] aandachtspunten_copd_aggregate.pry (contains ignored keyword)
@@ -355,7 +355,7 @@ Found 803 PRY files to process
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\astma_praktijken_53530098.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\bbr_praktijken_53533085.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\doac_en_grenswaarde_nierfunctie.sql
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\episode_filter_peildatum.sql (creates: episode_filter_pre, pre_episode)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\episode_filter_peildatum.sql (creates: pre_episode, episode_filter_pre)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\gpri_copd_comorbidities_patientenlijst.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\gpri_copd_comorbidities_verzamel_doelgroepen.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\gpri_copd_comorbidities_verzamel_vertaling.sql
@@ -368,11 +368,11 @@ Found 803 PRY files to process
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medewerker_koppeling_medewerkerbeheer.sql (creates: medewerker_nieuw)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_combinatiepreparaten.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_einddatum_berekenen.sql
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_epa.sql (creates: med_epa_chronisch, med_filter)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_epa.sql (creates: med_filter, med_epa_chronisch)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_filter_ooit_peildatum.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_filter_peildatum.sql
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_polyfarmacy_peildatum.sql (creates: polyfarmacie_atc2, med_filter_1, chronische_medicatie, chron_atc_code, polyfarmacie_atc3, chron_atc3, chron_atc2, polyfarmacie_atc_code, polyfarmacie_atc4, chron_atc4, med_filter_2)
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\meetwaarden_filter_deel1_peildatum.sql (creates: meetwaarden, nhgnr_verrijking)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\medicatie_polyfarmacy_peildatum.sql (creates: chron_atc2, polyfarmacie_atc2, polyfarmacie_atc3, polyfarmacie_atc4, polyfarmacie_atc_code, med_filter_1, chronische_medicatie, chron_atc3, med_filter_2, chron_atc_code, chron_atc4)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\meetwaarden_filter_deel1_peildatum.sql (creates: nhgnr_verrijking, meetwaarden)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\meetwaarden_spiro_std_3jr.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\meetwaarden_spiro_std_jr.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\meetwaarden_verzameltabel_seg2.sql
@@ -380,7 +380,7 @@ Found 803 PRY files to process
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\nhg_cvrm_standaard_2024_dm_matig_verhoogd_risico.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\nhg_cvrm_standaard_2024_dm_microvasculaire_aandoeningen.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\nhg_cvrm_standaard_2024_dm_zeer_hoog_risico.sql
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\ongewenst_gewichtsverlies.sql (creates: laatste_1maand, gewicht_verschil, laatste_6maand, gewicht_pre)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\ongewenst_gewichtsverlies.sql (creates: gewicht_pre, laatste_1maand, gewicht_verschil, laatste_6maand)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\oproepagenda_covid_oproeplijst_pzg3.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\oproepagenda_covid_verzameltabel_pzg3.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\oproepagenda_medische_urgentie_oproeplijst.sql
@@ -416,7 +416,7 @@ Found 803 PRY files to process
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_basis_meetwaarden_seg2_externals.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_basis_override_externals.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_basis_seg2_externals.sql
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_contact_aanvulling.sql (creates: contacten_dubbel, contacten_nummering, contacten_elimineren, contacten_filter)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_contact_aanvulling.sql (creates: contacten_nummering, contacten_dubbel, contacten_filter, contacten_elimineren)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_fi_score_filter_3mt_aanvulling.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_fi_verzameltabel_aanvulling.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_fi_verzameltabel_ct.sql
@@ -425,8 +425,8 @@ Found 803 PRY files to process
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_journaal_filter.sql (creates: jr_clean)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_medicatie_ct.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_medicatie_ct_seg2.sql
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_medicatie_polyfarmacy.sql (creates: polyfarmacie_atc2, chron_atc_code, polyfarmacie_atc3, chron_atc3, chron_atc2, polyfarmacie_atc_code, polyfarmacie_atc4, chron_atc4)
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_medicatie_polyfarmacy_3mt.sql (creates: polyfarmacie_atc2, chron_atc_code, polyfarmacie_atc3, chron_atc3, chron_atc2, polyfarmacie_atc_code, polyfarmacie_atc4, chron_atc4)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_medicatie_polyfarmacy.sql (creates: chron_atc2, polyfarmacie_atc2, polyfarmacie_atc3, polyfarmacie_atc4, polyfarmacie_atc_code, chron_atc3, chron_atc_code, chron_atc4)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_medicatie_polyfarmacy_3mt.sql (creates: chron_atc2, polyfarmacie_atc2, polyfarmacie_atc3, polyfarmacie_atc4, polyfarmacie_atc_code, chron_atc3, chron_atc_code, chron_atc4)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_meetwaarden_ct.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_meetwaarden_ct_seg2.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\proigia_meetwaarden_filter_deel1.sql (creates: nhgnr_verrijking)
@@ -461,9 +461,9 @@ Found 803 PRY files to process
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_huisarts_deel1.sql (creates: vektis_type)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_huisarts_deel2.sql (creates: huisarts)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_huisarts_pre_deel1.sql (creates: medewerker, contact_nr)
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_huisarts_pre_deel2.sql (creates: verrichting_poh_ggz, soort_contact)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_huisarts_pre_deel2.sql (creates: soort_contact, verrichting_poh_ggz)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_poh_ggz.sql (creates: vektis_type)
-[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_poh_ggz_pre.sql (creates: soort_contact_poh_ggz, verrichting_poh_ggz)
+[OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\verrichting_poh_ggz_pre.sql (creates: verrichting_poh_ggz, soort_contact_poh_ggz)
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\zorggroepen_met_gescheiden_declaratie_cvrm.sql
 [OK] Block macro generated: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new\zorggroepen_met_gezamenlijke_declaratie_copdastma.sql
 
@@ -8489,5 +8489,5 @@ First 100 chars: {# Selectie: Patiënten met palliatieve zorg dienen te worden u
 [OK] Generated: C:\Users\Max\Github\proigia_dbt\models\dm_dash_new\zorg_op_de_juiste_plek_-_henz_gorinchem\zodjp_53533085_verwijzing.sql
 
 
---- Run finished at 2025-11-19T14:26:55.886327 ---
+--- Run finished at 2025-11-19T15:28:56.229764 ---
 
