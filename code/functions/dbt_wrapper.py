@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, Dict
 import re
+import logging
 from code.functions.dialect_converter import convert_postgres_to_snowflake
 from code.functions.general import *
 import traceback
@@ -35,12 +36,15 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         
         macro_file = macro_path / f"{block_name}.sql"
         macro_content = f"{{% macro {block_name}() %}}\n{converted_sql}\n{{% endmacro %}}\n"
-        macro_file.write_text(macro_content, encoding='utf-8')
+        
+        # Ensure file is overwritten by explicitly using open with 'w' mode
+        with open(macro_file, 'w', encoding='utf-8') as f:
+            f.write(macro_content)
         
         if created_tables:
-            print(f"[OK] Block macro generated: {macro_file} (creates: {', '.join(created_tables)})")
+            logging.info(f"[OK] Block macro generated: {macro_file} (creates: {', '.join(created_tables)})")
         else:
-            print(f"[OK] Block macro generated: {macro_file}")
+            logging.info(f"[OK] Block macro generated: {macro_file}")
         
         return created_tables
     else:
@@ -60,11 +64,11 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
             query = re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", query)
             view_name = extract_view_name_from_query(query)
             if not view_name:
-                print(f"Warning: Could not extract view name from query {i+1}")
+                logging.warning(f"Could not extract view name from query {i+1}")
                 continue
             view_metadata = next((rv for rv in reportviews if rv.get('name') == view_name), {})
             if view_metadata.get('external', False):
-                print(f"Skipping external view: {view_name}")
+                logging.info(f"Skipping external view: {view_name}")
                 continue
             generate_dbt_model(
                 view_name=view_name,
@@ -93,6 +97,7 @@ def generate_dbt_model(
     """
     
     try:
+        logging.debug(f"\n{'='*80}\nProcessing: {report_name} - {view_name}\n{'='*80}")
         # Preprocess SQL (handles comment conversion and includes)
         preprocessed = preprocess_sql(query)
         # Preserve dbt macro calls by replacing them with placeholders
@@ -112,7 +117,8 @@ def generate_dbt_model(
         converted_sql = re.sub(r'/\*', r'{#', converted_sql)
         converted_sql = re.sub(r'\*/', r'#}', converted_sql)
         # Single-line comments: -- ...  ->  {# ... #}
-        converted_sql = re.sub(r'--([^\n]*)', r'{# \1 #}', converted_sql)
+        # Only match the first -- on each line to avoid nested comments
+        converted_sql = re.sub(r'^(\s*)--(.*)$', r'\1{# \2 #}', converted_sql, flags=re.MULTILINE)
         # Check if actually converted
         if converted_sql == preprocessed:
             print("[WARNING] SQL was not modified during conversion")
@@ -145,10 +151,20 @@ def generate_dbt_model(
         # Add each as a dbt variable
         for var in sorted(external_vars):
             variables.append(f"{{%- set {var} = var(\"{var}\", none) %}}")
-        # First replace quoted '${varname}' or "${varname}" with unquoted dbt variable
-        converted_sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", lambda m: f"{{{{ var('{m.group(2)}', none) }}}}", converted_sql)
-        # Then replace any remaining unquoted ${varname}
-        converted_sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', lambda m: f"{{{{ var('{m.group(1)}', none) }}}}", converted_sql)
+        # First replace quoted '${varname}' or "${varname}" - keep quotes for datum variables to prevent arithmetic interpretation
+        def replace_quoted_var(m):
+            var_name = m.group(2)
+            if 'datum' in var_name.lower():
+                return f"'{{{{ {var_name} }}}}'"  # Keep quotes for dates
+            return f"{{{{ {var_name} }}}}"  # Remove quotes for others
+        converted_sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, converted_sql)
+        # Then replace any remaining unquoted ${varname} - add quotes if it's a datum variable
+        def replace_unquoted_var(m):
+            var_name = m.group(1)
+            if 'datum' in var_name.lower():
+                return f"'{{{{ {var_name} }}}}'"  # Add quotes for dates
+            return f"{{{{ {var_name} }}}}"
+        converted_sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', replace_unquoted_var, converted_sql)
         if 'type' in view_metadata:
             variables.append("{%- set view_type = '" + view_metadata['type'] + "' %}")
         if 'displayname' in view_metadata:
@@ -162,7 +178,7 @@ def generate_dbt_model(
             "{{",
             "  config(",
             f"    materialized='view',",
-            f"    tags=['{report_type}', 'report']"
+            f"    tags=['{report_type}', 'report', '{report_name.replace(' ', '_').lower()}']"
         ]
         # Add schema if needed
         if view_metadata.get('type') == 'supportview':
@@ -175,12 +191,16 @@ def generate_dbt_model(
         model_content = '\n'.join(variables) + '\n\n'
         model_content += '\n'.join(config_lines) + '\n\n'
         model_content += converted_sql
-        # Write to file
+        
+        # Write to file - ensure parent directory exists and file is overwritten
         output_file = output_dir / f"{view_name}.sql"
-        output_file.write_text(model_content, encoding='utf-8')
-        print(f"[OK] Generated: {output_file}\n")
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(model_content)
+        
+        logging.info(f"[OK] Generated: {output_file}")
     except Exception as e:
-        print(f"[ERROR] Error processing {view_name}: {e}")
+        logging.error(f"Error processing {view_name}: {e}")
         traceback.print_exc()
 
 
@@ -208,12 +228,42 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None) 
     sql_no_comments = re.sub(r'--[^\n]*', '', sql)
     sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
     sql_no_comments = re.sub(r'\{#.*?#\}', '', sql_no_comments, flags=re.DOTALL)
-    # Find all potential CTE definitions: word followed by AS (optionally with any number of extra words like MATERIALIZED)
-    for match in re.finditer(r'\b(\w+)\s*(?:\([^)]+\))?\s+AS(?:\s+\w+)*\s*\(', sql_no_comments, re.IGNORECASE):
+    logging.debug(f"SQL for CTE detection (first 500 chars): {sql_no_comments[:500]}")
+    # Find CTEs: only match "name AS (" pattern that comes after WITH keyword or after a comma in a WITH clause
+    # Pattern: WITH <cte_name> AS [MATERIALIZED] ( or , <cte_name> AS [MATERIALIZED] (
+    # Match: word, optional column list, AS, optional keywords like MATERIALIZED, then opening paren
+    # Important: Don't match function calls like array_accum(...) AS alias or listagg(...) AS alias
+    for match in re.finditer(r'\b(\w+)\s*(\([^)]+\))?\s+AS(?:\s+\w+)*\s*\(', sql_no_comments, re.IGNORECASE):
         potential_cte = match.group(1).lower()
-        # Exclude SQL keywords that might match this pattern
-        if potential_cte not in ['select', 'insert', 'update', 'delete', 'with', 'case']:
-            cte_names.add(potential_cte)
+        has_parens_before_as = match.group(2) is not None
+        
+        # Check if this appears to be after WITH or comma (indicating CTE context)
+        # Get position and look backwards for WITH or comma
+        start_pos = match.start()
+        preceding_text = sql_no_comments[max(0, start_pos-100):start_pos]
+        
+        logging.debug(f"CTE pattern matched: '{match.group(0)[:50]}...' -> potential CTE: '{potential_cte}'")
+        logging.debug(f"  Preceding text (last 80 chars): '{preceding_text[-80:]}'")
+        
+        # Only consider it a CTE if preceded by WITH [RECURSIVE] or comma in CTE context
+        # Allow for optional RECURSIVE keyword after WITH
+        if re.search(r'(WITH(?:\s+RECURSIVE)?|,)\s*$', preceding_text, re.IGNORECASE | re.DOTALL):
+            # If there are parentheses between the word and AS, check if it's in CTE context
+            # CTEs can have column definitions like: cte_name(col1, col2) AS (...)
+            # Functions are like: function_name(...) AS alias
+            # The key difference: CTEs are after WITH/comma, functions are in SELECT/other contexts
+            # Since we already confirmed it's after WITH/comma, treat parentheses as column list
+            if has_parens_before_as:
+                logging.debug(f"  Found column list for CTE: '{potential_cte}'")
+                
+            # Exclude SQL keywords that might match this pattern
+            if potential_cte not in ['select', 'insert', 'update', 'delete', 'with', 'case']:
+                cte_names.add(potential_cte)
+                logging.debug(f"  Added '{potential_cte}' to CTE list")
+        else:
+            logging.debug(f"  Skipped '{potential_cte}': not in CTE context (no WITH or comma before it)")
+    logging.debug(f"Final CTE names detected: {cte_names}")
+    logging.debug(f"Block tables passed in: {block_tables}")
     
     # Note: We only removed comments for CTE detection, the original SQL with comments is preserved
     
@@ -226,32 +276,47 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None) 
     def replacer(match):
         keyword = match.group(1)
         table = match.group(2)
+        
+        # Debug logging
+        logging.debug(f"Pattern matched: '{keyword} {table}'")
 
         # Skip if it's a subquery (starts with parentheses) or function call
         if '(' in table:
+            logging.debug(f"  Skipped {table}: contains parenthesis")
             return match.group(0)
 
         # Skip if table is a CTE
         if table.lower() in cte_names:
-            return match.group(0)
-
-        # Skip if table is created by a block file
-        if block_tables and table.lower() in block_tables:
+            logging.debug(f"  Skipped {table}: is a CTE (found in: {cte_names})")
             return match.group(0)
 
         # Skip if it's a schema-qualified table (e.g., schema.table)
         if '.' in table:
+            logging.debug(f"  Skipped {table}: schema-qualified")
             return match.group(0)
 
         # Skip if the table is the literal TABLE keyword (Snowflake table function)
         if table.upper() == 'TABLE':
+            logging.debug(f"  Skipped {table}: is TABLE keyword")
             return match.group(0)
 
-        # Use correct dbt macro syntax with double curly brackets
-        if table.lower() in [t.lower() for t in external_tables]:
+        # Check if it's an external table FIRST (priority over block_tables)
+        is_external = table.lower() in [t.lower() for t in external_tables]
+        
+        if is_external:
+            # External tables always get STG prefix
             replacement = f"{keyword} STG.P{{{{praktijk_agb}}}}.{table}"
-        else:
-            replacement = f"{keyword} {{{{ ref('{table}') }}}}"
+            logging.debug(f"Replacing external table: '{table}' -> '{replacement}'")
+            return replacement
+        
+        # Skip if table is created by a block file (only if NOT external)
+        if block_tables and table.lower() in block_tables:
+            logging.debug(f"  Skipped {table}: created by block file")
+            return match.group(0)
+
+        # All other tables use ref()
+        replacement = f"{keyword} {{{{ ref('{table}') }}}}"
+        logging.debug(f"Replacing internal table: '{table}' -> '{replacement}'")
         return replacement
     
     return re.sub(pattern, replacer, sql, flags=re.IGNORECASE)

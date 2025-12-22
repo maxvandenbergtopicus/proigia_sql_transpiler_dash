@@ -1,4 +1,5 @@
 import re
+import logging
 
 def parse_crosstab_sql(sql_content: str):
     """
@@ -6,9 +7,15 @@ def parse_crosstab_sql(sql_content: str):
     Returns a dict with keys: 'pivot_col', 'from_statements', 'output_cols', 'cte_select_statement', 'pivot_statement', 'cte_statement'.
     Raises ValueError if unsupported patterns are found.
     """
+    logging.debug("=" * 80)
+    logging.debug("CROSSTAB CONVERSION - BEFORE:")
+    logging.debug("-" * 80)
+    logging.debug(sql_content)
+    logging.debug("-" * 80)
+    
     # Patterns
     pattern_1 = r'\$\$(.*?)\$\$'        # everything within $$...$$
-    pattern_2 = r'\)\s*as\s+(?:\w+\s*)?\(\s*(.*?)\s*\)' # from $$) as ... ( ... )
+    pattern_2 = r'\)\s*as\s+(?:\w+\s*)?\(\s*(.+?)(?:\)|$)' # from $$) as ... ( ... ) or until end - made more lenient
     pattern_3 = r'SELECT(.*?)FROM'      # between SELECT and FROM
     pattern_4 = r'FROM(.*?)ORDER'       # between FROM and ORDER
     pattern_5 = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\b(?!\s*\.|\s*\(|::)'
@@ -17,18 +24,20 @@ def parse_crosstab_sql(sql_content: str):
     # Extract statements
     statements = re.findall(pattern_1, sql_content, re.DOTALL)
     if len(statements) < 2:
+            logging.error(f"Crosstab parsing failed: Expected 2 $$ blocks, found {len(statements)}")
             return ''
     cte_statement = statements[0]
     pivot_statement = statements[1]
 
     # Check for unsupported patterns
     if 'JOIN' in pivot_statement.upper():
-            print("Unsupported JOIN found in pivot_statement.")
+            logging.warning("Unsupported JOIN found in pivot_statement.")
             return ''
 
     # Extract pivot column and from statements safely
     m_pivot_col = re.search(pattern_3, pivot_statement, re.IGNORECASE | re.DOTALL)
     if not m_pivot_col:
+        logging.error("Crosstab parsing failed: Could not extract pivot column (no SELECT...FROM found in pivot statement)")
         return ''
     
     # Find WITH statement if present within the CROSSTAB satement
@@ -44,21 +53,39 @@ def parse_crosstab_sql(sql_content: str):
     pivot_col = m_pivot_col.group(1).strip()
     m_from_statements = re.search(pattern_4, pivot_statement, re.IGNORECASE | re.DOTALL)
     if not m_from_statements:
+        logging.error("Crosstab parsing failed: Could not extract FROM statements (no FROM...ORDER found in pivot statement)")
         return ''
     from_statements = m_from_statements.group(1).strip()
 
-    # Build dbt_utils.get_column_values statement (example)
+    # Extract the column name from the pivot_statement (second $$ block)
+    # This is what we'll use in get_column_values
+    pivot_value_col = pivot_col  # Default to the SELECT column name
+    
+    # Build dbt_utils.get_column_values statement
+    # Use the pivot_col from the second query for get_column_values
     str_dbt_get_column_values = "{{ dbt_utils.pivot('<pivot_col>',\
-        dbt_utils.get_column_values(ref('<input_model>'),'categorie',default=[]),\
+        dbt_utils.get_column_values(ref('<input_model>'),'<pivot_value_col>',default=[]),\
         agg='',\
         then_value='<value_col>',\
         else_value=\"ARRAY_CONSTRUCT()\",\
-        quote_identifiers=False)}} ".replace('<pivot_col>', pivot_col).replace('<input_model>', from_statements)
+        quote_identifiers=False)}} ".replace('<input_model>', from_statements).replace('<pivot_value_col>', pivot_value_col.replace("'", "\\'"))
     # print("dbt utils get column values statement:\n", str_dbt_get_column_values)    
 
     ## Bepaal welke kolommen meegaan in de output
     m_statement_as = re.search(pattern_2, sql_content, re.IGNORECASE | re.DOTALL)
     if not m_statement_as:
+        logging.error("Crosstab parsing failed: Could not extract output columns (no ) as ... (...) pattern found)")
+        logging.error(f"Pattern being used: {pattern_2}")
+        # Try to find if there's a ') as (' pattern at all
+        test_match = re.search(r'\)\s*as\s*\(', sql_content, re.IGNORECASE | re.DOTALL)
+        if test_match:
+            logging.error(f"Found ') as (' at position {test_match.start()}, but full pattern didn't match")
+            # Show context around the match
+            start = max(0, test_match.start() - 50)
+            end = min(len(sql_content), test_match.end() + 200)
+            logging.error(f"Context: ...{sql_content[start:end]}...")
+        else:
+            logging.error("Could not even find a ') as (' pattern in the SQL")
         return ''
     statement_as = m_statement_as.group(1).strip().replace('(','').replace(';','').strip()
     # print('Statement AS: ', statement_as)
@@ -70,6 +97,7 @@ def parse_crosstab_sql(sql_content: str):
     ## Selecteer de kolom-statements uit de cte_statement
     m_cte_select_statement = re.search(pattern_3, cte_statement, re.IGNORECASE | re.DOTALL)
     if not m_cte_select_statement:
+        logging.error("Crosstab parsing failed: Could not extract CTE select statement (no SELECT...FROM found in CTE)")
         return ''
     cte_select_statement = m_cte_select_statement.group(1).strip()
     # print('Select columns: ', cte_select_statement)
@@ -107,6 +135,11 @@ def parse_crosstab_sql(sql_content: str):
     cols_to_pivot = list(set(input_cols) - set(output_cols))
     # print("Categorie naar kolom: ", cols_to_pivot[0])
     # print("Waarden in kolom: ", cols_to_pivot[1])
+    
+    # Replace placeholders:
+    # <pivot_col> = the column from CTE that contains categories (cols_to_pivot[0])
+    # <value_col> = the column from CTE that contains values (cols_to_pivot[1])
+    str_dbt_get_column_values = str_dbt_get_column_values.replace('<pivot_col>', cols_to_pivot[0])
     str_dbt_get_column_values = str_dbt_get_column_values.replace('<value_col>', cols_to_pivot[1])
     # print("Aangepaste dbt utils get column values statement:\n", str_dbt_get_column_values)
     #Kolommen voor de select en group by:
@@ -137,4 +170,10 @@ def parse_crosstab_sql(sql_content: str):
         f"FROM cte1\n"
         f"GROUP BY {select_col_clean}"
     )
+    
+    logging.debug("CROSSTAB CONVERSION - AFTER:")
+    logging.debug("-" * 80)
+    logging.debug(dbt_sql)
+    logging.debug("=" * 80)
+    
     return dbt_sql
