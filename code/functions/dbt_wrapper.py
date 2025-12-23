@@ -3,7 +3,7 @@ from typing import Any, Dict
 import re
 import logging
 from code.functions.dialect_converter import convert_postgres_to_snowflake
-from code.functions.general import *
+from code.functions.functions import *
 import traceback
 
 def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=None, seed_tables=None) -> set:

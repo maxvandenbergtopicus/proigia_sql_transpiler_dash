@@ -5,8 +5,6 @@ import sys
 from typing import Any, Dict
 import yaml
 
-from dbt_wrapper import convert_pry_to_dbt
-
 def extract_view_name_from_query(query: str) -> str:
     """Extract view name from CREATE [MATERIALIZED] VIEW statement."""
     match = re.search(r'CREATE\s+(?:MATERIALIZED\s+)?VIEW\s+(\w+)', query, re.IGNORECASE)
@@ -90,39 +88,3 @@ def find_pry_files(repo_path: Path, ignored_keywords: list) -> list:
     """Find PRY files, excluding those with ignored keywords."""
     return [f for f in repo_path.rglob("*.pry") 
             if not any(kw.lower() in f.name.lower() for kw in ignored_keywords)]
-
-
-def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tables: list):
-    """Process all PRY files in a directory (blocks first, then regular files)."""
-    ignored_keywords = config.get("ignored_keywords", [])
-    pry_files = find_pry_files(input_path, ignored_keywords)
-    
-    logging.info(f"Searching for PRY files in: {input_path}")
-    logging.info(f"\nFound {len(pry_files)} PRY files to process\n")
-    
-    if not pry_files:
-        logging.info("No PRY files found.")
-        return
-    
-    # Separate blocks from regular files
-    block_files = [f for f in pry_files if any(p.name.lower() == 'blocks' for p in f.parents)]
-    regular_files = [f for f in pry_files if f not in block_files]
-    
-    # First pass: Process blocks and track created tables
-    block_tables = set()
-    logging.info(f"\n=== Processing {len(block_files)} block files ===")
-    for pry_file in block_files:
-        try:
-            tables = convert_pry_to_dbt(pry_file, output_dir, config, seed_tables=seed_tables)
-            if tables:
-                block_tables.update(tables)
-        except Exception as e:
-            logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
-    
-    # Second pass: Process regular files
-    logging.info(f"\n=== Processing {len(regular_files)} regular files ===")
-    for pry_file in regular_files:
-        try:
-            convert_pry_to_dbt(pry_file, output_dir, config, block_tables=block_tables, seed_tables=seed_tables)
-        except Exception as e:
-            logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
