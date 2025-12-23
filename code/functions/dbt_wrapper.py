@@ -6,8 +6,11 @@ from code.functions.dialect_converter import convert_postgres_to_snowflake
 from code.functions.general import *
 import traceback
 
-def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=None) -> set:
+def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=None, seed_tables=None) -> set:
     """Convert PRY file to dbt models.
+    
+    Args:
+        seed_tables: Dict mapping table names to their references (e.g., {'nhg_labcodes': 'dwh.{{praktijk_agb}}.nhg_labcodes'})
     
     Returns:
         set: Table/view names created by this file (for blocks)
@@ -77,7 +80,8 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
                 report_type=report_type,
                 view_metadata=view_metadata,
                 output_dir=full_output_dir,
-                block_tables=block_tables
+                block_tables=block_tables,
+                seed_tables=seed_tables
             )
         return set()
 
@@ -88,30 +92,43 @@ def generate_dbt_model(
     report_type: str,
     view_metadata: Dict[str, Any],
     output_dir: Path,
-    block_tables=None
+    block_tables=None,
+    seed_tables=None
 ) -> None:
     """Generate a single dbt model file."
     
     Args:
         block_tables: Set of table names created by block files
+        seed_tables: Dict mapping table names to their references from config
     """
     
     try:
         logging.debug(f"\n{'='*80}\nProcessing: {report_name} - {view_name}\n{'='*80}")
         # Preprocess SQL (handles comment conversion and includes)
         preprocessed = preprocess_sql(query)
-        # Preserve dbt macro calls by replacing them with placeholders
-        macro_pattern = r"({{\s*[\w_]+\(\)\s*}})"
+        
+        # Preserve dbt macro calls by replacing them with placeholders (to survive sqlglot)
+        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)\s*\}\})"
         macros = []
+        
         def macro_replacer(match):
-            macros.append(match.group(1))
-            return f"__DBT_MACRO_{len(macros)-1}__"
+            macro_call = match.group(1)
+            macros.append(macro_call)
+            placeholder = f"__DBT_MACRO_{len(macros)-1}__"
+            logging.debug(f"Preserving macro: '{macro_call}' -> '{placeholder}'")
+            return placeholder
+        
         temp_sql = re.sub(macro_pattern, macro_replacer, preprocessed)
+        logging.debug(f"Found {len(macros)} macro calls to preserve")
+        
         # Convert SQL from PostgreSQL to Snowflake
         converted_sql = convert_postgres_to_snowflake(temp_sql)
+        
         # Restore macro calls
         for idx, macro in enumerate(macros):
-            converted_sql = converted_sql.replace(f"__DBT_MACRO_{idx}__", macro)
+            placeholder = f"__DBT_MACRO_{idx}__"
+            converted_sql = converted_sql.replace(placeholder, macro)
+            logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
         # Replace all SQL comments with Jinja comments (after SQL conversion)
         # Multi-line comments: /* ... */  ->  {# ... #}
         converted_sql = re.sub(r'/\*', r'{#', converted_sql)
@@ -122,16 +139,22 @@ def generate_dbt_model(
         # Check if actually converted
         if converted_sql == preprocessed:
             print("[WARNING] SQL was not modified during conversion")
+        
+        logging.debug(f"SQL before CREATE VIEW removal (first 500 chars): {converted_sql[:500]}")
+        
         # Remove CREATE [MATERIALIZED] VIEW statement, keep only the SELECT/WITH
         converted_sql = re.sub(
-            r'CREATE\s+(MATERIALIZED\s+)?VIEW\s+\w+\s+AS\s*',
+            r'CREATE\s+(MATERIALIZED\s+)?VIEW\s+\w+\s+AS\s+',
             '',
             converted_sql,
             count=1,
             flags=re.IGNORECASE
         )
+        
+        logging.debug(f"SQL after CREATE VIEW removal (first 500 chars): {converted_sql[:500]}")
+        
         # Replace table references with dbt macros
-        converted_sql = replace_table_references(converted_sql, block_tables=block_tables)
+        converted_sql = replace_table_references(converted_sql, block_tables=block_tables, seed_tables=seed_tables)
         # Ensure it starts with WITH or SELECT
         converted_sql = converted_sql.strip()
         if not re.match(r'^(WITH|SELECT)', converted_sql, re.IGNORECASE):
@@ -204,119 +227,67 @@ def generate_dbt_model(
         traceback.print_exc()
 
 
-def replace_table_references(sql: str, external_tables=None, block_tables=None) -> str:
-    """
-    Replace table references in FROM/JOIN clauses with dbt ref() or source() macros.
-    If table is in external_tables, use STG.P{{praktijk_agb}}.{table}, else use ref().
-    Do not replace tables that are CTEs in the WITH clause or created by block files.
+def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None) -> str:
+    """Replace table references in FROM/JOIN with dbt ref() or STG.P{{praktijk_agb}}.table."""
+    # Set defaults
+    block_tables = block_tables or set()
+    external_tables = external_tables or [
+        'allergie', 'bepaling', 'contact', 'contraindicatie', 'episode', 'journaal',
+        'journaalregel', 'medewerker', 'medicatie', 'metadata', 'origineel',
+        'patient', 'praktijk', 'ruiter', 'verrichting', 'verwijzing', 
+        'override_patientenlijst', 'functie', 'medewerker_hisnaam'
+    ]
+    seed_table_lookup = {k.lower(): v for k, v in (seed_tables or {}).items()}
     
-    Args:
-        block_tables: Set of table names created by block files (should not be replaced)
-    """
-    if block_tables is None:
-        block_tables = set()
-    if external_tables is None:
-        external_tables = [
-            'allergie', 'bepaling', 'contact', 'contraindicatie', 'episode', 'journaal',
-            'journaalregel', 'medewerker', 'medicatie', 'metadata', 'origineel',
-            'patient', 'praktijk', 'ruiter', 'verrichting', 'verwijzing', 'override_patientenlijst', 'functie', 'medewerker_hisnaam'
-        ]
-    
-    # Robustly extract all CTE names from the entire SQL (not just top-level WITH)
+    # Extract CTE names from SQL (remove comments first to avoid false matches)
+    sql_clean = re.sub(r'(--[^\n]*|/\*.*?\*/|\{#.*?#\})', '', sql, flags=re.DOTALL)
     cte_names = set()
-    # Temporarily remove comments (both SQL and Jinja) to avoid false matches in CTE detection only
-    sql_no_comments = re.sub(r'--[^\n]*', '', sql)
-    sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
-    sql_no_comments = re.sub(r'\{#.*?#\}', '', sql_no_comments, flags=re.DOTALL)
-    logging.debug(f"SQL for CTE detection (first 500 chars): {sql_no_comments[:500]}")
-    # Find CTEs: only match "name AS (" pattern that comes after WITH keyword or after a comma in a WITH clause
-    # Pattern: WITH <cte_name> AS [MATERIALIZED] ( or , <cte_name> AS [MATERIALIZED] (
-    # Match: word, optional column list, AS, optional keywords like MATERIALIZED, then opening paren
-    # Important: Don't match function calls like array_accum(...) AS alias or listagg(...) AS alias
-    for match in re.finditer(r'\b(\w+)\s*(\([^)]+\))?\s+AS(?:\s+\w+)*\s*\(', sql_no_comments, re.IGNORECASE):
-        potential_cte = match.group(1).lower()
-        has_parens_before_as = match.group(2) is not None
-        
-        # Check if this appears to be after WITH or comma (indicating CTE context)
-        # Get position and look backwards for WITH or comma
-        start_pos = match.start()
-        preceding_text = sql_no_comments[max(0, start_pos-100):start_pos]
-        
-        logging.debug(f"CTE pattern matched: '{match.group(0)[:50]}...' -> potential CTE: '{potential_cte}'")
-        logging.debug(f"  Preceding text (last 80 chars): '{preceding_text[-80:]}'")
-        
-        # Only consider it a CTE if preceded by WITH [RECURSIVE] or comma in CTE context
-        # Allow for optional RECURSIVE keyword after WITH
-        if re.search(r'(WITH(?:\s+RECURSIVE)?|,)\s*$', preceding_text, re.IGNORECASE | re.DOTALL):
-            # If there are parentheses between the word and AS, check if it's in CTE context
-            # CTEs can have column definitions like: cte_name(col1, col2) AS (...)
-            # Functions are like: function_name(...) AS alias
-            # The key difference: CTEs are after WITH/comma, functions are in SELECT/other contexts
-            # Since we already confirmed it's after WITH/comma, treat parentheses as column list
-            if has_parens_before_as:
-                logging.debug(f"  Found column list for CTE: '{potential_cte}'")
-                
-            # Exclude SQL keywords that might match this pattern
-            if potential_cte not in ['select', 'insert', 'update', 'delete', 'with', 'case']:
-                cte_names.add(potential_cte)
-                logging.debug(f"  Added '{potential_cte}' to CTE list")
-        else:
-            logging.debug(f"  Skipped '{potential_cte}': not in CTE context (no WITH or comma before it)")
-    logging.debug(f"Final CTE names detected: {cte_names}")
-    logging.debug(f"Block tables passed in: {block_tables}")
     
-    # Note: We only removed comments for CTE detection, the original SQL with comments is preserved
+    for match in re.finditer(r'\b(\w+)\s*(?:\([^)]+\))?\s+AS(?:\s+\w+)*\s*\(', sql_clean, re.IGNORECASE):
+        cte = match.group(1).lower()
+        # Check if preceded by WITH or comma (indicating CTE context)
+        preceding = sql_clean[max(0, match.start()-100):match.start()]
+        if re.search(r'(WITH(?:\s+RECURSIVE)?|,)\s*$', preceding, re.IGNORECASE | re.DOTALL):
+            if cte not in ['select', 'insert', 'update', 'delete', 'with', 'case']:
+                cte_names.add(cte)
     
-    # Regex to match FROM or any JOIN type, but skip if immediately followed by LATERAL (e.g., JOIN LATERAL, LEFT JOIN LATERAL, etc.)
-    # Only match if the table name is not followed by a dot (schema/table or table.column),
-    # not followed by an open parenthesis (function call),
-    # and not immediately followed by '::' (type cast)
-    pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\b(?!\s*\.|\s*\(|::)'
+    logging.debug(f"Detected CTEs: {cte_names}, Block tables: {block_tables}")
     
-    def replacer(match):
-        keyword = match.group(1)
-        table = match.group(2)
-        
-        # Debug logging
-        logging.debug(f"Pattern matched: '{keyword} {table}'")
-
-        # Skip if it's a subquery (starts with parentheses) or function call
-        if '(' in table:
-            logging.debug(f"  Skipped {table}: contains parenthesis")
-            return match.group(0)
-
-        # Skip if table is a CTE
-        if table.lower() in cte_names:
-            logging.debug(f"  Skipped {table}: is a CTE (found in: {cte_names})")
-            return match.group(0)
-
-        # Skip if it's a schema-qualified table (e.g., schema.table)
-        if '.' in table:
-            logging.debug(f"  Skipped {table}: schema-qualified")
-            return match.group(0)
-
-        # Skip if the table is the literal TABLE keyword (Snowflake table function)
-        if table.upper() == 'TABLE':
-            logging.debug(f"  Skipped {table}: is TABLE keyword")
-            return match.group(0)
-
-        # Check if it's an external table FIRST (priority over block_tables)
-        is_external = table.lower() in [t.lower() for t in external_tables]
-        
-        if is_external:
-            # External tables always get STG prefix
-            replacement = f"{keyword} STG.P{{{{praktijk_agb}}}}.{table}"
-            logging.debug(f"Replacing external table: '{table}' -> '{replacement}'")
-            return replacement
-        
-        # Skip if table is created by a block file (only if NOT external)
-        if block_tables and table.lower() in block_tables:
-            logging.debug(f"  Skipped {table}: created by block file")
-            return match.group(0)
-
-        # All other tables use ref()
-        replacement = f"{keyword} {{{{ ref('{table}') }}}}"
-        logging.debug(f"Replacing internal table: '{table}' -> '{replacement}'")
-        return replacement
+    # Replace schema-qualified seed tables first (schema.table -> seed reference)
+    schema_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b(?!\s*\(|::)'
     
-    return re.sub(pattern, replacer, sql, flags=re.IGNORECASE)
+    def schema_replacer(match):
+        keyword, schema, table = match.group(1), match.group(2), match.group(3)
+        if table.lower() in seed_table_lookup:
+            logging.debug(f"Replacing seed: {schema}.{table}")
+            return f"{keyword} {seed_table_lookup[table.lower()]}"
+        return match.group(0)
+    
+    sql = re.sub(schema_pattern, schema_replacer, sql, flags=re.IGNORECASE)
+    
+    # Replace unqualified table references (table -> ref() or STG prefix)
+    table_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\b(?!\s*\.|\s*\(|::)'
+    
+    def table_replacer(match):
+        keyword, table = match.group(1), match.group(2)
+        table_lower = table.lower()
+        
+        # Skip CTEs, TABLE keyword, or tables with dots/parens
+        if (table_lower in cte_names or table.upper() == 'TABLE' or 
+            '(' in table or '.' in table):
+            return match.group(0)
+        
+        # External tables get STG prefix (priority over block_tables)
+        if table_lower in [t.lower() for t in external_tables]:
+            logging.debug(f"External: {table}")
+            return f"{keyword} STG.P{{{{praktijk_agb}}}}.{table}"
+        
+        # Skip block-created tables
+        if table_lower in block_tables:
+            return match.group(0)
+        
+        # Everything else uses ref()
+        logging.debug(f"Internal: {table}")
+        return f"{keyword} {{{{ ref('{table}') }}}}"
+    
+    return re.sub(table_pattern, table_replacer, sql, flags=re.IGNORECASE)

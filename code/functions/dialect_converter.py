@@ -135,6 +135,22 @@ def convert_postgres_to_snowflake(sql: str) -> str:
             sql = sql.replace('array_accum', 'array_agg')
             sql = sql.replace('ARRAY_ACCUM', 'ARRAY_AGG')
         
+        # Pre-process: Remove MATERIALIZED keyword from CTEs (not supported in Snowflake)
+        if 'materialized' in sql.lower():
+            logging.info("Removing MATERIALIZED keyword from CTEs")
+            # Remove AS MATERIALIZED from CTEs: WITH cte AS MATERIALIZED (...) -> WITH cte AS (...)
+            sql = re.sub(r'\bAS\s+MATERIALIZED\s*\(', 'AS (', sql, flags=re.IGNORECASE)
+        
+        # Pre-process: Convert ARRAY[...] to ARRAY_CONSTRUCT(...)
+        if 'array[' in sql.lower():
+            logging.info("Converting ARRAY[...] to ARRAY_CONSTRUCT(...)")
+            sql = convert_array_to_array_construct(sql)
+        
+        # Pre-process: Remove PostgreSQL array type casts (::text[], ::varchar[], etc.)
+        if '::' in sql and '[]' in sql:
+            logging.info("Removing PostgreSQL array type casts")
+            sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
+        
         # Pre-process: Handle crosstab function (not supported in Snowflake)
         if 'crosstab' in sql.lower():
             sql = handle_crosstab(sql)
@@ -204,6 +220,63 @@ def convert_unnest_array_to_values(sql: str) -> str:
         return f"SELECT\n    {col}\n  FROM (VALUES\n    {values}\n  ) AS t({col})"
 
     return pattern.sub(repl, sql)
+
+def convert_array_to_array_construct(sql: str) -> str:
+    """
+    Convert PostgreSQL ARRAY[...] syntax to Snowflake ARRAY_CONSTRUCT(...).
+    Handles multi-line arrays and nested brackets/parentheses.
+    """
+    result = []
+    i = 0
+    
+    while i < len(sql):
+        # Look for ARRAY[ (case-insensitive)
+        if sql[i:i+6].upper() == 'ARRAY[':
+            # Found ARRAY[, now find the matching closing bracket
+            result.append('ARRAY_CONSTRUCT(')
+            i += 6  # Skip past 'ARRAY['
+            
+            # Track bracket depth to handle nested arrays
+            bracket_depth = 1
+            paren_depth = 0
+            in_string = False
+            string_char = None
+            
+            while i < len(sql) and bracket_depth > 0:
+                char = sql[i]
+                
+                # Handle string literals
+                if char in ('"', "'") and (i == 0 or sql[i-1] != '\\'):
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                        string_char = None
+                
+                # Only count brackets/parens outside of strings
+                if not in_string:
+                    if char == '[':
+                        bracket_depth += 1
+                    elif char == ']':
+                        bracket_depth -= 1
+                        if bracket_depth == 0:
+                            # Found the closing bracket for this ARRAY
+                            result.append(')')
+                            i += 1
+                            continue
+                    elif char == '(':
+                        paren_depth += 1
+                    elif char == ')':
+                        paren_depth -= 1
+                
+                result.append(char)
+                i += 1
+        else:
+            result.append(sql[i])
+            i += 1
+    
+    return ''.join(result)
 
 def handle_crosstab(sql: str) -> str:
     """

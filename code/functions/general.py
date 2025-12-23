@@ -1,64 +1,52 @@
+import logging
+from pathlib import Path
 import re
+import sys
 from typing import Any, Dict
 import yaml
 
+from dbt_wrapper import convert_pry_to_dbt
+
 def extract_view_name_from_query(query: str) -> str:
-    """Extract view name from CREATE VIEW or CREATE MATERIALIZED VIEW statement."""
-    # Try to match CREATE MATERIALIZED VIEW first
-    match = re.search(r'CREATE\s+MATERIALIZED\s+VIEW\s+(\w+)', query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    # Fall back to regular CREATE VIEW
-    match = re.search(r'CREATE\s+VIEW\s+(\w+)', query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    return None
+    """Extract view name from CREATE [MATERIALIZED] VIEW statement."""
+    match = re.search(r'CREATE\s+(?:MATERIALIZED\s+)?VIEW\s+(\w+)', query, re.IGNORECASE)
+    return match.group(1) if match else None
 
 def parse_pry_file(content: str) -> Dict[str, Any]:
-    """Parse PRY file content into structured data."""
-    # Replace any Jinja block (e.g., {% ... %}) with a space, preserving the rest of the line
-    #filtered_lines = [re.sub(r'{%.*?%}', ' ', line) for line in content.splitlines()]
-    #filtered_content = '\n'.join(filtered_lines)
-    # Remove all Jinja blocks (e.g., {% ... %}) from metadata (before queries:)
+    """Parse PRY file: extract metadata and SQL queries from YAML structure."""
     queries_split = content.split('queries:', 1)
     if len(queries_split) != 2:
         raise ValueError("Invalid PRY format: 'queries:' section not found")
-    # Remove all Jinja blocks from metadata_yaml
-    metadata_yaml = re.sub(r"{%-?[^%]*%}", '', queries_split[0])
-    queries_section = queries_split[1]
     
-    # Parse metadata
+    # Parse metadata (strip Jinja blocks first)
+    metadata_yaml = re.sub(r"{%-?[^%]*%}", '', queries_split[0])
     metadata = yaml.safe_load(metadata_yaml)
     
-    # Parse SQL queries (they're YAML list items starting with - |)
+    # Parse SQL queries from YAML list (- | blocks with 4-space indentation)
     queries = []
     current_query = []
     in_query = False
     
-    for line in queries_section.split('\n'):
+    for line in queries_split[1].split('\n'):
         if line.strip().startswith('- |'):
             if current_query:
                 queries.append('\n'.join(current_query))
             current_query = []
             in_query = True
         elif in_query:
-            # End query block only if we hit a non-indented line (new YAML key or list item)
-            if line and not line.startswith(' ') and not line.startswith('\t'):
-                # End of query block
-                if current_query:
-                    queries.append('\n'.join(current_query))
-                    current_query = []
-                in_query = False
-            else:
-                # Only remove 4 leading spaces if present, otherwise keep the line as is
-                if line.startswith('    '):
-                    current_query.append(line[4:])
+            # Non-indented line ends query block, unless it's Jinja template syntax
+            if line and not line.startswith((' ', '\t')):
+                if line.strip().startswith(('{%', '{{')):
+                    current_query.append(line)  # Keep Jinja includes
                 else:
-                    current_query.append(line)
+                    if current_query:
+                        queries.append('\n'.join(current_query))
+                        current_query = []
+                    in_query = False
+            else:
+                # Strip 4-space YAML indentation
+                current_query.append(line[4:] if line.startswith('    ') else line)
     
-    # Add last query if exists
     if current_query:
         queries.append('\n'.join(current_query))
     
@@ -67,18 +55,74 @@ def parse_pry_file(content: str) -> Dict[str, Any]:
 
 def sanitize_folder_name(name: str) -> str:
     """Convert report name to valid folder name."""
-    # Remove or replace invalid folder characters
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    # Replace spaces with underscores
-    name = name.replace(' ', '_')
-    # Remove multiple underscores
-    name = re.sub(r'_+', '_', name)
-    # Convert to lowercase for consistency
-    name = name.lower().strip('_')
-    return name
+    name = re.sub(r'[<>:"/\\|?*]', '', name)  # Remove invalid chars
+    name = re.sub(r'_+', '_', name.replace(' ', '_'))  # Spaces to underscores
+    return name.lower().strip('_')
 
 def preprocess_sql(sql: str) -> str:
     """Preprocess SQL to handle Jinja includes and other special syntax."""
     # Replace only {% include 'blockname.pry' %} with {{ blockname() }} in SQL queries
     sql = re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", sql)
     return sql
+
+def setup_logging(log_file: Path, log_level: str = 'all'):
+    """Setup logging to console and file."""
+    level_map = {'all': logging.INFO, 'debug': logging.DEBUG, 'warning': logging.WARNING, 'error': logging.ERROR}
+    level = level_map.get(log_level.lower(), logging.INFO)
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []
+    
+    formatter = logging.Formatter('%(message)s')
+    
+    # Console and file handlers with same config
+    for handler in [logging.StreamHandler(sys.stdout), 
+                    logging.FileHandler(log_file, mode='w', encoding='utf-8')]:
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    return logger
+
+
+def find_pry_files(repo_path: Path, ignored_keywords: list) -> list:
+    """Find PRY files, excluding those with ignored keywords."""
+    return [f for f in repo_path.rglob("*.pry") 
+            if not any(kw.lower() in f.name.lower() for kw in ignored_keywords)]
+
+
+def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tables: list):
+    """Process all PRY files in a directory (blocks first, then regular files)."""
+    ignored_keywords = config.get("ignored_keywords", [])
+    pry_files = find_pry_files(input_path, ignored_keywords)
+    
+    logging.info(f"Searching for PRY files in: {input_path}")
+    logging.info(f"\nFound {len(pry_files)} PRY files to process\n")
+    
+    if not pry_files:
+        logging.info("No PRY files found.")
+        return
+    
+    # Separate blocks from regular files
+    block_files = [f for f in pry_files if any(p.name.lower() == 'blocks' for p in f.parents)]
+    regular_files = [f for f in pry_files if f not in block_files]
+    
+    # First pass: Process blocks and track created tables
+    block_tables = set()
+    logging.info(f"\n=== Processing {len(block_files)} block files ===")
+    for pry_file in block_files:
+        try:
+            tables = convert_pry_to_dbt(pry_file, output_dir, config, seed_tables=seed_tables)
+            if tables:
+                block_tables.update(tables)
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
+    
+    # Second pass: Process regular files
+    logging.info(f"\n=== Processing {len(regular_files)} regular files ===")
+    for pry_file in regular_files:
+        try:
+            convert_pry_to_dbt(pry_file, output_dir, config, block_tables=block_tables, seed_tables=seed_tables)
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
