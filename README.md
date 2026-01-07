@@ -26,27 +26,11 @@ pip install -r requirements.txt
 
 Edit `config.yaml` to configure your settings:
 
-### Database Configuration (Optional)
-```yaml
-Postgres:
-  port: 5432
-  username: your_username
-  password: your_password
-  database: your_database
-
-Snowflake:
-  account: your_account
-  user: your_user
-  password: your_password
-  warehouse: your_warehouse
-  database: your_database
-  schema: your_schema
-```
-
 ### dbt Output Paths
 ```yaml
 dbt_output_path: C:\path\to\dbt\models\output
 dbt_macro_path: C:\path\to\dbt\macros\output
+proigia_defintion_path: C:\path\to\proigia_definition
 ```
 
 ### Ignored Keywords
@@ -59,28 +43,14 @@ ignored_keywords:
 
 ## Usage
 
-### Process a Single File
+Run the transpiler:
 ```bash
-python main.py <path_to_pry_file> [output_directory]
-```
-
-Example:
-```bash
-python main.py C:\proigia\reports\my_report.pry C:\dbt\models
-```
-
-### Process a Directory
-```bash
-python main.py <path_to_directory> [output_directory]
-```
-
-Example:
-```bash
-python main.py C:\proigia\reports C:\dbt\models
+python main.py
 ```
 
 The tool will:
-1. Search recursively for all `.pry` files
+1. Read input and output paths from `config.yaml`
+2. Search recursively for all `.pry` files in `proigia_defintion_path`
 2. Skip files with ignored keywords
 3. Process block files first (from `blocks/` folders) and create macros
 4. Process regular files and generate dbt models
