@@ -120,9 +120,70 @@ class FixedSnowflake(Snowflake):
             return super().function_sql(expression)
 
 
+def convert_postgres_escape_strings(sql: str) -> str:
+    """
+    Convert PostgreSQL escape strings E'...' to regular strings.
+    In PostgreSQL, E'\\n' means newline, E'\\\\' means one backslash.
+    For Snowflake, we need to preserve the actual escape sequences.
+    """
+    result = []
+    i = 0
+    
+    while i < len(sql):
+        # Look for E' or E"
+        if i < len(sql) - 1 and sql[i].upper() == 'E' and sql[i+1] in ("'", '"'):
+            quote_char = sql[i+1]
+            result.append(quote_char)  # Remove the E, keep the quote
+            i += 2  # Skip past E'
+            
+            # Process the string content
+            while i < len(sql):
+                if sql[i] == '\\' and i + 1 < len(sql):
+                    # Handle escape sequences
+                    next_char = sql[i+1]
+                    if next_char == '\\':
+                        # \\\\ in E'...' means one backslash
+                        result.append('\\\\')  # Keep as double backslash for Snowflake
+                        i += 2
+                    elif next_char in ('n', 't', 'r'):
+                        # \\n, \\t, \\r are escape sequences
+                        result.append('\\')
+                        result.append(next_char)
+                        i += 2
+                    else:
+                        # Other escapes like \\. or \\1
+                        result.append('\\')
+                        result.append(next_char)
+                        i += 2
+                elif sql[i] == quote_char:
+                    # Check if it's an escaped quote
+                    if i + 1 < len(sql) and sql[i+1] == quote_char:
+                        result.append(quote_char)
+                        result.append(quote_char)
+                        i += 2
+                    else:
+                        # End of string
+                        result.append(quote_char)
+                        i += 1
+                        break
+                else:
+                    result.append(sql[i])
+                    i += 1
+        else:
+            result.append(sql[i])
+            i += 1
+    
+    return ''.join(result)
+
+
 def convert_postgres_to_snowflake(sql: str) -> str:
     """Convert SQL from PostgreSQL to Snowflake dialect using sqlglot."""
     try:
+        # Pre-process: Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
+        if "E'" in sql or 'E"' in sql:
+            logging.info("Converting PostgreSQL escape strings (E'...')")
+            sql = convert_postgres_escape_strings(sql)
+        
         # Pre-process: Replace citext with varchar (case-insensitive text type)
         if 'citext' in sql.lower():
             logging.info("Converting citext to VARCHAR")
@@ -139,7 +200,12 @@ def convert_postgres_to_snowflake(sql: str) -> str:
         if 'materialized' in sql.lower():
             logging.info("Removing MATERIALIZED keyword from CTEs")
             # Remove AS MATERIALIZED from CTEs: WITH cte AS MATERIALIZED (...) -> WITH cte AS (...)
-            sql = re.sub(r'\bAS\s+MATERIALIZED\s*\(', 'AS (', sql, flags=re.IGNORECASE)
+            sql = re.sub(r'\bAS\s+MATERIALIZED\b', 'AS', sql, flags=re.IGNORECASE)
+        
+        # Pre-process: Convert SIMILAR TO to RLIKE (Snowflake equivalent)
+        if 'similar to' in sql.lower():
+            logging.info("Converting SIMILAR TO to RLIKE")
+            sql = re.sub(r'\bSIMILAR\s+TO\b', 'RLIKE', sql, flags=re.IGNORECASE)
         
         # Pre-process: Convert ARRAY[...] to ARRAY_CONSTRUCT(...)
         if 'array[' in sql.lower():

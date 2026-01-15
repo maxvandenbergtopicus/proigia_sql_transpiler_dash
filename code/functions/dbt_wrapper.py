@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 import re
 import logging
 from code.functions.dialect_converter import convert_postgres_to_snowflake
@@ -24,7 +24,15 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         block_name = pry_path.stem
         
         preprocessed = preprocess_sql(content)
+        
+        # Replace custom functions with dbt macros (before sqlglot conversion)
+        function_macros = config.get('function_macros', [])
+        if function_macros:
+            preprocessed = replace_functions_with_macros(preprocessed, function_macros)
+        
         converted_sql = convert_postgres_to_snowflake(preprocessed)
+        # For blocks: only replace external tables, leave all others unchanged
+        converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, is_block=True)
         
         # Extract all table/view names created by this block (look for "name AS (")
         created_tables = set()
@@ -81,9 +89,81 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
                 view_metadata=view_metadata,
                 output_dir=full_output_dir,
                 block_tables=block_tables,
-                seed_tables=seed_tables
+                seed_tables=seed_tables,
+                config=config
             )
         return set()
+
+def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
+    """Replace SQL function calls with dbt macro calls.
+    
+    Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
+    """
+    for func_name in function_names:
+        # Match function_name(...) - case insensitive
+        # Use a simpler approach: find function name followed by parentheses
+        # and extract content up to the matching closing paren
+        pattern = re.compile(
+            rf'\b{re.escape(func_name)}\s*\(',
+            re.IGNORECASE
+        )
+        
+        # Find all matches and replace them
+        offset = 0
+        result = []
+        last_end = 0
+        
+        for match in pattern.finditer(sql):
+            start = match.start()
+            # Find the matching closing parenthesis
+            paren_start = match.end()
+            depth = 1
+            i = paren_start
+            in_string = False
+            string_char = None
+            
+            while i < len(sql) and depth > 0:
+                char = sql[i]
+                # Handle string literals
+                if char in ("'", '"') and (i == 0 or sql[i-1] != '\\'):
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                        string_char = None
+                elif not in_string:
+                    if char == '(':
+                        depth += 1
+                    elif char == ')':
+                        depth -= 1
+                i += 1
+            
+            if depth == 0:
+                args = sql[paren_start:i-1].strip()
+                macro_name = func_name.lower()
+                
+                # Add the text before this match
+                result.append(sql[last_end:start])
+                
+                # Add the macro call
+                if args:
+                    result.append(f"{{{{ {macro_name}('{args}') }}}}")
+                else:
+                    result.append(f"{{{{ {macro_name}() }}}}")
+                
+                last_end = i
+        
+        # Add remaining text
+        result.append(sql[last_end:])
+        sql = ''.join(result)
+        
+        count = len([m for m in pattern.finditer(''.join(result))])
+        if count > 0:
+            logging.debug(f"Replaced function {func_name} with macro calls")
+    
+    return sql
+
 
 def generate_dbt_model(
     view_name: str,
@@ -93,7 +173,8 @@ def generate_dbt_model(
     view_metadata: Dict[str, Any],
     output_dir: Path,
     block_tables=None,
-    seed_tables=None
+    seed_tables=None,
+    config=None
 ) -> None:
     """Generate a single dbt model file."
     
@@ -107,8 +188,14 @@ def generate_dbt_model(
         # Preprocess SQL (handles comment conversion and includes)
         preprocessed = preprocess_sql(query)
         
+        # Replace custom functions with dbt macros (before sqlglot conversion)
+        function_macros = config.get('function_macros', [])
+        if function_macros:
+            preprocessed = replace_functions_with_macros(preprocessed, function_macros)
+        
         # Preserve dbt macro calls by replacing them with placeholders (to survive sqlglot)
-        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)\s*\}\})"
+        # Match macros with or without arguments: {{ macro() }} or {{ macro('arg') }}
+        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^)]*\)\s*\}\})"
         macros = []
         
         def macro_replacer(match):
@@ -227,8 +314,13 @@ def generate_dbt_model(
         traceback.print_exc()
 
 
-def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None) -> str:
-    """Replace table references in FROM/JOIN with dbt ref() or STG.P{{praktijk_agb}}.table."""
+def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None, is_block=False) -> str:
+    """Replace table references in FROM/JOIN with dbt ref() or STG.P{{praktijk_agb}}.table.
+    
+    Args:
+        is_block: If True, only replace external tables. All other tables remain unchanged.
+                  If False, replace external tables with STG prefix and other tables with ref().
+    """
     # Set defaults
     block_tables = block_tables or set()
     external_tables = external_tables or [
@@ -277,12 +369,16 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
             '(' in table or '.' in table):
             return match.group(0)
         
-        # External tables get STG prefix (priority over block_tables)
+        # External tables get STG prefix
         if table_lower in [t.lower() for t in external_tables]:
             logging.debug(f"External: {table}")
             return f"{keyword} STG.P{{{{praktijk_agb}}}}.{table}"
         
-        # Skip block-created tables
+        # For blocks: leave all non-external tables unchanged
+        if is_block:
+            return match.group(0)
+        
+        # For normal models: skip block-created tables, use ref() for everything else
         if table_lower in block_tables:
             return match.group(0)
         

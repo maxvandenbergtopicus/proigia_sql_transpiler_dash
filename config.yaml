@@ -14,3 +14,8 @@ ignored_keywords:
 
 seed_tabellen:
   nhg_labcodes: dwh.{{praktijk_agb}}.nhg_labcodes
+
+# Function to macro mappings: SQL functions that should be replaced with dbt macros
+# Format: function_name (case-insensitive)
+function_macros:
+  - clean_icpc
