@@ -1,0 +1,17 @@
+-- Prepare CTE from original query
+WITH prepare AS (
+SELECT
+            patient_id,
+            categorie,
+            ARRAY[
+                count(*)::varchar,
+                max(voorschrijfdatum)::varchar,
+                min(voorschrijfdatum)::varchar,
+                array_agg(distinct atc_code)::varchar
+                ] as resultaat
+        FROM proigia_qlik_medicatie_3jr_crosstab_pre
+        GROUP BY patient_id, categorie
+        ORDER BY patient_id, categorie
+)
+-- Call snowflake pivot macro
+{{snowflake_pivot(['a02', 'a02ba', 'a02bc', 'a02bc01', 'a02bc02', 'a10', 'a10a', 'a10ab', 'a10ab01', 'a10ab04', 'a10ab05', 'a10ab06', 'a10ac', 'a10ac01', 'a10ad', 'a10ae', 'a10ae04', 'a10ae05', 'a10ae54', 'a10ae56', 'a10af', 'a10b', 'a10ba', 'a10ba02', 'a10bb', 'a10bc', 'a10bd', 'a10bd02', 'a10bd03', 'a10bd05', 'a10bd07', 'a10bd08', 'a10bd19', 'a10bd20', 'a10bf', 'a10bg', 'a10bg03', 'a10bh', 'a10bj', 'a10bj01', 'a10bj02', 'a10bj03', 'a10bj05', 'a10bj06', 'a10bk', 'a10bk03', 'a10bx', 'b01', 'b01a', 'b01aa', 'b01aa04', 'b01aa07', 'b01ab', 'b01ac', 'b01ac01', 'b01ac04', 'b01ac06', 'b01ac07', 'b01ac08', 'b01ac22', 'b01ac24', 'b01ac56', 'b01ad', 'b01ae', 'b01ae07', 'b01af', 'b01af01', 'b01af02', 'b01af03', 'b01ax', 'c0', 'c01', 'c01aa', 'c01aa05', 'c01b', 'c01ba01', 'c01ba03', 'c01bc03', 'c01bc04', 'c01bd01', 'c01da', 'c02', 'c03', 'c03a', 'c03aa03', 'c03ad01', 'c03ba04', 'c03ca01', 'c03ca02', 'c03cb01', 'c03cb02', 'c03da01', 'c03da04', 'c03eb01', 'c03eb02', 'c04', 'c05', 'c05ae03', 'c06', 'c07', 'c07aa07', 'c07ab02', 'c07ab03', 'c07ab07', 'c08', 'c08ca01', 'c08ca05', 'c08ca13', 'c08da01', 'c08da51', 'c08db01', 'c09', 'c09a', 'c09aa', 'c09aa02', 'c09aa03', 'c09aa04', 'c09aa15', 'c09b', 'c09ba', 'c09bb', 'c09bb10', 'c09bx', 'c09c', 'c09ca', 'c09ca01', 'c09ca02', 'c09ca03', 'c09ca04', 'c09ca06', 'c09ca07', 'c09d', 'c09da', 'c09da01', 'c09da03', 'c09da04', 'c09da06', 'c09da07', 'c09db', 'c09dx', 'c10', 'c10a', 'c10aa', 'c10aa01', 'c10ba', 'h02', 'h02aa02', 'h02ab', 'h02ab02', 'h02ab04', 'h02ab06', 'h02ab07', 'h02ab08', 'h02ab09', 'h02ab10', 'h06ab06', 'h06ab07', 'j01', 'j01aa02', 'j01ce02', 'j01ce05', 'j01cf02', 'j01cf05', 'j01ea01', 'j01ma02', 'j01xe01', 'j07bb', 'm01a', 'm01ab05', 'm01ab51', 'm01ab55', 'm01ae', 'm01ae01', 'm01ae02', 'm01ae52', 'm01ba03', 'm04aa01', 'm05', 'n02ab', 'n02aj02', 'n02aj08', 'n02aj14', 'n02aj18', 'n02aj19', 'n02ba', 'n02be51', 'n02cc', 'n05a', 'n05aa', 'n05ab', 'n05ad', 'n05ae', 'n05af', 'n05ag', 'n05ah', 'n05al', 'n05an', 'n05ax', 'n05ba', 'n05be', 'n05c', 'n05cd', 'n05cf', 'n05cm', 'n06a', 'n06aa', 'n06ab', 'n06af', 'n06ag', 'n06ax', 'n06ax05', 'n06ax16', 'n06ax21', 'n06ba', 'n06ba02', 'n06ba04', 'n06d', 'n07ba', 'r03', 'r03a', 'r03aa', 'r03ab', 'r03ac', 'r03ac02', 'r03ac03', 'r03ac04', 'r03ac12', 'r03ac13', 'r03ac18', 'r03ac19', 'r03ah', 'r03ak', 'r03ak04', 'r03ak06', 'r03ak07', 'r03ak08', 'r03ak09', 'r03ak10', 'r03ak11', 'r03ak12', 'r03ak13', 'r03al', 'r03al03', 'r03al04', 'r03al05', 'r03al06', 'r03al07', 'r03al08', 'r03al09', 'r03b', 'r03ba', 'r03ba01', 'r03ba02', 'r03ba05', 'r03ba08', 'r03bb', 'r03bb01', 'r03bb04', 'r03bb05', 'r03bb06', 'r03bb07', 'r03bb54', 'r03bc', 'r03bx', 'r03da', 'r03db', 'r03dc', 'r03dc03', 'r03dx'],'resultaat', 'categorie', 4,4, ['patient_id'])}}

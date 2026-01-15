@@ -23,6 +23,38 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
     if any(p.name.lower() == 'blocks' for p in pry_path.parents):
         block_name = pry_path.stem
         
+        # Check if this is a column list block (contains _ct)
+        if '_ct' in block_name:
+            logging.info(f"Processing column list block: {block_name}")
+            
+            # Parse column names from the content (format: column_name type,)
+            column_names = []
+            for line in content.split('\n'):
+                line = line.strip()
+                if line and not line.startswith('--') and not line.startswith('{'):
+                    # Extract column name before the type (e.g., "af_b varchar[]," -> "af_b")
+                    match = re.match(r'^\s*([a-zA-Z_][\w]*)\s+', line)
+                    if match:
+                        column_names.append(match.group(1))
+            
+            logging.debug(f"Extracted {len(column_names)} columns: {column_names[:5]}...")
+            
+            # Create macro that returns the list
+            macro_path = Path(config.get('dbt_macro_path', 'macros'))
+            macro_path.mkdir(parents=True, exist_ok=True)
+            
+            macro_file = macro_path / f"{block_name}.sql"
+            # Format each column on its own line for readability
+            column_lines = ",\n  ".join(f"'{col}'" for col in column_names)
+            macro_content = f"{{% macro {block_name}() %}}\n[\n  {column_lines}\n]\n{{% endmacro %}}\n"
+            
+            with open(macro_file, 'w', encoding='utf-8') as f:
+                f.write(macro_content)
+            
+            logging.info(f"[OK] Column list macro generated: {macro_file} ({len(column_names)} columns)")
+            return set()
+        
+        # Regular block processing
         preprocessed = preprocess_sql(content)
         
         # Replace custom functions with dbt macros (before sqlglot conversion)
