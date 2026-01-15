@@ -5,7 +5,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.snowflake import Snowflake
 
-from code.functions.crosstabs import parse_crosstab_sql
+from crosstabs.crosstabs_new import parse_crosstab_sql
 
 # Suppress sqlglot's verbose debug output
 logging.getLogger("sqlglot").setLevel(logging.WARNING)
