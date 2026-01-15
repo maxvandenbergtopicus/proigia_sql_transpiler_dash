@@ -62,6 +62,52 @@ def parse_crosstab_to_macro(sql: str) -> str:
     
     logging.debug(f"CTE columns: {cte_cols}")
     
+    # Analyze ARRAY construction to determine aantal_split and eventuele_extra_split
+    aantal_split = None
+    eventuele_extra_split = None
+    
+    # Find the values column that contains the ARRAY
+    for col_expr in columns:
+        if col_expr.strip().upper().startswith('ARRAY['):
+            # Extract array elements
+            array_content_match = re.search(r'ARRAY\[(.*?)\]', col_expr, re.IGNORECASE | re.DOTALL)
+            if array_content_match:
+                array_content = array_content_match.group(1)
+                
+                # Count elements by splitting on commas outside of function calls
+                array_elements = []
+                current_elem = ''
+                depth = 0
+                
+                for char in array_content:
+                    if char in '([': depth += 1
+                    elif char in ')]': depth -= 1
+                    elif char == ',' and depth == 0:
+                        if current_elem.strip():
+                            array_elements.append(current_elem.strip())
+                        current_elem = ''
+                        continue
+                    current_elem += char
+                
+                if current_elem.strip():
+                    array_elements.append(current_elem.strip())
+                
+                aantal_split = len(array_elements)
+                logging.debug(f"Array has {aantal_split} elements")
+                logging.debug(f"Array elements: {[elem[:30] + '...' if len(elem) > 30 else elem for elem in array_elements]}")
+                
+                # Check for nested arrays (array_agg, ARRAY constructs)
+                # Position is 1-indexed as per macro requirements
+                for idx, elem in enumerate(array_elements, start=1):
+                    if re.search(r'\barray_agg\b', elem, re.IGNORECASE) or 'ARRAY[' in elem.upper():
+                        eventuele_extra_split = idx
+                        logging.debug(f"Found nested array at position {idx} (1-indexed): {elem[:50]}...")
+                        break
+    
+    if aantal_split is None:
+        logging.warning("Could not determine aantal_split, using default 0")
+        aantal_split = 0
+    
     # Determine column roles
     id_cols = [c for c in cte_cols if c in output_cols]
     pivot_cols = [c for c in cte_cols if c not in output_cols]
@@ -73,33 +119,24 @@ def parse_crosstab_to_macro(sql: str) -> str:
     pivot_key = pivot_cols[0]    # Category column
     array_name = pivot_cols[1]   # Values column
     
+    # The pivoted category values are the output columns minus the id columns
+    pivoted_values = [c for c in output_cols if c not in id_cols]
+    
     logging.debug(f"ID columns: {id_cols}")
     logging.debug(f"Pivot key: {pivot_key}, Array: {array_name}")
-    
-    # Get table from query2 for dynamic column list
-    from_match = re.search(r'\bFROM\s+([a-zA-Z_][\w]*)', query2, re.IGNORECASE)
-    pivot_table = from_match.group(1) if from_match else 'unknown_table'
-    
-    # Get column from query2 SELECT
-    pivot_col_match = re.search(r'SELECT\s+(\w+)', query2, re.IGNORECASE)
-    pivot_col = pivot_col_match.group(1) if pivot_col_match else pivot_key
+    logging.debug(f"Pivoted category values: {pivoted_values}")
     
     # Build macro call
     id_cols_str = "[" + ", ".join(f"'{c}'" for c in id_cols) + "]"
+    pivoted_values_str = "[" + ", ".join(f"'{c}'" for c in pivoted_values) + "]"
+    eventuele_extra_split_str = str(eventuele_extra_split) if eventuele_extra_split is not None else 'none'
     
     result = f"""-- Prepare CTE from original query
 WITH prepare AS (
 {query1}
 )
 -- Call snowflake pivot macro
-{{{{ snowflake_pivot_test(
-    dbt_utils.get_column_values(ref('{pivot_table}'), '{pivot_col}'),
-    '{array_name}',
-    '{pivot_key}',
-    4,
-    none,
-    {id_cols_str}
-) }}}}"""
+{{{{snowflake_pivot({pivoted_values_str},'{array_name}', '{pivot_key}', {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}"""
     
     logging.debug("="*80)
     logging.debug("RESULT:")
@@ -139,7 +176,17 @@ if __name__ == "__main__":
         print(result)
         print(f"\n{'='*80}\n")
         
-        output_file = input_file.with_suffix('.output.sql')
+        # Create output files folder at same level as input folder
+        # If input is in sql_files/input_files/, output goes to sql_files/output files/
+        if input_file.parent.name in ['input_files', 'input files']:
+            output_dir = input_file.parent.parent / 'output files'
+        else:
+            output_dir = input_file.parent / 'output files'
+        
+        output_dir.mkdir(exist_ok=True)
+        
+        # Save to output folder with same filename
+        output_file = output_dir / input_file.name
         output_file.write_text(result, encoding='utf-8')
         print(f"Output saved to: {output_file}")
     else:
