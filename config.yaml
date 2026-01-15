@@ -1,7 +1,7 @@
 # Persoonlijke variabeleen 
-dbt_output_path: C:\Users\Max\Github\proigia_dbt\models\dm_dash_new # Pad waar de gegenereerde dbt modellen worden opgeslagen
-dbt_macro_path: C:\Users\Max\Github\proigia_dbt\macros\dm_dash_new # Pad waar de dbt macro's worden opgeslagen
-proigia_defintion_path: C:\Users\Max\Github\proigia_definition # Pad naar de proigia definitie bestanden
+dbt_output_path: /Users/gelderloos/repos/proigia_dbt/models/dm_dash_new # Pad waar de gegenereerde dbt modellen worden opgeslagen
+dbt_macro_path: /Users/gelderloos/repos/proigia_dbt/macros/dm_dash_new # Pad waar de dbt macro's worden opgeslagen
+proigia_defintion_path: /Users/gelderloos/repos/proigia_definition # Pad naar de proigia definitie bestanden
 
 # Logging level: 'all' (INFO+), 'error' (ERROR only), 'debug' (DEBUG+), 'warning' (WARNING+)
 # Het selecteren van een log level niveau heeft invloed op de hoeveelheid informatie die wordt gelogd tijdens de uitvoering van het script.
