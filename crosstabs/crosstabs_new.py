@@ -24,12 +24,44 @@ def parse_crosstab_to_macro(sql: str) -> str:
     query2 = dollar_blocks[1].strip()  # Category query
     
     # Extract output columns from ) AS result (col1 type, col2 type, ...)
-    output_match = re.search(r'\)\s*as\s+\w*\s*\(([^)]+)\)', sql, re.IGNORECASE | re.DOTALL)
+    # Match until the closing ) of the column definition (followed by another ) that closes crosstab())
+    output_match = re.search(r'\)\s*as\s+\w*\s*\((.+?)\)\s*\)', sql, re.IGNORECASE | re.DOTALL)
     if not output_match:
         logging.error("Could not find output columns")
         return ""
     
-    output_cols = [col.strip().split()[0] for col in output_match.group(1).split(',')]
+    output_section = output_match.group(1).strip()
+    
+    # Check for Jinja include or macro call
+    if '{% include' in output_section or '{{' in output_section:
+        logging.info("Detected Jinja template in output columns - using macro call for column list")
+        
+        # Extract the macro name from {% include 'name.pry' %}
+        include_match = re.search(r"{%\s*include\s+['\"](.+?)['\"]", output_section)
+        if include_match:
+            macro_name = include_match.group(1).replace('.pry', '').replace('.sql', '')
+            logging.debug(f"Using macro: {macro_name}")
+        else:
+            # Try to extract from {{ macro() }}
+            macro_match = re.search(r'{{\s*(\w+)\s*\(\s*\)\s*}}', output_section)
+            if macro_match:
+                macro_name = macro_match.group(1)
+            else:
+                logging.warning("Could not determine macro name")
+                macro_name = "unknown_macro"
+        
+        # In this case, parse only the columns before the include
+        cols_before_include = output_section.split('{')[0].strip()
+        if cols_before_include and cols_before_include != '':
+            output_cols = [col.strip().split()[0] for col in cols_before_include.rstrip(',').split(',') if col.strip()]
+        else:
+            output_cols = []
+        
+        use_macro_for_columns = macro_name
+    else:
+        output_cols = [col.strip().split()[0] for col in output_section.split(',')]
+        use_macro_for_columns = None
+    
     logging.debug(f"Output columns: {output_cols}")
     
     # Parse query1 SELECT columns
@@ -128,8 +160,16 @@ def parse_crosstab_to_macro(sql: str) -> str:
     
     # Build macro call
     id_cols_str = "[" + ", ".join(f"'{c}'" for c in id_cols) + "]"
-    pivoted_values_str = "[" + ", ".join(f"'{c}'" for c in pivoted_values) + "]"
     eventuele_extra_split_str = str(eventuele_extra_split) if eventuele_extra_split is not None else 'none'
+    
+    # Handle column list - use macro if detected, otherwise static list
+    if use_macro_for_columns:
+        pivoted_values_str = f"{{{{ {use_macro_for_columns}() }}}}"
+        logging.debug(f"Using macro for column list: {pivoted_values_str}")
+    else:
+        pivoted_values = [c for c in output_cols if c not in id_cols]
+        pivoted_values_str = "[" + ", ".join(f"'{c}'" for c in pivoted_values) + "]"
+        logging.debug(f"Using static column list: {pivoted_values_str}")
     
     result = f"""-- Prepare CTE from original query
 WITH prepare AS (
