@@ -152,7 +152,7 @@ def convert_postgres_to_snowflake(sql: str) -> str:
             sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
         
         # Pre-process: Handle crosstab function (not supported in Snowflake)
-        if 'crosstab' in sql.lower():
+        if 'crosstab(' in sql.lower():
             sql = handle_crosstab(sql)
 
         # Pre-process: Convert unnest(ARRAY[...]) to SELECT ... FROM VALUES (...)
