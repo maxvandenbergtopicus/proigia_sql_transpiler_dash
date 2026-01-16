@@ -46,7 +46,13 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
             macro_file = macro_path / f"{block_name}.sql"
             # Format each column on its own line for readability
             column_lines = ",\n  ".join(f"'{col}'" for col in column_names)
-            macro_content = f"{{% macro {block_name}() %}}\n[\n  {column_lines}\n]\n{{% endmacro %}}\n"
+            macro_content = f"""{{% macro {block_name}() %}}
+{{%- set categories = [
+  {column_lines}
+] -%}}
+{{{{ return(categories) }}}}
+{{% endmacro %}}
+"""
             
             with open(macro_file, 'w', encoding='utf-8') as f:
                 f.write(macro_content)
@@ -78,7 +84,14 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         macro_path.mkdir(parents=True, exist_ok=True)
         
         macro_file = macro_path / f"{block_name}.sql"
-        macro_content = f"{{% macro {block_name}() %}}\n{converted_sql}\n{{% endmacro %}}\n"
+        
+        # Check if macro contains {{praktijk_agb}} and add variable declaration if needed
+        macro_header = f"{{% macro {block_name}() %}}\n"
+        if '{{praktijk_agb}}' in converted_sql or '{{ praktijk_agb }}' in converted_sql:
+            macro_header += "{%- set praktijk_agb = var('praktijk_agb', 0) %}\n"
+            logging.debug(f"Added praktijk_agb variable to macro {block_name}")
+        
+        macro_content = f"{macro_header}{converted_sql}\n{{% endmacro %}}\n"
         
         # Ensure file is overwritten by explicitly using open with 'w' mode
         with open(macro_file, 'w', encoding='utf-8') as f:
@@ -246,8 +259,20 @@ def generate_dbt_model(
         # Restore macro calls
         for idx, macro in enumerate(macros):
             placeholder = f"__DBT_MACRO_{idx}__"
-            converted_sql = converted_sql.replace(placeholder, macro)
-            logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
+            
+            # Check if placeholder is in a set statement context
+            # In that case, restore without the {{ }} brackets
+            pattern_in_set = rf'\{{%\-\s*set\s+\w+\s*=\s*{re.escape(placeholder)}\s*\-%\}}'
+            if re.search(pattern_in_set, converted_sql):
+                # Extract just the macro call without {{ }}
+                macro_without_brackets = re.sub(r'^\{\{\s*', '', macro)
+                macro_without_brackets = re.sub(r'\s*\}\}$', '', macro_without_brackets)
+                converted_sql = converted_sql.replace(placeholder, macro_without_brackets)
+                logging.debug(f"Restored macro in set context: '{placeholder}' -> '{macro_without_brackets}'")
+            else:
+                # Normal restoration with {{ }}
+                converted_sql = converted_sql.replace(placeholder, macro)
+                logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
         # Replace all SQL comments with Jinja comments (after SQL conversion)
         # Multi-line comments: /* ... */  ->  {# ... #}
         converted_sql = re.sub(r'/\*', r'{#', converted_sql)
@@ -359,7 +384,7 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
         'allergie', 'bepaling', 'contact', 'contraindicatie', 'episode', 'journaal',
         'journaalregel', 'medewerker', 'medicatie', 'metadata', 'origineel',
         'patient', 'praktijk', 'ruiter', 'verrichting', 'verwijzing', 
-        'override_patientenlijst', 'functie', 'medewerker_hisnaam'
+        'override_patientenlijst', 'functie', 'medewerker_hisnaam', 
     ]
     seed_table_lookup = {k.lower(): v for k, v in (seed_tables or {}).items()}
     
@@ -396,9 +421,9 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
         keyword, table = match.group(1), match.group(2)
         table_lower = table.lower()
         
-        # Skip CTEs, TABLE keyword, or tables with dots/parens
+        # Skip CTEs, TABLE keyword, tables with dots/parens, or draaitabel_ct (created by snowflake_pivot macro)
         if (table_lower in cte_names or table.upper() == 'TABLE' or 
-            '(' in table or '.' in table):
+            '(' in table or '.' in table or table_lower == 'draaitabel_ct'):
             return match.group(0)
         
         # External tables get STG prefix

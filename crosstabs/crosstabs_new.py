@@ -24,17 +24,23 @@ def parse_crosstab_to_macro(sql: str) -> str:
     query2 = dollar_blocks[1].strip()  # Category query
     
     # Extract output columns from ) AS result (col1 type, col2 type, ...)
-    # Match until the closing ) of the column definition (followed by another ) that closes crosstab())
-    output_match = re.search(r'\)\s*as\s+\w*\s*\((.+?)\)\s*\)', sql, re.IGNORECASE | re.DOTALL)
+    # Match until the closing ) of the column definition
+    # Pattern handles: ...AS ct(...)) or ...AS ct(...) or ...AS ct(...);
+    # Allow whitespace/newlines between AS and identifier and opening paren
+    output_match = re.search(r'\)\s*as\s+(\w*)\s*\((.+?)\)\s*(?:\)|;|$)', sql, re.IGNORECASE | re.DOTALL)
     if not output_match:
         logging.error("Could not find output columns")
         return ""
     
-    output_section = output_match.group(1).strip()
+    output_section = output_match.group(2).strip()
     
-    # Check for Jinja include or macro call
-    if '{% include' in output_section or '{{' in output_section:
-        logging.info("Detected Jinja template in output columns - using macro call for column list")
+    logging.debug(f"Output section before processing: {output_section[:200]}...")
+    
+    # Check for Jinja include, macro call, or preserved macro placeholder
+    has_macro = ('{% include' in output_section or '{{' in output_section or '__DBT_MACRO_' in output_section)
+    
+    if has_macro:
+        logging.info("Detected Jinja template or preserved macro in output columns - using macro call for column list")
         
         # Extract the macro name from {% include 'name.pry' %}
         include_match = re.search(r"{%\s*include\s+['\"](.+?)['\"]", output_section)
@@ -47,20 +53,31 @@ def parse_crosstab_to_macro(sql: str) -> str:
             if macro_match:
                 macro_name = macro_match.group(1)
             else:
-                logging.warning("Could not determine macro name")
-                macro_name = "unknown_macro"
+                # Check for preserved macro placeholder __DBT_MACRO_N__
+                placeholder_match = re.search(r'__DBT_MACRO_(\d+)__', output_section)
+                if placeholder_match:
+                    # Extract just the placeholder identifier, we'll use it as the macro name
+                    macro_name = f"__DBT_MACRO_{placeholder_match.group(1)}__"
+                else:
+                    logging.warning("Could not determine macro name")
+                    macro_name = "unknown_macro"
         
-        # In this case, parse only the columns before the include
-        cols_before_include = output_section.split('{')[0].strip()
-        if cols_before_include and cols_before_include != '':
-            output_cols = [col.strip().split()[0] for col in cols_before_include.rstrip(',').split(',') if col.strip()]
+        # Parse only the columns BEFORE the include/macro (these are the ID columns)
+        # Remove the macro/include part and placeholders completely first
+        cols_before_macro = re.sub(r'{%.*?%}|\{\{.*?\}\}|__DBT_MACRO_\d+__', '', output_section, flags=re.DOTALL).strip()
+        if cols_before_macro and cols_before_macro.rstrip(','):
+            # Parse column names (before type declarations)
+            output_cols = [col.strip().split()[0] for col in cols_before_macro.rstrip(',').split(',') if col.strip()]
         else:
             output_cols = []
         
         use_macro_for_columns = macro_name
+        logging.debug(f"Set use_macro_for_columns = {use_macro_for_columns}")
+        logging.debug(f"Parsed output_cols (ID columns): {output_cols}")
     else:
         output_cols = [col.strip().split()[0] for col in output_section.split(',')]
         use_macro_for_columns = None
+        logging.debug(f"No Jinja detected, parsed all output_cols: {output_cols}")
     
     logging.debug(f"Output columns: {output_cols}")
     
@@ -97,16 +114,24 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # Analyze ARRAY construction to determine aantal_split and eventuele_extra_split
     aantal_split = None
     eventuele_extra_split = None
+    contains_aggregation = False
+    array_column_expr = None
     
     # Find the values column that contains the ARRAY
     for col_expr in columns:
-        if col_expr.strip().upper().startswith('ARRAY['):
-            # Extract array elements
-            array_content_match = re.search(r'ARRAY\[(.*?)\]', col_expr, re.IGNORECASE | re.DOTALL)
-            if array_content_match:
-                array_content = array_content_match.group(1)
+        if 'ARRAY[' in col_expr.upper() or 'ARRAY_CONSTRUCT' in col_expr.upper():
+            array_column_expr = col_expr
+            
+            # Extract array content between brackets/parens
+            if 'ARRAY[' in col_expr.upper():
+                match = re.search(r'ARRAY\[(.*)\]\s+as', col_expr, re.IGNORECASE | re.DOTALL)
+            else:
+                match = re.search(r'ARRAY_CONSTRUCT\((.*)\)\s+as', col_expr, re.IGNORECASE | re.DOTALL)
+            
+            if match:
+                array_content = match.group(1)
                 
-                # Count elements by splitting on commas outside of function calls
+                # Split by commas at depth 0 to get individual elements
                 array_elements = []
                 current_elem = ''
                 depth = 0
@@ -125,16 +150,22 @@ def parse_crosstab_to_macro(sql: str) -> str:
                     array_elements.append(current_elem.strip())
                 
                 aantal_split = len(array_elements)
-                logging.debug(f"Array has {aantal_split} elements")
-                logging.debug(f"Array elements: {[elem[:30] + '...' if len(elem) > 30 else elem for elem in array_elements]}")
                 
-                # Check for nested arrays (array_agg, ARRAY constructs)
-                # Position is 1-indexed as per macro requirements
-                for idx, elem in enumerate(array_elements, start=1):
-                    if re.search(r'\barray_agg\b', elem, re.IGNORECASE) or 'ARRAY[' in elem.upper():
-                        eventuele_extra_split = idx
-                        logging.debug(f"Found nested array at position {idx} (1-indexed): {elem[:50]}...")
+                # Check for aggregation functions
+                agg_functions = ['max', 'min', 'count', 'sum', 'avg']
+                for elem in array_elements:
+                    if any(f'{func}('.upper() in elem.upper() for func in agg_functions):
+                        contains_aggregation = True
                         break
+                
+                # Check for nested arrays (array_agg)
+                for idx, elem in enumerate(array_elements, start=1):
+                    if 'array_agg'.upper() in elem.upper() or 'ARRAY[' in elem.upper():
+                        eventuele_extra_split = idx
+                        break
+                
+                logging.debug(f"Array has {aantal_split} elements, aggregation={contains_aggregation}, nested_at={eventuele_extra_split}")
+                break
     
     if aantal_split is None:
         logging.warning("Could not determine aantal_split, using default 0")
@@ -163,20 +194,68 @@ def parse_crosstab_to_macro(sql: str) -> str:
     eventuele_extra_split_str = str(eventuele_extra_split) if eventuele_extra_split is not None else 'none'
     
     # Handle column list - use macro if detected, otherwise static list
+    macro_variable_declaration = ""
     if use_macro_for_columns:
-        pivoted_values_str = f"{{{{ {use_macro_for_columns}() }}}}"
-        logging.debug(f"Using macro for column list: {pivoted_values_str}")
+        # Set variable first, then use it in the function call
+        if use_macro_for_columns.startswith('__DBT_MACRO_'):
+            # Placeholder - it will be restored to {{ macro() }}, but we need just macro()
+            # So we keep the placeholder and it will be restored in the set statement context
+            # dbt_wrapper will restore it to {{ macro() }}, but we need to strip those
+            # Actually, let's just use the placeholder as-is and handle restoration differently
+            macro_variable_declaration = f"{{%- set categorie_list = {use_macro_for_columns} -%}}\n"
+        else:
+            # Regular macro name - call it directly without {{ }}
+            macro_variable_declaration = f"{{%- set categorie_list = {use_macro_for_columns}() -%}}\n"
+        pivoted_values_str = "categorie_list"
+        logging.debug(f"Using macro for column list with variable declaration")
     else:
         pivoted_values = [c for c in output_cols if c not in id_cols]
         pivoted_values_str = "[" + ", ".join(f"'{c}'" for c in pivoted_values) + "]"
         logging.debug(f"Using static column list: {pivoted_values_str}")
     
+    # Convert ARRAY[] to ARRAY_CONSTRUCT and wrap with array_to_string if needed
+    modified_query1 = query1
+    
+    logging.info(f"=== Array wrapping check: contains_aggregation={contains_aggregation}, array_column_expr={array_column_expr}")
+    
+    if contains_aggregation and array_column_expr:
+        logging.info(f"WRAPPING: Array contains aggregation functions - wrapping with array_to_string")
+        
+        # Try ARRAY[ first (PostgreSQL syntax)
+        pattern = r'ARRAY\s*\[((?:[^\[\]]|\[(?:[^\[\]]|\[[^\[\]]*\])*\])*)\]\s+as\s+' + re.escape(array_name)
+        match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
+        
+        if match:
+            logging.info("Found ARRAY[ pattern - replacing with array_to_string wrapper")
+            array_content = match.group(1)
+            replacement = f"array_to_string(ARRAY_CONSTRUCT({array_content}),';') as {array_name}"
+            modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
+        else:
+            # Try ARRAY_CONSTRUCT( (Snowflake syntax)
+            pattern = r'ARRAY_CONSTRUCT\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)\s+as\s+' + re.escape(array_name)
+            match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
+            
+            if match:
+                logging.info("Found ARRAY_CONSTRUCT pattern - replacing with array_to_string wrapper")
+                array_content = match.group(1)
+                replacement = f"array_to_string(ARRAY_CONSTRUCT({array_content}),';') as {array_name}"
+                modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
+            else:
+                logging.warning(f"NO MATCH: Could not find ARRAY[ or ARRAY_CONSTRUCT pattern with 'as {array_name}'")
+    else:
+        logging.info(f"NO WRAPPING: Converting ARRAY[] to ARRAY_CONSTRUCT() without wrapping")
+        # No aggregation, just convert ARRAY[] to ARRAY_CONSTRUCT()
+        modified_query1 = re.sub(r'ARRAY\s*\[', 'ARRAY_CONSTRUCT(', modified_query1, flags=re.IGNORECASE)
+        modified_query1 = re.sub(r'\]\s+as\s+' + re.escape(array_name), f') as {array_name}', modified_query1, flags=re.IGNORECASE)
+    
     result = f"""-- Prepare CTE from original query
-WITH prepare AS (
-{query1}
+{macro_variable_declaration}WITH prepare AS (
+{modified_query1}
 )
 -- Call snowflake pivot macro
-{{{{snowflake_pivot({pivoted_values_str},'{array_name}', '{pivot_key}', {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}"""
+{{{{snowflake_pivot({pivoted_values_str},'{array_name}', '{pivot_key}', {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}
+
+SELECT * FROM draaitabel_ct"""
     
     logging.debug("="*80)
     logging.debug("RESULT:")
