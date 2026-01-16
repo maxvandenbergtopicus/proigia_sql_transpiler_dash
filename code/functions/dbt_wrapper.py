@@ -63,14 +63,17 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         # Regular block processing
         preprocessed = preprocess_sql(content)
         
-        # Replace custom functions with dbt macros (before sqlglot conversion)
+        # Convert PostgreSQL to Snowflake FIRST (before function macro replacement)
         function_macros = config.get('function_macros', [])
-        if function_macros:
-            preprocessed = replace_functions_with_macros(preprocessed, function_macros)
+        converted_sql = convert_postgres_to_snowflake(preprocessed, function_macros=function_macros)
         
-        converted_sql = convert_postgres_to_snowflake(preprocessed)
+        # Replace custom functions with dbt macros AFTER sqlglot conversion
+        if function_macros:
+            converted_sql = replace_functions_with_macros(converted_sql, function_macros)
+        
         # For blocks: only replace external tables, leave all others unchanged
-        converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, is_block=True)
+        model_refs = config.get('model_refs', [])
+        converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, model_refs=model_refs, is_block=True)
         
         # Extract all table/view names created by this block (look for "name AS (")
         created_tables = set()
@@ -143,69 +146,27 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     """Replace SQL function calls with dbt macro calls.
     
     Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
+    Example: indelingen.translate_labcode_answers(col::int, val) -> {{ translate_labcode_answers('col::int', 'val') }}
     """
     for func_name in function_names:
-        # Match function_name(...) - case insensitive
-        # Use a simpler approach: find function name followed by parentheses
-        # and extract content up to the matching closing paren
-        pattern = re.compile(
-            rf'\b{re.escape(func_name)}\s*\(',
-            re.IGNORECASE
-        )
+        # Match indelingen.function_name(...) or function_name(...)
+        # [^)]* matches simple cases without nested parentheses
+        pattern = rf'\b(?:indelingen\.)?{re.escape(func_name)}\s*\(([^)]*)\)'
         
-        # Find all matches and replace them
-        offset = 0
-        result = []
-        last_end = 0
-        
-        for match in pattern.finditer(sql):
-            start = match.start()
-            # Find the matching closing parenthesis
-            paren_start = match.end()
-            depth = 1
-            i = paren_start
-            in_string = False
-            string_char = None
+        def replacer(match):
+            args = match.group(1).strip()
+            macro_name = func_name.lower()
             
-            while i < len(sql) and depth > 0:
-                char = sql[i]
-                # Handle string literals
-                if char in ("'", '"') and (i == 0 or sql[i-1] != '\\'):
-                    if not in_string:
-                        in_string = True
-                        string_char = char
-                    elif char == string_char:
-                        in_string = False
-                        string_char = None
-                elif not in_string:
-                    if char == '(':
-                        depth += 1
-                    elif char == ')':
-                        depth -= 1
-                i += 1
+            if not args:
+                return f"{{{{ {macro_name}() }}}}"
             
-            if depth == 0:
-                args = sql[paren_start:i-1].strip()
-                macro_name = func_name.lower()
-                
-                # Add the text before this match
-                result.append(sql[last_end:start])
-                
-                # Add the macro call
-                if args:
-                    result.append(f"{{{{ {macro_name}('{args}') }}}}")
-                else:
-                    result.append(f"{{{{ {macro_name}() }}}}")
-                
-                last_end = i
+            # Simple split by comma and quote each argument
+            arg_list = [arg.strip() for arg in args.split(',')]
+            quoted_args = ', '.join(f"'{arg}'" for arg in arg_list)
+            return f"{{{{ {macro_name}({quoted_args}) }}}}"
         
-        # Add remaining text
-        result.append(sql[last_end:])
-        sql = ''.join(result)
-        
-        count = len([m for m in pattern.finditer(''.join(result))])
-        if count > 0:
-            logging.debug(f"Replaced function {func_name} with macro calls")
+        sql = re.sub(pattern, replacer, sql, flags=re.IGNORECASE)
+        logging.info(f"Processed function: {func_name}")
     
     return sql
 
@@ -233,14 +194,10 @@ def generate_dbt_model(
         # Preprocess SQL (handles comment conversion and includes)
         preprocessed = preprocess_sql(query)
         
-        # Replace custom functions with dbt macros (before sqlglot conversion)
-        function_macros = config.get('function_macros', [])
-        if function_macros:
-            preprocessed = replace_functions_with_macros(preprocessed, function_macros)
-        
         # Preserve dbt macro calls by replacing them with placeholders (to survive sqlglot)
         # Match macros with or without arguments: {{ macro() }} or {{ macro('arg') }}
-        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^)]*\)\s*\}\})"
+        # Updated pattern to handle quotes and nested parentheses properly
+        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^}]*\)\s*\}\})"
         macros = []
         
         def macro_replacer(match):
@@ -254,7 +211,13 @@ def generate_dbt_model(
         logging.debug(f"Found {len(macros)} macro calls to preserve")
         
         # Convert SQL from PostgreSQL to Snowflake
-        converted_sql = convert_postgres_to_snowflake(temp_sql)
+        function_macros = config.get('function_macros', [])
+        converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=function_macros)
+        
+        # Replace custom functions with dbt macros AFTER sqlglot conversion
+        if function_macros:
+            converted_sql = replace_functions_with_macros(converted_sql, function_macros)
+            logging.debug(f"After function replacement (first 500 chars): {converted_sql[:500]}")
         
         # Restore macro calls
         for idx, macro in enumerate(macros):
@@ -298,9 +261,14 @@ def generate_dbt_model(
         logging.debug(f"SQL after CREATE VIEW removal (first 500 chars): {converted_sql[:500]}")
         
         # Replace table references with dbt macros
-        converted_sql = replace_table_references(converted_sql, block_tables=block_tables, seed_tables=seed_tables)
-        # Ensure it starts with WITH or SELECT
+        model_refs = config.get('model_refs', [])
+        converted_sql = replace_table_references(converted_sql, block_tables=block_tables, seed_tables=seed_tables, model_refs=model_refs)
+        
+        # Ensure it starts with WITH or SELECT and remove trailing semicolon
         converted_sql = converted_sql.strip()
+        if converted_sql.endswith(';'):
+            converted_sql = converted_sql[:-1].strip()
+            
         if not re.match(r'^(WITH|SELECT)', converted_sql, re.IGNORECASE):
             print(f"[WARNING] Query doesn't start with WITH or SELECT after removing CREATE VIEW")
             print(f"First 100 chars: {converted_sql[:100]}")
@@ -371,15 +339,18 @@ def generate_dbt_model(
         traceback.print_exc()
 
 
-def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None, is_block=False) -> str:
+def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None, model_refs=None, is_block=False) -> str:
     """Replace table references in FROM/JOIN with dbt ref() or STG.P{{praktijk_agb}}.table.
     
     Args:
         is_block: If True, only replace external tables. All other tables remain unchanged.
                   If False, replace external tables with STG prefix and other tables with ref().
+        model_refs: List of table names that should be replaced with {{ ref('table_name') }}
     """
     # Set defaults
     block_tables = block_tables or set()
+    model_refs = model_refs or []
+    model_refs_lower = [m.lower() for m in model_refs]
     external_tables = external_tables or [
         'allergie', 'bepaling', 'contact', 'contraindicatie', 'episode', 'journaal',
         'journaalregel', 'medewerker', 'medicatie', 'metadata', 'origineel',
@@ -402,11 +373,24 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
     
     logging.debug(f"Detected CTEs: {cte_names}, Block tables: {block_tables}")
     
-    # Replace schema-qualified seed tables first (schema.table -> seed reference)
+    # Replace indelingen. prefix pattern first (indelingen.table -> DWH.REFERENCE_DATA.table)
+    indelingen_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+indelingen\.([a-zA-Z_][\w]*)\b(?!\s*\(|::)'
+    
+    def indelingen_replacer(match):
+        keyword, table = match.group(1), match.group(2)
+        logging.debug(f"Replacing indelingen.{table} -> DWH.REFERENCE_DATA.{table}")
+        return f"{keyword} DWH.REFERENCE_DATA.{table}"
+    
+    sql = re.sub(indelingen_pattern, indelingen_replacer, sql, flags=re.IGNORECASE)
+    
+    # Replace schema-qualified seed tables (schema.table -> seed reference from config)
     schema_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b(?!\s*\(|::)'
     
     def schema_replacer(match):
         keyword, schema, table = match.group(1), match.group(2), match.group(3)
+        # Skip indelingen schema as it's already handled
+        if schema.lower() == 'indelingen':
+            return match.group(0)
         if table.lower() in seed_table_lookup:
             logging.debug(f"Replacing seed: {schema}.{table}")
             return f"{keyword} {seed_table_lookup[table.lower()]}"
@@ -425,6 +409,11 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
         if (table_lower in cte_names or table.upper() == 'TABLE' or 
             '(' in table or '.' in table or table_lower == 'draaitabel_ct'):
             return match.group(0)
+        
+        # Model refs get {{ ref('model_name') }} replacement
+        if table_lower in model_refs_lower:
+            logging.debug(f"Model ref: {table} -> ref('{table_lower}')")
+            return f"{keyword} {{{{ ref('{table_lower}') }}}}"
         
         # External tables get STG prefix
         if table_lower in [t.lower() for t in external_tables]:

@@ -42,6 +42,20 @@ class FixedSnowflake(Snowflake):
             expressions = self.expressions(expression, flat=True)
             return f"ARRAY_CONSTRUCT({expressions})"
         
+        def anonymous_sql(self, expression: exp.Anonymous) -> str:
+            """Handle AGE function conversion to DATEDIFF"""
+            if expression.this.upper() == "AGE":
+                args = expression.expressions
+                if len(args) == 2:
+                    # AGE(end, start) -> DATEDIFF(year, start, end)
+                    return f"DATEDIFF(year, {self.sql(args[1])}, {self.sql(args[0])})"
+                elif len(args) == 1:
+                    # AGE(timestamp) -> DATEDIFF(year, timestamp, CURRENT_TIMESTAMP())
+                    return f"DATEDIFF(year, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
+            
+            # For other anonymous functions, use default behavior
+            return super().anonymous_sql(expression)
+        
         def eq_sql(self, expression: exp.EQ) -> str:
             """Convert 'value' = ANY(array) to ARRAY_CONTAINS(TO_VARIANT(value), array)"""
             # Check if right side is ANY
@@ -176,7 +190,7 @@ def convert_postgres_escape_strings(sql: str) -> str:
     return ''.join(result)
 
 
-def convert_postgres_to_snowflake(sql: str) -> str:
+def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str:
     """Convert SQL from PostgreSQL to Snowflake dialect using sqlglot."""
     try:
         # Pre-process: Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
@@ -196,6 +210,11 @@ def convert_postgres_to_snowflake(sql: str) -> str:
             sql = sql.replace('array_accum', 'array_agg')
             sql = sql.replace('ARRAY_ACCUM', 'ARRAY_AGG')
         
+        # Pre-process: Replace string_to_array with SPLIT
+        if 'string_to_array' in sql.lower():
+            logging.info("Converting string_to_array to SPLIT")
+            sql = re.sub(r'\bstring_to_array\b', 'SPLIT', sql, flags=re.IGNORECASE)
+        
         # Pre-process: Remove MATERIALIZED keyword from CTEs (not supported in Snowflake)
         if 'materialized' in sql.lower():
             logging.info("Removing MATERIALIZED keyword from CTEs")
@@ -207,6 +226,12 @@ def convert_postgres_to_snowflake(sql: str) -> str:
             logging.info("Converting SIMILAR TO to RLIKE")
             sql = re.sub(r'\bSIMILAR\s+TO\b', 'RLIKE', sql, flags=re.IGNORECASE)
         
+        # Pre-process: Convert PostgreSQL regex match operator ~ to RLIKE
+        if '~' in sql:
+            logging.info("Converting PostgreSQL regex match operator ~ to RLIKE")
+            # Replace ~ with RLIKE (but not ~* which is case-insensitive and handled separately)
+            sql = re.sub(r'(\s)~(\s)', r'\1RLIKE\2', sql)
+        
         # Pre-process: Convert ARRAY[...] to ARRAY_CONSTRUCT(...)
         if 'array[' in sql.lower():
             logging.info("Converting ARRAY[...] to ARRAY_CONSTRUCT(...)")
@@ -217,8 +242,13 @@ def convert_postgres_to_snowflake(sql: str) -> str:
             logging.info("Removing PostgreSQL array type casts")
             sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
         
+        # Pre-process: Convert PostgreSQL array overlap operator && to ARRAYS_OVERLAP
+        if '&&' in sql:
+            logging.info("Converting PostgreSQL array overlap operator && to ARRAYS_OVERLAP")
+            sql = convert_array_overlap_to_snowflake(sql)
+        
         # Pre-process: Handle crosstab function (not supported in Snowflake)
-        if 'crosstab' in sql.lower():
+        if re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE):
             sql = handle_crosstab(sql)
 
         # Pre-process: Convert unnest(ARRAY[...]) to SELECT ... FROM VALUES (...)
@@ -240,6 +270,26 @@ def convert_postgres_to_snowflake(sql: str) -> str:
     except Exception as e:
         sys.stderr.write(f"[Error] Failed to convert SQL: {e}\n")
         return sql
+
+def convert_array_overlap_to_snowflake(sql: str) -> str:
+    """
+    Convert PostgreSQL array overlap operator && to Snowflake ARRAYS_OVERLAP function.
+    Handles patterns like: array1::int[] && ARRAY[...] -> ARRAYS_OVERLAP(array1, ARRAY_CONSTRUCT(...))
+    """
+    # Remove ::type[] casts before && operator, then replace && with function call
+    # Match: anything && ARRAY[...]
+    def repl(match):
+        left = match.group(1).strip()
+        right = match.group(2).strip()
+        # Remove ::type[] from left side
+        left = re.sub(r'::\w+\[\]\s*$', '', left).strip()
+        # Convert ARRAY[...] to ARRAY_CONSTRUCT(...) on right side
+        right = convert_array_to_array_construct(right)
+        return f"ARRAYS_OVERLAP({left}, {right})"
+    
+    # Pattern: capture left side (up to &&) and right side (ARRAY[...])
+    return re.sub(r'([\w_]+\([^)]*(?:\([^)]*\))*[^)]*\)|[\w_]+)(?:::\w+\[\])?\s*&&\s*(ARRAY_CONSTRUCT\([^)]+\)|ARRAY\[[^\]]+\])', 
+                  repl, sql, flags=re.IGNORECASE)
 
 def convert_unnest_array_to_values(sql: str) -> str:
     """
@@ -474,4 +524,27 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
         # Snowflake DATEADD syntax: DATEADD(unit, amount, base)
         return f"DATEADD({unit}, {amount_val}, {base})"
     
-    return pattern.sub(repl, sql)
+    sql = pattern.sub(repl, sql)
+    
+    # Pattern 3: date + concat(..., ' unit')::interval (dynamic interval from string concat)
+    # Example: '1900-01-01'::date + concat(cast(value as varchar), ' day')::interval
+    pattern3 = re.compile(
+        r"(\([^)]+\)(?:::\w+)?|'[^']+'::\w+|\w+(?:::\w+)?)"  # base: parenthesized expr, string literal, or column (with optional cast)
+        r"\s*([-+])\s*"  # operator
+        r"concat\s*\(([^)]+),\s*'[^']*\s*(year|month|day|hour|minute|second)s?[^']*'\s*\)::interval",
+        re.IGNORECASE
+    )
+    
+    def repl3(match):
+        base = match.group(1).strip()
+        operator = match.group(2)
+        amount_expr = match.group(3).strip()
+        unit = match.group(4).upper()
+        
+        # Apply operator to amount
+        if operator == '-':
+            amount_expr = f"-({amount_expr})"
+        
+        return f"DATEADD({unit}, {amount_expr}, {base})"
+    
+    return pattern3.sub(repl3, sql)
