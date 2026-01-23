@@ -23,6 +23,67 @@ def parse_crosstab_to_macro(sql: str) -> str:
     query1 = dollar_blocks[0].strip()  # Main data query
     query2 = dollar_blocks[1].strip()  # Category query
     
+    # Check if query1 contains CTEs (WITH clause) and extract them
+    inner_ctes = ""
+    query1_without_ctes = query1
+    
+    with_match = re.match(r'^\s*WITH\s+', query1, re.IGNORECASE)
+    if with_match:
+        logging.info("Detected CTEs inside query1, extracting them")
+        
+        # Find the last SELECT statement (the main query after all CTEs)
+        # Strategy: Find all top-level SELECT keywords and take the last one
+        # We need to track parenthesis depth to avoid matching SELECTs inside CTEs
+        
+        # Find the position of the main SELECT (after all CTEs)
+        depth = 0
+        in_string = False
+        string_char = None
+        select_positions = []
+        i = 0
+        
+        while i < len(query1):
+            char = query1[i]
+            
+            # Track string literals
+            if char in ('"', "'") and (i == 0 or query1[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+            
+            # Track parenthesis depth (only outside strings)
+            if not in_string:
+                if char == '(':
+                    depth += 1
+                elif char == ')':
+                    depth -= 1
+                # Look for SELECT at depth 0
+                elif depth == 0 and query1[i:i+6].upper() == 'SELECT':
+                    select_positions.append(i)
+            
+            i += 1
+        
+        if select_positions:
+            # Use the last SELECT at depth 0 (the main query)
+            main_select_pos = select_positions[-1]
+            
+            # Everything before the main SELECT is CTEs
+            inner_ctes = query1[:main_select_pos].strip()
+            # Remove trailing comma if present
+            inner_ctes = re.sub(r',\s*$', '', inner_ctes)
+            
+            # The main query is everything from SELECT onwards
+            query1_without_ctes = query1[main_select_pos:].strip()
+            
+            logging.debug(f"Extracted {len(select_positions)} SELECT statements, using last one as main query")
+            logging.debug(f"Inner CTEs length: {len(inner_ctes)} chars")
+            logging.debug(f"Main query length: {len(query1_without_ctes)} chars")
+        else:
+            logging.warning("Found WITH but no SELECT statements")
+    
     # Extract output columns from ) AS result (col1 type, col2 type, ...)
     # Match until the closing ) of the column definition
     # Pattern handles: ...AS ct(...)) or ...AS ct(...) or ...AS ct(...);
@@ -81,8 +142,8 @@ def parse_crosstab_to_macro(sql: str) -> str:
     
     logging.debug(f"Output columns: {output_cols}")
     
-    # Parse query1 SELECT columns
-    select_match = re.search(r'SELECT\s+(.*?)\s+FROM', query1, re.IGNORECASE | re.DOTALL)
+    # Parse query1 SELECT columns (use query1_without_ctes to avoid parsing CTE selects)
+    select_match = re.search(r'SELECT\s+(.*?)\s+FROM', query1_without_ctes, re.IGNORECASE | re.DOTALL)
     if not select_match:
         logging.error("No SELECT found in query1")
         return ""
@@ -122,11 +183,11 @@ def parse_crosstab_to_macro(sql: str) -> str:
         if 'ARRAY[' in col_expr.upper() or 'ARRAY_CONSTRUCT' in col_expr.upper():
             array_column_expr = col_expr
             
-            # Extract array content between brackets/parens
+            # Extract array content between brackets/parens (with or without 'as alias')
             if 'ARRAY[' in col_expr.upper():
-                match = re.search(r'ARRAY\[(.*)\]\s+as', col_expr, re.IGNORECASE | re.DOTALL)
+                match = re.search(r'ARRAY\[(.*)\](?:\s+as)?', col_expr, re.IGNORECASE | re.DOTALL)
             else:
-                match = re.search(r'ARRAY_CONSTRUCT\((.*)\)\s+as', col_expr, re.IGNORECASE | re.DOTALL)
+                match = re.search(r'ARRAY_CONSTRUCT\((.*)\)(?:\s+as)?', col_expr, re.IGNORECASE | re.DOTALL)
             
             if match:
                 array_content = match.group(1)
@@ -214,7 +275,8 @@ def parse_crosstab_to_macro(sql: str) -> str:
         logging.debug(f"Using static column list: {pivoted_values_str}")
     
     # Convert ARRAY[] to ARRAY_CONSTRUCT and wrap with array_to_string if needed
-    modified_query1 = query1
+    # Use query1_without_ctes (the SELECT part only, not the CTEs)
+    modified_query1 = query1_without_ctes
     
     logging.info(f"=== Array wrapping check: contains_aggregation={contains_aggregation}, array_column_expr={array_column_expr}")
     
@@ -246,14 +308,48 @@ def parse_crosstab_to_macro(sql: str) -> str:
         logging.info(f"NO WRAPPING: Converting ARRAY[] to ARRAY_CONSTRUCT() without wrapping")
         # No aggregation, just convert ARRAY[] to ARRAY_CONSTRUCT()
         modified_query1 = re.sub(r'ARRAY\s*\[', 'ARRAY_CONSTRUCT(', modified_query1, flags=re.IGNORECASE)
-        modified_query1 = re.sub(r'\]\s+as\s+' + re.escape(array_name), f') as {array_name}', modified_query1, flags=re.IGNORECASE)
+        
+        # Always enforce the alias after conversion
+        # If the ARRAY_CONSTRUCT has an alias, normalize it
+        if re.search(r'ARRAY_CONSTRUCT\([^)]*\)\s+as\s+\w+', modified_query1, re.IGNORECASE):
+            modified_query1 = re.sub(r'ARRAY_CONSTRUCT\(([^)]*)\)\s+as\s+(\w+)', r'ARRAY_CONSTRUCT(\1) as \2', modified_query1, flags=re.IGNORECASE)
+        else:
+            # ARRAY doesn't have an alias - add default alias 'waardes'
+            array_name = 'waardes'
+            logging.info(f"ARRAY column has no alias, enforcing default alias: {array_name}")
+            # Add alias after closing parenthesis
+            modified_query1 = re.sub(r'ARRAY_CONSTRUCT\(([^)]*)\)(\s*(FROM|ORDER|GROUP|WHERE|LIMIT|\)|$))', rf'ARRAY_CONSTRUCT(\1) as {array_name}\2', modified_query1, flags=re.IGNORECASE)
     
-    result = f"""-- Prepare CTE from original query
+    # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
+    if "'" in pivot_key:
+        pivot_key_quoted = f'"{pivot_key}"'
+    else:
+        pivot_key_quoted = f"'{pivot_key}'"
+    
+    # Similarly handle array_name
+    if "'" in array_name:
+        array_name_quoted = f'"{array_name}"'
+    else:
+        array_name_quoted = f"'{array_name}'"
+    
+    # Build the result - if there are inner CTEs, place them before the prepare CTE
+    if inner_ctes:
+        result = f"""-- CTEs extracted from crosstab query
+{macro_variable_declaration}{inner_ctes},
+prepare AS (
+{modified_query1}
+)
+-- Call snowflake pivot macro
+{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}
+
+SELECT * FROM draaitabel_ct"""
+    else:
+        result = f"""-- Prepare CTE from original query
 {macro_variable_declaration}WITH prepare AS (
 {modified_query1}
 )
 -- Call snowflake pivot macro
-{{{{snowflake_pivot({pivoted_values_str},'{array_name}', '{pivot_key}', {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}
+{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}
 
 SELECT * FROM draaitabel_ct"""
     

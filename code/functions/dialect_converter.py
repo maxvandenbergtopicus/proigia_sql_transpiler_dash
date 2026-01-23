@@ -192,6 +192,10 @@ def convert_postgres_escape_strings(sql: str) -> str:
 
 def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str:
     """Convert SQL from PostgreSQL to Snowflake dialect using sqlglot."""
+    # Pre-process: Convert LIKE ANY(array) to Snowflake-compatible EXISTS(SELECT ... LIKE ...)
+    if re.search(r'LIKE\s+ANY\s*\(', sql, re.IGNORECASE):
+        logging.info("Converting LIKE ANY(array) to Snowflake EXISTS(SELECT ... LIKE ...)")
+        sql = convert_like_any_to_exists(sql)
     try:
         # Pre-process: Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
         if "E'" in sql or 'E"' in sql:
@@ -259,6 +263,9 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         
         # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
         sql = convert_date_arithmetic_to_snowflake(sql)
+        
+        # Pre-process: Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...)) to ARRAY_AGG with WITHIN GROUP
+        sql = convert_max_array_to_array_agg(sql)
 
         # Parse with PostgreSQL dialect
         parsed = sqlglot.parse_one(sql, read="postgres")
@@ -394,6 +401,19 @@ def convert_array_to_array_construct(sql: str) -> str:
     
     return ''.join(result)
 
+def convert_like_any_to_exists(sql: str) -> str:
+    """
+    Convert 'col LIKE ANY(array)' to Snowflake-compatible EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE col LIKE f.value)
+    Handles both qualified and unqualified column/array names.
+    """
+    # Pattern: <expr> LIKE ANY(<array_expr>)
+    pattern = re.compile(r'(\b[\w\.]+\b)\s+LIKE\s+ANY\s*\(([^\)]+)\)', re.IGNORECASE)
+    def repl(match):
+        col = match.group(1).strip()
+        arr = match.group(2).strip()
+        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
+    return pattern.sub(repl, sql)
+
 def handle_crosstab(sql: str) -> str:
     """
     Replace crosstab block with a dbt-compatible crosstab SQL using parse_crosstab_sql.
@@ -449,6 +469,47 @@ def convert_generate_series_to_snowflake(sql: str) -> str:
     pattern = re.compile(r"FROM\s+generate_series\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*(?:,\s*([^\)]+))?\)\s+AS\s+(\w+)\s*\((\w+)\)", re.IGNORECASE)
     return pattern.sub(repl, sql)
 
+def convert_max_array_to_array_agg(sql: str) -> str:
+    """
+    Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ELSE NULL END) to ARRAY_AGG with WITHIN GROUP.
+    Snowflake doesn't support MAX() on arrays, so we need to use ARRAY_AGG with ordering.
+    
+    Transforms:
+      MAX(CASE WHEN condition THEN ARRAY_CONSTRUCT(col1, col2, col3) ELSE NULL END)
+    To:
+      ARRAY_AGG(CASE WHEN condition THEN ARRAY_CONSTRUCT(col1, col2, col3) ELSE NULL END) 
+        WITHIN GROUP (ORDER BY col1 DESC)[0]
+    
+    The ORDER BY uses the first column in ARRAY_CONSTRUCT to determine which row to pick.
+    """
+    # Pattern to match MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ...)
+    # We need to extract the CASE expression and the first column from ARRAY_CONSTRUCT
+    pattern = re.compile(
+        r'\bMAX\s*\(\s*'  # MAX(
+        r'(CASE\s+WHEN\s+.*?'  # CASE WHEN ... (capture group 1 - start of case)
+        r'THEN\s+'  # THEN
+        r'ARRAY_CONSTRUCT\s*\(\s*'  # ARRAY_CONSTRUCT(
+        r'(?:CAST\s*\(\s*)?'  # Optional CAST(
+        r'(\w+(?:\.\w+)?)'  # First column name (capture group 2) - may have table prefix
+        r'(?:\s+AS\s+\w+\s*\))?'  # Optional AS type) for CAST
+        r'[^)]*'  # Rest of array construct args
+        r'\)'  # Close ARRAY_CONSTRUCT
+        r'.*?'  # Rest of CASE (ELSE clause, etc.)
+        r'END)'  # END of CASE (capture group 1 - end)
+        r'\s*\)',  # Close MAX
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    def repl(match):
+        case_expr = match.group(1).strip()
+        order_by_col = match.group(2).strip()
+        
+        # Build the ARRAY_AGG replacement
+        return (f"ARRAY_AGG({case_expr}) "
+                f"WITHIN GROUP (ORDER BY {order_by_col} DESC)[0]")
+    
+    return pattern.sub(repl, sql)
+
 def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     """
     Convert PostgreSQL date arithmetic to Snowflake DATEADD syntax.
@@ -457,7 +518,9 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     - column::date-'3 months'::interval -> DATEADD(MONTH, -3, column::date)
     - date_col-'2 days'::interval -> DATEADD(DAY, -2, date_col)
     - voorschrijfdatum+round(hoeveelheid/0.5)*interval'1 day' -> DATEADD(DAY, round(hoeveelheid/0.5), voorschrijfdatum)
+    - date::date - validtime (where validtime is integer months) -> DATEADD(MONTH, -validtime, date::date)
     """
+    
     # Pattern 1: column + expression * interval 'N unit' or column - expression * interval 'N unit'
     # Also handles: column + interval 'N unit' * expression
     pattern1 = re.compile(
@@ -521,9 +584,10 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
         else:
             amount_val = amount
         
-        # Snowflake DATEADD syntax: DATEADD(unit, amount, base)
+        # Create DATEADD
         return f"DATEADD({unit}, {amount_val}, {base})"
     
+    # Apply the pattern
     sql = pattern.sub(repl, sql)
     
     # Pattern 3: date + concat(..., ' unit')::interval (dynamic interval from string concat)
@@ -547,4 +611,38 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
         
         return f"DATEADD({unit}, {amount_expr}, {base})"
     
-    return pattern3.sub(repl3, sql)
+    sql = pattern3.sub(repl3, sql)
+    
+    # Pattern 4 (run LAST): Edge case for integer columns representing months (validtime, loopduur, etc.)
+    # Handles: date_expr - table.column or date_expr + table.column
+    # where column is validtime, loopduur, looptijd (integer months)
+    # This pattern runs after all interval conversions so it can handle DATEADD results
+    pattern4 = re.compile(
+        r"(DATEADD\([^)]+\)|"  # DATEADD expression
+        r"\([^)]+\)(?:::\w+)?|"  # parenthesized expr with optional cast
+        r"'[^']+'::\w+|"  # string literal with cast
+        r"\w+(?:::\w+)?)"  # column with optional cast
+        r"\s*([-+])\s*"  # operator (+ or -)
+        r"(\w+\.)?(validtime|loopduur|looptijd)\b",  # optional table prefix + month column name
+        re.IGNORECASE
+    )
+    
+    def repl4(match):
+        base = match.group(1).strip()
+        operator = match.group(2)
+        table_prefix = match.group(3) if match.group(3) else ''
+        column_name = match.group(4)
+        
+        # Build the full column reference
+        full_column = f"{table_prefix}{column_name}"
+        
+        # Apply operator to amount
+        if operator == '-':
+            amount_expr = f"-{full_column}"
+        else:
+            amount_expr = full_column
+        
+        # Snowflake DATEADD with MONTH hardcoded
+        return f"DATEADD(MONTH, {amount_expr}, {base})"
+    
+    return pattern4.sub(repl4, sql)

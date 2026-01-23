@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 import yaml
@@ -21,7 +22,22 @@ def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tab
     # Separate blocks from regular files
     block_files = [f for f in pry_files if any(p.name.lower() == 'blocks' for p in f.parents)]
     regular_files = [f for f in pry_files if f not in block_files]
-    
+
+    # Scan all PRY files for materialized view names
+    materialized_views = set()
+    for pry_file in pry_files:
+        try:
+            content = pry_file.read_text(encoding='utf-8')
+            # Only match CREATE MATERIALIZED VIEW viewname (MATERIALIZED required)
+            matches = re.findall(r'CREATE\s+MATERIALIZED\s+VIEW\s+(\w+)', content, re.IGNORECASE)
+            materialized_views.update([m.lower() for m in matches])
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to scan {pry_file.name} for materialized views: {e}")
+
+    # Add to config for downstream use
+    config = dict(config)  # copy to avoid mutating original
+    config['model_refs'] = list(materialized_views)
+    logging.info(f"Identified {len(materialized_views)} materialized views in PRY files.\n")
     # First pass: Process blocks and track created tables
     block_tables = set()
     logging.info(f"\n=== Processing {len(block_files)} block files ===")
@@ -32,7 +48,7 @@ def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tab
                 block_tables.update(tables)
         except Exception as e:
             logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
-    
+
     # Second pass: Process regular files
     logging.info(f"\n=== Processing {len(regular_files)} regular files ===")
     for pry_file in regular_files:

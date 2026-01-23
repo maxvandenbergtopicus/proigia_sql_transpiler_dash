@@ -17,8 +17,15 @@ ignored_keywords:
 function_macros:
   - clean_icpc
   - translate_labcode_answers
+  - override_kwartaal
 
 # Model references: Tables/views that should be replaced with {{ ref('model_name') }}
 # These are typically materialized views or other dbt models that need to be referenced
 model_refs:
   - proigia_labcodes
+
+# Table mapping: Specific table references that should be mapped to different schemas/tables
+# Format: "source_schema.source_table": "target_schema.target_table"
+# Supports {{agb}} placeholder in target
+table_mapping:
+  public.medewerker: "STG.P{{agb}}.medewerker_manual"

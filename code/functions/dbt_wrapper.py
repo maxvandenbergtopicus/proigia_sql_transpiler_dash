@@ -10,7 +10,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
     """Convert PRY file to dbt models.
     
     Args:
-        seed_tables: Dict mapping table names to their references (e.g., {'nhg_labcodes': 'dwh.{{praktijk_agb}}.nhg_labcodes'})
+        seed_tables: Dict mapping table names to their references (e.g., {'nhg_labcodes': 'dwh.{{agb}}.nhg_labcodes'})
     
     Returns:
         set: Table/view names created by this file (for blocks)
@@ -73,7 +73,8 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         
         # For blocks: only replace external tables, leave all others unchanged
         model_refs = config.get('model_refs', [])
-        converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, model_refs=model_refs, is_block=True)
+        table_mapping = config.get('table_mapping', {})
+        converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, model_refs=model_refs, table_mapping=table_mapping, is_block=True)
         
         # Extract all table/view names created by this block (look for "name AS (")
         created_tables = set()
@@ -88,11 +89,11 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         
         macro_file = macro_path / f"{block_name}.sql"
         
-        # Check if macro contains {{praktijk_agb}} and add variable declaration if needed
+        # Check if macro contains {{agb}} and add variable declaration if needed
         macro_header = f"{{% macro {block_name}() %}}\n"
-        if '{{praktijk_agb}}' in converted_sql or '{{ praktijk_agb }}' in converted_sql:
-            macro_header += "{%- set praktijk_agb = var('praktijk_agb', 0) %}\n"
-            logging.debug(f"Added praktijk_agb variable to macro {block_name}")
+        if '{{agb}}' in converted_sql or '{{ agb }}' in converted_sql:
+            macro_header += "{%- set agb = var('agb', 0) %}\n"
+            logging.debug(f"Added agb variable to macro {block_name}")
         
         macro_content = f"{macro_header}{converted_sql}\n{{% endmacro %}}\n"
         
@@ -148,26 +149,92 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
     Example: indelingen.translate_labcode_answers(col::int, val) -> {{ translate_labcode_answers('col::int', 'val') }}
     """
+    logging.info(f"Replacing functions with macros: {function_names}, SQL: {sql}")
+    def smart_split_args(argstr):
+        args = []
+        current = ''
+        depth = 0
+        in_string = False
+        string_char = None
+        i = 0
+        while i < len(argstr):
+            char = argstr[i]
+            if char in ('"', "'"):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+                current += char
+            elif char == '(' and not in_string:
+                depth += 1
+                current += char
+            elif char == ')' and not in_string:
+                depth -= 1
+                current += char
+            elif char == ',' and not in_string and depth == 0:
+                args.append(current.strip())
+                current = ''
+            else:
+                current += char
+            i += 1
+        if current.strip():
+            args.append(current.strip())
+        return args
+
+    def find_function_calls(s, func_name):
+        # Returns list of (start, end, args_str) for each function call
+        results = []
+        pattern = re.compile(rf'(?:indelingen\.)?{re.escape(func_name)}\s*\(', re.IGNORECASE)
+        for m in pattern.finditer(s):
+            start = m.start()
+            i = m.end()
+            depth = 1
+            in_string = False
+            string_char = None
+            while i < len(s):
+                c = s[i]
+                if c in ('"', "'"):
+                    if not in_string:
+                        in_string = True
+                        string_char = c
+                    elif c == string_char:
+                        in_string = False
+                        string_char = None
+                elif c == '(' and not in_string:
+                    depth += 1
+                elif c == ')' and not in_string:
+                    depth -= 1
+                    if depth == 0:
+                        # Found matching close
+                        args_str = s[m.end():i]
+                        results.append((start, i+1, args_str))
+                        break
+                i += 1
+        return results
+
     for func_name in function_names:
-        # Match indelingen.function_name(...) or function_name(...)
-        # [^)]* matches simple cases without nested parentheses
-        pattern = rf'\b(?:indelingen\.)?{re.escape(func_name)}\s*\(([^)]*)\)'
-        
-        def replacer(match):
-            args = match.group(1).strip()
+        # Find all function calls with correct parenthesis matching
+        calls = find_function_calls(sql, func_name)
+        # Replace from the end to avoid messing up indices
+        for start, end, args in reversed(calls):
             macro_name = func_name.lower()
-            
-            if not args:
-                return f"{{{{ {macro_name}() }}}}"
-            
-            # Simple split by comma and quote each argument
-            arg_list = [arg.strip() for arg in args.split(',')]
-            quoted_args = ', '.join(f"'{arg}'" for arg in arg_list)
-            return f"{{{{ {macro_name}({quoted_args}) }}}}"
-        
-        sql = re.sub(pattern, replacer, sql, flags=re.IGNORECASE)
-        logging.info(f"Processed function: {func_name}")
-    
+            if not args.strip():
+                replacement = f"{{{{ {macro_name}() }}}}"
+            else:
+                arg_list = smart_split_args(args)
+                quoted_args = []
+                for arg in arg_list:
+                    arg_strip = arg.strip()
+                    # Replace ${varname} or '${varname}' with {{ varname }}
+                    # Remove quotes around ${varname} if present
+                    arg_strip = re.sub(r"(['\"])?\$\{([a-zA-Z_][\w]*)\}(['\"])?", lambda m: f"{{{{ {m.group(2)} }}}}", arg_strip)
+                    # Quote the argument (single quotes)
+                    quoted_args.append(f"'{arg_strip}'")
+                replacement = f"{{{{ {macro_name}({', '.join(quoted_args)}) }}}}"
+            sql = sql[:start] + replacement + sql[end:]
+        logging.info(f"SQL after replacing function '{func_name}")
     return sql
 
 
@@ -262,7 +329,8 @@ def generate_dbt_model(
         
         # Replace table references with dbt macros
         model_refs = config.get('model_refs', [])
-        converted_sql = replace_table_references(converted_sql, block_tables=block_tables, seed_tables=seed_tables, model_refs=model_refs)
+        table_mapping = config.get('table_mapping', {})
+        converted_sql = replace_table_references(converted_sql, block_tables=block_tables, seed_tables=seed_tables, model_refs=model_refs, table_mapping=table_mapping)
         
         # Ensure it starts with WITH or SELECT and remove trailing semicolon
         converted_sql = converted_sql.strip()
@@ -277,28 +345,28 @@ def generate_dbt_model(
             "{%- set report_name = '" + report_name + "' %}",
             "{%- set report_type = '" + report_type + "' %}",
             "{%- set view_name = '" + view_name + "' %}",
-            "{%- set praktijk_agb = var(\"praktijk_agb\", none) %}",
+            "{%- set agb = var(\"agb\", none) %}",
         ]
         # Extract all external variables like ${varname} in the SQL
         external_vars = set(re.findall(r'\$\{([a-zA-Z_][\w]*)\}', converted_sql))
-        # Exclude praktijk_agb (already set)
-        external_vars.discard('praktijk_agb')
+        # Exclude agb (already set)
+        external_vars.discard('agb')
         # Add each as a dbt variable
         for var in sorted(external_vars):
             variables.append(f"{{%- set {var} = var(\"{var}\", none) %}}")
-        # First replace quoted '${varname}' or "${varname}" - keep quotes for datum variables to prevent arithmetic interpretation
+        
+        # Replace quoted '${varname}' or "${varname}" - always remove quotes
         def replace_quoted_var(m):
             var_name = m.group(2)
-            if 'datum' in var_name.lower():
-                return f"'{{{{ {var_name} }}}}'"  # Keep quotes for dates
-            return f"{{{{ {var_name} }}}}"  # Remove quotes for others
+            return f"'{{{{ {var_name} }}}}'"  # Remove quotes entirely
         converted_sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, converted_sql)
+        
         # Then replace any remaining unquoted ${varname} - add quotes if it's a datum variable
         def replace_unquoted_var(m):
             var_name = m.group(1)
             if 'datum' in var_name.lower():
                 return f"'{{{{ {var_name} }}}}'"  # Add quotes for dates
-            return f"{{{{ {var_name} }}}}"
+            return f"'{{{{ {var_name} }}}}'"
         converted_sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', replace_unquoted_var, converted_sql)
         if 'type' in view_metadata:
             variables.append("{%- set view_type = '" + view_metadata['type'] + "' %}")
@@ -339,97 +407,221 @@ def generate_dbt_model(
         traceback.print_exc()
 
 
-def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None, model_refs=None, is_block=False) -> str:
-    """Replace table references in FROM/JOIN with dbt ref() or STG.P{{praktijk_agb}}.table.
+def replace_table_references(sql: str, external_tables=None, block_tables=None, seed_tables=None, model_refs=None, table_mapping=None, is_block=False) -> str:
+    """Replace table references in FROM/JOIN with dbt ref() or STG.P{{agb}}.table.
+    
+    Replacement priority (highest to lowest):
+    1. Schema-qualified tables: indelingen.X -> DWH.REFERENCE_DATA.X
+    2. Table mappings from config (schema.table -> custom target)
+    3. Seed tables from config (qualified schema.table -> seed reference)
+    4. CTEs (no replacement)
+    5. Special tables like 'TABLE', 'draaitabel_ct' (no replacement)
+    6. Model refs from config -> {{ ref('table_name') }}
+    7. External tables -> STG.P{{agb}}.table
+    8. Block tables (no replacement)
+    9. Everything else -> {{ ref('table_name') }} (unless is_block=True)
     
     Args:
-        is_block: If True, only replace external tables. All other tables remain unchanged.
-                  If False, replace external tables with STG prefix and other tables with ref().
+        is_block: If True, only replace external/seed/mapped tables. All others unchanged.
         model_refs: List of table names that should be replaced with {{ ref('table_name') }}
+        table_mapping: Dict mapping specific schema.table patterns to target references
     """
-    # Set defaults
+    # Initialize defaults
     block_tables = block_tables or set()
     model_refs = model_refs or []
     model_refs_lower = [m.lower() for m in model_refs]
+    table_mapping = table_mapping or {}
+    table_mapping_lower = {k.lower(): v for k, v in table_mapping.items()}
     external_tables = external_tables or [
         'allergie', 'bepaling', 'contact', 'contraindicatie', 'episode', 'journaal',
         'journaalregel', 'medewerker', 'medicatie', 'metadata', 'origineel',
         'patient', 'praktijk', 'ruiter', 'verrichting', 'verwijzing', 
         'override_patientenlijst', 'functie', 'medewerker_hisnaam', 
     ]
+    external_tables_lower = [t.lower() for t in external_tables]
     seed_table_lookup = {k.lower(): v for k, v in (seed_tables or {}).items()}
     
-    # Extract CTE names from SQL (remove comments first to avoid false matches)
+    # Extract CTE names from SQL
+    cte_names = _extract_cte_names(sql)
+    logging.debug(f"Detected CTEs: {cte_names}, Block tables: {block_tables}")
+    
+    # Step 1: Replace schema-qualified references (indelingen, seed tables, table mappings)
+    sql = _replace_qualified_tables(sql, seed_table_lookup, table_mapping_lower)
+    
+    # Step 2: Replace unqualified table references
+    sql = _replace_unqualified_tables(
+        sql, cte_names, model_refs_lower, external_tables_lower, 
+        block_tables, is_block
+    )
+    
+    return sql
+
+
+def _extract_cte_names(sql: str) -> set:
+    """Extract CTE names from SQL query.
+    
+    Returns:
+        Set of lowercase CTE names
+    """
+    # Remove comments to avoid false matches
     sql_clean = re.sub(r'(--[^\n]*|/\*.*?\*/|\{#.*?#\})', '', sql, flags=re.DOTALL)
     cte_names = set()
     
-    for match in re.finditer(r'\b(\w+)\s*(?:\([^)]+\))?\s+AS(?:\s+\w+)*\s*\(', sql_clean, re.IGNORECASE):
+    # Match pattern: WITH name AS ( or , name AS (
+    for match in re.finditer(r'\b(\w+)\s*(?:\([^)]+\))?\s+AS\s*\(', sql_clean, re.IGNORECASE):
         cte = match.group(1).lower()
-        # Check if preceded by WITH or comma (indicating CTE context)
+        
+        # Verify it's preceded by WITH or comma
         preceding = sql_clean[max(0, match.start()-100):match.start()]
         if re.search(r'(WITH(?:\s+RECURSIVE)?|,)\s*$', preceding, re.IGNORECASE | re.DOTALL):
+            # Exclude SQL keywords that might match the pattern
             if cte not in ['select', 'insert', 'update', 'delete', 'with', 'case']:
                 cte_names.add(cte)
     
-    logging.debug(f"Detected CTEs: {cte_names}, Block tables: {block_tables}")
+    return cte_names
+
+
+def _replace_qualified_tables(sql: str, seed_table_lookup: dict, table_mapping_lower: dict) -> str:
+    """Replace schema-qualified table references.
     
-    # Replace indelingen. prefix pattern first (indelingen.table -> DWH.REFERENCE_DATA.table)
-    indelingen_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+indelingen\.([a-zA-Z_][\w]*)\b(?!\s*\(|::)'
-    
-    def indelingen_replacer(match):
-        keyword, table = match.group(1), match.group(2)
-        logging.debug(f"Replacing indelingen.{table} -> DWH.REFERENCE_DATA.{table}")
-        return f"{keyword} DWH.REFERENCE_DATA.{table}"
-    
-    sql = re.sub(indelingen_pattern, indelingen_replacer, sql, flags=re.IGNORECASE)
-    
-    # Replace schema-qualified seed tables (schema.table -> seed reference from config)
+    Handles:
+    - indelingen.table -> DWH.REFERENCE_DATA.table
+    - schema.table patterns from table_mapping
+    - schema.table patterns from seed_tables
+    """
+    # Pattern for schema.table references
     schema_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b(?!\s*\(|::)'
     
     def schema_replacer(match):
         keyword, schema, table = match.group(1), match.group(2), match.group(3)
-        # Skip indelingen schema as it's already handled
-        if schema.lower() == 'indelingen':
-            return match.group(0)
+        schema_lower = schema.lower()
+        
+        # Priority 1: indelingen schema
+        if schema_lower == 'indelingen':
+            logging.debug(f"Replacing indelingen.{table} -> DWH.REFERENCE_DATA.{table}")
+            return f"{keyword} DWH.REFERENCE_DATA.{table}"
+        
+        # Priority 2: Table mapping (e.g., dwh.public.medewerker -> ODS.{{agb}}.medewerker_manual)
+        qualified_table = f"{schema}.{table}".lower()
+        if qualified_table in table_mapping_lower:
+            target = table_mapping_lower[qualified_table]
+            logging.debug(f"Table mapping: {schema}.{table} -> {target}")
+            return f"{keyword} {target}"
+        
+        # Priority 3: Seed tables
         if table.lower() in seed_table_lookup:
-            logging.debug(f"Replacing seed: {schema}.{table}")
+            logging.debug(f"Replacing seed: {schema}.{table} -> {seed_table_lookup[table.lower()]}")
             return f"{keyword} {seed_table_lookup[table.lower()]}"
+        
         return match.group(0)
     
-    sql = re.sub(schema_pattern, schema_replacer, sql, flags=re.IGNORECASE)
+    return re.sub(schema_pattern, schema_replacer, sql, flags=re.IGNORECASE)
+
+
+def _replace_unqualified_tables(sql: str, cte_names: set, model_refs_lower: list, 
+                                 external_tables_lower: list, block_tables: set, 
+                                 is_block: bool) -> str:
+    """Replace unqualified table references in FROM/JOIN clauses.
     
-    # Replace unqualified table references (table -> ref() or STG prefix)
+    Args:
+        cte_names: Set of CTE names (lowercase) to skip
+        model_refs_lower: List of model names (lowercase) to replace with ref()
+        external_tables_lower: List of external table names (lowercase)
+        block_tables: Set of block table names to skip
+        is_block: If True, only replace external tables
+    """
+    # Pattern matches FROM/JOIN followed by an unqualified table name
+    # Excludes: table.x, table(, table::
     table_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\b(?!\s*\.|\s*\(|::)'
     
     def table_replacer(match):
         keyword, table = match.group(1), match.group(2)
         table_lower = table.lower()
         
-        # Skip CTEs, TABLE keyword, tables with dots/parens, or draaitabel_ct (created by snowflake_pivot macro)
-        if (table_lower in cte_names or table.upper() == 'TABLE' or 
-            '(' in table or '.' in table or table_lower == 'draaitabel_ct'):
+        # Check if we're inside a function call (e.g., EXTRACT(year FROM date_col))
+        if _is_inside_function_call(sql, match.start()):
             return match.group(0)
         
-        # Model refs get {{ ref('model_name') }} replacement
+        # Priority 1: Skip CTEs
+        if table_lower in cte_names:
+            return match.group(0)
+        
+        # Priority 2: Skip special keywords/tables
+        if table_lower in ['table', 'draaitabel_ct']:
+            return match.group(0)
+        
+        # Priority 3: Model refs -> {{ ref('table_name') }}
         if table_lower in model_refs_lower:
             logging.debug(f"Model ref: {table} -> ref('{table_lower}')")
             return f"{keyword} {{{{ ref('{table_lower}') }}}}"
         
-        # External tables get STG prefix
-        if table_lower in [t.lower() for t in external_tables]:
-            logging.debug(f"External: {table}")
-            return f"{keyword} STG.P{{{{praktijk_agb}}}}.{table}"
+        # Priority 4: External tables -> STG.P{{agb}}.table
+        if table_lower in external_tables_lower:
+            logging.debug(f"External: {table} -> STG.P{{{{agb}}}}.{table}")
+            return f"{keyword} STG.P{{{{agb}}}}.{table}"
         
-        # For blocks: leave all non-external tables unchanged
+        # Priority 5: Block mode - leave all non-external tables unchanged
         if is_block:
             return match.group(0)
         
-        # For normal models: skip block-created tables, use ref() for everything else
+        # Priority 6: Skip block-created tables
         if table_lower in block_tables:
             return match.group(0)
         
-        # Everything else uses ref()
-        logging.debug(f"Internal: {table}")
+        # Priority 7: Everything else -> {{ ref('table_name') }}
+        logging.debug(f"Internal table: {table} -> ref('{table_lower}')")
         return f"{keyword} {{{{ ref('{table}') }}}}"
     
-    return re.sub(table_pattern, table_replacer, sql, flags=re.IGNORECASE)
+    return re.sub(table_pattern, table_replacer, sql, flags=re.IGNORECASE | re.DOTALL)
+
+
+def _is_inside_function_call(sql: str, match_pos: int) -> bool:
+    """Check if a FROM/JOIN match is inside a function call (e.g., EXTRACT(year FROM date)).
+    
+    Args:
+        sql: Full SQL string
+        match_pos: Position of the FROM/JOIN match
+        
+    Returns:
+        True if inside a function call, False otherwise
+    """
+    # Look at preceding context (300 chars should be enough to find context)
+    start_pos = max(0, match_pos - 300)
+    preceding_text = sql[start_pos:match_pos]
+    
+    # Count unmatched opening parentheses
+    paren_depth = preceding_text.count('(') - preceding_text.count(')')
+    
+    # If paren_depth <= 0, we're not inside any parentheses
+    if paren_depth <= 0:
+        return False
+    
+    # Find the matching unmatched opening paren by walking backwards
+    depth = 0
+    matching_paren_pos = -1
+    
+    for i in range(len(preceding_text) - 1, -1, -1):
+        char = preceding_text[i]
+        if char == ')':
+            depth += 1
+        elif char == '(':
+            if depth == 0:
+                # Found the unmatched opening paren
+                matching_paren_pos = i
+                break
+            else:
+                depth -= 1
+    
+    if matching_paren_pos < 0:
+        # Couldn't find matching paren, be conservative
+        return False
+    
+    # Get text between the matching opening paren and our match
+    text_after_paren = preceding_text[matching_paren_pos:]
+    
+    # If there's a SELECT/WITH after the paren, it's a subquery/CTE - allow it
+    # If there's no SELECT/WITH, it's likely a function call - skip it
+    has_select = re.search(r'\b(SELECT|WITH)\b', text_after_paren, re.IGNORECASE)
+    
+    # Return True (is inside function) if there's NO SELECT/WITH
+    return not bool(has_select)
