@@ -1,47 +1,52 @@
 -- CTEs extracted from crosstab query
-WITH alle_hb AS
-    (
-        SELECT
-            patient_id,
-            nhgnr,
-            datum,
-            uitslag_raw,
-            uitslag_waarde
-        FROM proigia_meetwaarden_filter_seg2
-        WHERE omschrijving ilike '%hoofdbehandelaar%'
-    ),
-    max_datum_niet_ha AS
-    (
-        SELECT
-            patient_id,
-            nhgnr,
-            max(datum) as max_dd_niet_huisarts
-        FROM alle_hb
-        WHERE (uitslag_waarde <> 'huisarts' or uitslag_waarde IS NULL)
-        GROUP BY patient_id, nhgnr
-    ),
-    min_datum_wel_ha AS
-    (
-        SELECT
-            patient_id,
-            nhgnr,
-            min(datum) as min_dd_huisarts
-        FROM alle_hb
-        LEFT JOIN max_datum_niet_ha USING (patient_id, nhgnr)
-        WHERE uitslag_waarde = 'huisarts'
-        AND (datum >= max_dd_niet_huisarts or max_dd_niet_huisarts IS NULL)
-        GROUP BY patient_id, nhgnr
-    ),
+WITH alle_hb AS (
+SELECT
+  patient_id,
+  memo,
+  datum,
+  uitslag_waarde
+FROM proigia_meetwaarden_filter_seg2
+WHERE
+  omschrijving ILIKE '%hoofdbehandelaar%'
+ORDER BY
+  patient_id,
+  memo,
+  uitslag_waarde,
+  datum DESC
+),
+grouping_uitslagen AS (
+SELECT
+  patient_id,
+  memo,
+  datum,
+  ARRAY_AGG(DISTINCT uitslag_waarde) AS uitslagen
+FROM alle_hb
+GROUP BY
+  patient_id,
+  memo,
+  datum
+),
 prepare AS (
 SELECT
-        patient_id,
-        nhgnr,
-        ARRAY_CONSTRUCT(min_dd_huisarts, max_dd_niet_huisarts) as waardes
-    FROM min_datum_wel_ha
-    LEFT JOIN max_datum_niet_ha USING (patient_id, nhgnr)
-    ORDER BY patient_id, nhgnr
+  patient_id,
+  _col,
+  dubbel
+FROM (
+  SELECT
+    patient_id AS patient_id,
+    memo || '_db' AS _col,
+    ARRAY_CONSTRUCT(
+      CAST(CASE WHEN ARRAY_SIZE(uitslagen) > 1 THEN 1 ELSE 0 END AS VARCHAR),
+      CAST(datum AS VARCHAR),
+      CAST(uitslagen AS VARCHAR)
+    ) AS dubbel,
+    ROW_NUMBER() OVER (PARTITION BY patient_id, memo ORDER BY patient_id, memo, datum DESC) AS _row_number
+  FROM grouping_uitslagen
+) AS _t
+WHERE
+  _row_number = 1
 )
 -- Call snowflake pivot macro
-{{snowflake_pivot(['dmhb', 'ashb', 'cohb', 'gzhb', 'cvhb', 'ozhb', 'dchb', 'uihb', 'skhb', 'nfhb', 'obhb', 'afhb', 'oshb', 'clhb', 'pahb', 'czhb', 'dehb', 'adhb'],'waardes', 'nhgnr', 2,none, ['patient_id'])}}
+{{snowflake_pivot(['adhb_db', 'afhb_db', 'ashb_db', 'clhb_db', 'cohb_db', 'cvhb_db', 'czhb_db', 'dchb_db', 'dehb_db', 'dmhb_db', 'gzhb_db', 'nfhb_db', 'obhb_db', 'oshb_db', 'ozhb_db', 'pahb_db', 'skhb_db', 'uihb_db'],'dubbel', '_col', 3,none, ['patient_id'])}}
 
 SELECT * FROM draaitabel_ct

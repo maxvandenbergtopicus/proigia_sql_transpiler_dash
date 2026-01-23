@@ -1,5 +1,10 @@
+
 import re
 import logging
+import sqlglot
+
+# Ensure INFO-level logs are shown in the console
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 
 def parse_crosstab_to_macro(sql: str) -> str:
@@ -74,17 +79,95 @@ def parse_crosstab_to_macro(sql: str) -> str:
             inner_ctes = query1[:main_select_pos].strip()
             # Remove trailing comma if present
             inner_ctes = re.sub(r',\s*$', '', inner_ctes)
-            
+            # Strip leading "WITH " if present
+            inner_ctes = inner_ctes.lstrip('WITH ').strip()
+
+            # --- Split and print each CTE one by one ---
+            def extract_ctes(ctes_sql):
+                transformed_ctes = []
+                i = 0
+                n = len(ctes_sql)
+                while i < n:
+                    # Skip whitespace and comments
+                    while i < n and ctes_sql[i] in ' \n\r\t':
+                        i += 1
+                    # Skip SQL single-line comments
+                    if ctes_sql[i:i+2] == '--':
+                        while i < n and ctes_sql[i] != '\n':
+                            i += 1
+                        i += 1
+                        continue
+                    # Find CTE name
+                    name_match = re.match(r'\s*([a-zA-Z_][\w]*)\s+AS\s*\(', ctes_sql[i:], re.IGNORECASE)
+                    if not name_match:
+                        break
+                    name = name_match.group(1)
+                    i += name_match.end()
+                    # Find body by tracking parentheses
+                    depth = 1
+                    body_start = i
+                    in_string = False
+                    string_char = ''
+                    while i < n and depth > 0:
+                        char = ctes_sql[i]
+                        if not in_string and char in ('"', "'"):
+                            in_string = True
+                            string_char = char
+                        elif in_string and char == string_char:
+                            in_string = False
+                            string_char = ''
+                        elif not in_string:
+                            if char == '(':
+                                depth += 1
+                            elif char == ')':
+                                depth -= 1
+                        i += 1
+                    body_end = i - 1
+                    body = ctes_sql[body_start:body_end].strip()
+                    # Transpile the body from PostgreSQL to Snowflake
+                    try:
+                        transpiled_body = sqlglot.transpile(body, read="postgres", write="snowflake", pretty=True)[0]
+                    except Exception as e:
+                        logging.warning(f"Failed to transpile CTE {name}: {e}")
+                        transpiled_body = body  # Fallback to original
+                    
+                    # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
+                    transpiled_body = re.sub(
+                        r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
+                        r"ARRAY_AGG(DISTINCT \1)",
+                        transpiled_body,
+                        flags=re.IGNORECASE | re.DOTALL
+                    )
+                    
+                    msg = f"\n{'#'*40}\n### INDIVIDUAL CTE EXTRACTED: {name} ###\n{'-'*40}\nWITH {name} AS (\n{transpiled_body}\n)\n{'#'*40}\n"
+                    logging.info(msg)
+                    # Add to transformed CTEs list
+                    transformed_ctes.append(f"{name} AS (\n{transpiled_body}\n)")
+                    # Skip whitespace and comments after CTE
+                    while i < n and ctes_sql[i] in ' \n\r\t':
+                        i += 1
+                    if ctes_sql[i:i+2] == '--':
+                        while i < n and ctes_sql[i] != '\n':
+                            i += 1
+                        i += 1
+                    # Skip comma after CTE
+                    if i < n and ctes_sql[i] == ',':
+                        i += 1
+                return transformed_ctes
+            if inner_ctes:
+                logging.info(f"Calling extract_ctes with inner_ctes (length={len(inner_ctes)})")
+                transformed_ctes_list = extract_ctes(inner_ctes)
+                logging.info("Finished extract_ctes call")
+
             # The main query is everything from SELECT onwards
             query1_without_ctes = query1[main_select_pos:].strip()
-            
+
             logging.debug(f"Extracted {len(select_positions)} SELECT statements, using last one as main query")
             logging.debug(f"Inner CTEs length: {len(inner_ctes)} chars")
             logging.debug(f"Main query length: {len(query1_without_ctes)} chars")
         else:
             logging.warning("Found WITH but no SELECT statements")
-    
-    # Extract output columns from ) AS result (col1 type, col2 type, ...)
+            query1_without_ctes = query1
     # Match until the closing ) of the column definition
     # Pattern handles: ...AS ct(...)) or ...AS ct(...) or ...AS ct(...);
     # Allow whitespace/newlines between AS and identifier and opening paren
@@ -150,6 +233,13 @@ def parse_crosstab_to_macro(sql: str) -> str:
     
     # Parse columns from SELECT (handle nested parens/brackets)
     select_clause = select_match.group(1)
+    
+    # Strip DISTINCT ON clause if present
+    distinct_on_match = re.match(r'DISTINCT\s+ON\s*\([^)]*\)\s+', select_clause, re.IGNORECASE)
+    if distinct_on_match:
+        select_clause = select_clause[distinct_on_match.end():].strip()
+        logging.debug("Stripped DISTINCT ON from select clause")
+    
     columns = []
     current = ''
     depth = 0
@@ -278,47 +368,25 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # Use query1_without_ctes (the SELECT part only, not the CTEs)
     modified_query1 = query1_without_ctes
     
-    logging.info(f"=== Array wrapping check: contains_aggregation={contains_aggregation}, array_column_expr={array_column_expr}")
+    logging.info(f"=== Array processing: array_column_expr={array_column_expr}")
     
-    if contains_aggregation and array_column_expr:
-        logging.info(f"WRAPPING: Array contains aggregation functions - wrapping with array_to_string")
-        
-        # Try ARRAY[ first (PostgreSQL syntax)
-        pattern = r'ARRAY\s*\[((?:[^\[\]]|\[(?:[^\[\]]|\[[^\[\]]*\])*\])*)\]\s+as\s+' + re.escape(array_name)
-        match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
-        
-        if match:
-            logging.info("Found ARRAY[ pattern - replacing with array_to_string wrapper")
-            array_content = match.group(1)
-            replacement = f"array_to_string(ARRAY_CONSTRUCT({array_content}),';') as {array_name}"
-            modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
-        else:
-            # Try ARRAY_CONSTRUCT( (Snowflake syntax)
-            pattern = r'ARRAY_CONSTRUCT\s*\(((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)\)\s+as\s+' + re.escape(array_name)
-            match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
-            
-            if match:
-                logging.info("Found ARRAY_CONSTRUCT pattern - replacing with array_to_string wrapper")
-                array_content = match.group(1)
-                replacement = f"array_to_string(ARRAY_CONSTRUCT({array_content}),';') as {array_name}"
-                modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
-            else:
-                logging.warning(f"NO MATCH: Could not find ARRAY[ or ARRAY_CONSTRUCT pattern with 'as {array_name}'")
+    # Always convert ARRAY[] to ARRAY_CONSTRUCT() and wrap with array_to_string
+    modified_query1 = re.sub(r'ARRAY\s*\[(.*?)\]', r'ARRAY_CONSTRUCT(\1)', modified_query1, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Define nested paren pattern to handle expressions with parentheses
+    nested_paren = r'((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)'
+    
+    # Always wrap the ARRAY_CONSTRUCT with array_to_string
+    pattern = r'ARRAY_CONSTRUCT\s*\(' + nested_paren + r'\)(\s+as\s+(\w+))?'
+    match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
+    if match:
+        content = match.group(1)
+        alias_part = match.group(2) if match.group(2) else f' as {array_name}'
+        replacement = f"array_to_string(ARRAY_CONSTRUCT({content}), ';'){alias_part}"
+        modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
+        logging.info("Wrapped ARRAY_CONSTRUCT with array_to_string")
     else:
-        logging.info(f"NO WRAPPING: Converting ARRAY[] to ARRAY_CONSTRUCT() without wrapping")
-        # No aggregation, just convert ARRAY[] to ARRAY_CONSTRUCT()
-        modified_query1 = re.sub(r'ARRAY\s*\[', 'ARRAY_CONSTRUCT(', modified_query1, flags=re.IGNORECASE)
-        
-        # Always enforce the alias after conversion
-        # If the ARRAY_CONSTRUCT has an alias, normalize it
-        if re.search(r'ARRAY_CONSTRUCT\([^)]*\)\s+as\s+\w+', modified_query1, re.IGNORECASE):
-            modified_query1 = re.sub(r'ARRAY_CONSTRUCT\(([^)]*)\)\s+as\s+(\w+)', r'ARRAY_CONSTRUCT(\1) as \2', modified_query1, flags=re.IGNORECASE)
-        else:
-            # ARRAY doesn't have an alias - add default alias 'waardes'
-            array_name = 'waardes'
-            logging.info(f"ARRAY column has no alias, enforcing default alias: {array_name}")
-            # Add alias after closing parenthesis
-            modified_query1 = re.sub(r'ARRAY_CONSTRUCT\(([^)]*)\)(\s*(FROM|ORDER|GROUP|WHERE|LIMIT|\)|$))', rf'ARRAY_CONSTRUCT(\1) as {array_name}\2', modified_query1, flags=re.IGNORECASE)
+        logging.warning("Could not find ARRAY_CONSTRUCT to wrap")
     
     # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
     if "'" in pivot_key:
@@ -332,10 +400,47 @@ def parse_crosstab_to_macro(sql: str) -> str:
     else:
         array_name_quoted = f"'{array_name}'"
     
+    # Transpile the main query from PostgreSQL to Snowflake (after array processing)
+    logging.info(f"Transpiling main query: {modified_query1[:200]}...")
+    try:
+        modified_query1 = sqlglot.transpile(modified_query1, read="postgres", write="snowflake", pretty=True)[0]
+        logging.info(f"Transpiled main query: {modified_query1[:200]}...")
+        # After transpilation, check if the pivot column has an alias
+        # Look for the pivot_key expression in the entire query (may have spaces added by sqlglot)
+        pivot_key_normalized = pivot_key.replace('||', ' || ')
+        # Find lines containing the pivot expression with AS alias
+        lines = modified_query1.split('\n')
+        for line in lines:
+            line = line.strip()
+            if pivot_key_normalized in line and ' AS ' in line.upper():
+                # Extract the alias after AS
+                as_match = re.search(r'\s+AS\s+(\w+)', line, re.IGNORECASE)
+                if as_match:
+                    pivot_key = as_match.group(1)
+                    logging.info(f"Found alias for pivot column: {pivot_key}")
+                    break
+        # Update the quoted version
+        if "'" in pivot_key:
+            pivot_key_quoted = f'"{pivot_key}"'
+        else:
+            pivot_key_quoted = f"'{pivot_key}'"
+    except Exception as e:
+        logging.warning(f"Failed to transpile main query: {e}")
+        # modified_query1 remains as is
+    
+    # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
+    modified_query1 = re.sub(
+        r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
+        r"ARRAY_AGG(DISTINCT \1)",
+        modified_query1,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
     # Build the result - if there are inner CTEs, place them before the prepare CTE
     if inner_ctes:
+        ctes_part = "WITH " + ",\n".join(transformed_ctes_list) + ","
         result = f"""-- CTEs extracted from crosstab query
-{macro_variable_declaration}{inner_ctes},
+{macro_variable_declaration}{ctes_part}
 prepare AS (
 {modified_query1}
 )

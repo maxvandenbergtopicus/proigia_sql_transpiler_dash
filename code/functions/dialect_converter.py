@@ -14,6 +14,16 @@ logging.getLogger("sqlglot").setLevel(logging.WARNING)
 # ---- Custom Dialect Definition ----
 class FixedSnowflake(Snowflake):
     class Generator(Snowflake.Generator):
+        # Override TRANSFORMS to handle EXTRACT(YEAR FROM AGE(...)) pattern
+        TRANSFORMS = {
+            **Snowflake.Generator.TRANSFORMS,
+            exp.Extract: lambda self, e: (
+                self.anonymous_sql(e.expression)
+                if e.this and e.this.this == "YEAR" and isinstance(e.expression, exp.Anonymous) and e.expression.this.upper() == "AGE"
+                else Snowflake.Generator.TRANSFORMS[exp.Extract](self, e)
+            ),
+        }
+        
         def cast_sql(self, expression: exp.Cast) -> str:
             """Handle PostgreSQL interval casts for Snowflake compatibility"""
             # Check if this is an interval cast
@@ -189,9 +199,9 @@ def convert_postgres_escape_strings(sql: str) -> str:
     
     return ''.join(result)
 
-
 def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str:
     """Convert SQL from PostgreSQL to Snowflake dialect using sqlglot."""
+    logging.info(f"[convert_postgres_to_snowflake] Input SQL:\n{sql}")
     # Pre-process: Convert LIKE ANY(array) to Snowflake-compatible EXISTS(SELECT ... LIKE ...)
     if re.search(r'LIKE\s+ANY\s*\(', sql, re.IGNORECASE):
         logging.info("Converting LIKE ANY(array) to Snowflake EXISTS(SELECT ... LIKE ...)")
@@ -251,6 +261,8 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
             logging.info("Converting PostgreSQL array overlap operator && to ARRAYS_OVERLAP")
             sql = convert_array_overlap_to_snowflake(sql)
         
+        # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
+        sql = convert_date_arithmetic_to_snowflake(sql)
         # Pre-process: Handle crosstab function (not supported in Snowflake)
         if re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE):
             sql = handle_crosstab(sql)
@@ -261,18 +273,25 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         # Pre-process: Convert generate_series to Snowflake-compatible TABLE(GENERATOR(...))
         sql = convert_generate_series_to_snowflake(sql)
         
-        # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
-        sql = convert_date_arithmetic_to_snowflake(sql)
-        
-        # Pre-process: Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...)) to ARRAY_AGG with WITHIN GROUP
-        sql = convert_max_array_to_array_agg(sql)
-
         # Parse with PostgreSQL dialect
         parsed = sqlglot.parse_one(sql, read="postgres")
 
         # Generate with custom Snowflake dialect
         converted = parsed.sql(dialect=FixedSnowflake, pretty=True)
     
+        # Pre-process: Convert DISTINCT ON to Snowflake-compatible syntax
+        if 'distinct on' in sql.lower():
+            logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
+            sql = convert_distinct_on_to_snowflake(sql)
+            
+        # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
+        converted = re.sub(
+            r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
+            r"ARRAY_AGG(DISTINCT \1)",
+            converted,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+        logging.info(f"[convert_postgres_to_snowflake] Output SQL:\n{converted}")
         return converted
     except Exception as e:
         sys.stderr.write(f"[Error] Failed to convert SQL: {e}\n")
@@ -524,14 +543,16 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     # Pattern 1: column + expression * interval 'N unit' or column - expression * interval 'N unit'
     # Also handles: column + interval 'N unit' * expression
     pattern1 = re.compile(
-        r"(\w+(?:::\w+)?)"  # base column (with optional ::type cast)
-        r"\s*([-+])\s*"  # operator (+ or -)
-        r"(?:"  # non-capturing group for two variations
-        r"(.*?)\s*\*\s*interval\s*'(\d+)\s+(year|month|day|hour|minute|second)s?'"  # expr * interval 'N unit'
-        r"|"  # OR
-        r"interval\s*'(\d+)\s+(year|month|day|hour|minute|second)s?'\s*\*\s*(.*?)"  # interval 'N unit' * expr
-        r")",
-        re.IGNORECASE
+        r"""
+        (\w+(?:::\w+)?)  # base column (with optional ::type cast)
+        \s*([-+])\s*  # operator (+ or -)
+        (?:  # non-capturing group for two variations
+        (.*?)\s*\*\s*interval\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'  # expr * interval 'N unit'
+        |  # OR
+        interval\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'\s*\*\s*(.*?)  # interval 'N unit' * expr
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE
     )
     
     def repl1(match):
@@ -563,16 +584,92 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     
     sql = pattern1.sub(repl1, sql)
     
-    # Pattern 2: (expression)::date - 'N unit'::interval or (expression)::date + 'N unit'::interval
+    # Pattern 2a: Function calls or parenthesized expressions + 'N unit'::interval
+    # Example: COALESCE(col1, col2) + '1 day'::interval
+    # This needs to handle nested parentheses properly
+    def find_matching_paren(text, start):
+        """Find the closing parenthesis for an opening paren at start position"""
+        count = 1
+        i = start + 1
+        while i < len(text) and count > 0:
+            if text[i] == '(':
+                count += 1
+            elif text[i] == ')':
+                count -= 1
+            i += 1
+        return i if count == 0 else -1
+    
+    # Pattern 2a: Match function_name(...) + 'N unit'::interval
+    pattern2a = re.compile(
+        r"\b(\w+)\s*\("  # function name + opening paren
+        r"|"  # OR
+        r"\("  # just an opening paren for grouped expressions
+    )
+    
+    def repl2a(sql_text):
+        """Process function calls and parenthesized expressions with interval arithmetic"""
+        result = []
+        i = 0
+        while i < len(sql_text):
+            # Look for function call or parenthesized expression
+            match = pattern2a.search(sql_text, i)
+            if not match:
+                result.append(sql_text[i:])
+                break
+            
+            # Add everything before the match
+            result.append(sql_text[i:match.start()])
+            
+            # Find the closing paren
+            paren_start = match.end() - 1
+            paren_end = find_matching_paren(sql_text, paren_start)
+            
+            if paren_end == -1:
+                # Couldn't find matching paren, just add the match and continue
+                result.append(match.group(0))
+                i = match.end()
+                continue
+            
+            # Extract the full expression (function call or grouped expr)
+            if match.group(1):  # Function call
+                base_expr = sql_text[match.start():paren_end]
+            else:  # Just parentheses
+                base_expr = sql_text[match.start():paren_end]
+            
+            # Check if followed by +/- interval
+            interval_match = re.match(
+                r"\s*([-+])\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'::interval",
+                sql_text[paren_end:],
+                re.IGNORECASE
+            )
+            
+            if interval_match:
+                operator = interval_match.group(1)
+                amount = interval_match.group(2)
+                unit = interval_match.group(3).upper()
+                
+                # Convert to DATEADD
+                amount_val = f"-{amount}" if operator == '-' else amount
+                result.append(f"DATEADD({unit}, {amount_val}, {base_expr})")
+                i = paren_end + interval_match.end()
+            else:
+                result.append(base_expr)
+                i = paren_end
+        
+        return ''.join(result)
+    
+    sql = repl2a(sql)
+    
+    # Pattern 2b: Simple column or literal + 'N unit'::interval
     # Capture: base expression, operator (+ or -), number, unit
-    pattern = re.compile(
-        r"(['\"]?\$?\{?[\w]+\}?['\"]?::date|\w+::date|\w+)"  # base expression (with or without ::date)
+    pattern2b = re.compile(
+        r"(\w+(?:::\w+)?|'[^']+'::\w+)"  # simple column or literal with cast
         r"\s*([-+])\s*"  # operator (+ or -)
-        r"'(\d+)\s+(year|month|day|hour|minute|second)s?'::interval",  # interval
+        r"'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'::interval",  # interval
         re.IGNORECASE
     )
     
-    def repl(match):
+    def repl2b(match):
         base = match.group(1)
         operator = match.group(2)
         amount = match.group(3)
@@ -588,14 +685,14 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
         return f"DATEADD({unit}, {amount_val}, {base})"
     
     # Apply the pattern
-    sql = pattern.sub(repl, sql)
+    sql = pattern2b.sub(repl2b, sql)
     
     # Pattern 3: date + concat(..., ' unit')::interval (dynamic interval from string concat)
     # Example: '1900-01-01'::date + concat(cast(value as varchar), ' day')::interval
     pattern3 = re.compile(
         r"(\([^)]+\)(?:::\w+)?|'[^']+'::\w+|\w+(?:::\w+)?)"  # base: parenthesized expr, string literal, or column (with optional cast)
         r"\s*([-+])\s*"  # operator
-        r"concat\s*\(([^)]+),\s*'[^']*\s*(year|month|day|hour|minute|second)s?[^']*'\s*\)::interval",
+        r"concat\s*\(([^)]+),\s*'[^']*\s*(year|month|week|day|hour|minute|second)s?[^']*'\s*\)::interval",
         re.IGNORECASE
     )
     
@@ -644,5 +741,93 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
         
         # Snowflake DATEADD with MONTH hardcoded
         return f"DATEADD(MONTH, {amount_expr}, {base})"
+
+    # Pattern for base_expr [+|-] 'N unit'::interval (decimal, plural/singular)
+    pattern_new = re.compile(
+        r"([\w\(\)\{\}\$'\":, ]+)"  # base expression (function, cast, etc.)
+        r"\s*([-+])\s*"
+        r"'([\d\.]+)\s*(year|month|week|day|hour|minute|second)s?'::interval",
+        re.IGNORECASE
+    )
+
+    def repl_new(match):
+        base = match.group(1).strip()
+        operator = match.group(2)
+        amount = match.group(3)
+        unit = match.group(4).upper()
+        amount_val = f"-{amount}" if operator == '-' else amount
+        return f"DATEADD({unit}, {amount_val}, {base})"
+
+    sql = pattern_new.sub(repl_new, sql)
     
-    return pattern4.sub(repl4, sql)
+    return sql
+
+def convert_distinct_on_to_snowflake(sql: str) -> str:
+    """
+    Convert PostgreSQL DISTINCT ON to Snowflake-compatible syntax using QUALIFY.
+    DISTINCT ON (col1, col2, ...) is equivalent to keeping only the first row
+    for each unique combination of (col1, col2, ...) in the specified ORDER BY.
+
+    Example:
+    SELECT DISTINCT ON (a, b) a, b, c FROM table ORDER BY a, b, c
+    ->
+    SELECT a, b, c FROM table QUALIFY ROW_NUMBER() OVER (PARTITION BY a, b ORDER BY a, b, c) = 1
+    """
+    # Find DISTINCT ON pattern
+    distinct_pattern = re.compile(r'DISTINCT\s+ON\s*\(\s*([^)]+)\s*\)', re.IGNORECASE)
+
+    match = distinct_pattern.search(sql)
+    if not match:
+        return sql  # No DISTINCT ON found, return unchanged
+
+    distinct_cols = match.group(1).strip()
+    distinct_start = match.start()
+    distinct_end = match.end()
+
+    # Find the ORDER BY clause after the DISTINCT ON
+    sql_after_distinct = sql[distinct_end:]
+    order_match = re.search(r'ORDER\s+BY\s+(.+?)(?=\s*(?:GROUP\s+BY|HAVING|LIMIT|OFFSET|UNION|INTERSECT|EXCEPT|\)|;|$))', sql_after_distinct, re.IGNORECASE | re.DOTALL)
+
+    # Build QUALIFY clause
+    qualify_clause = f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {distinct_cols}"
+    if order_match:
+        order_content = order_match.group(1).strip()
+        qualify_clause += f" ORDER BY {order_content}"
+    qualify_clause += ") = 1"
+
+    # Remove DISTINCT ON
+    sql = sql[:distinct_start] + sql[distinct_end:]
+
+    # Find where to insert QUALIFY - before the closing ) of the CTE or ; of the statement
+    # Look for the end of this SELECT statement from the current position
+    insert_pos = len(sql)  # Default to end
+
+    remaining_sql = sql[distinct_start:]
+    paren_count = 0
+    in_string = False
+    string_char = None
+
+    for i, char in enumerate(remaining_sql):
+        if char in ('"', "'") and (i == 0 or remaining_sql[i-1] != '\\'):
+            if not in_string:
+                in_string = True
+                string_char = char
+            elif char == string_char:
+                in_string = False
+                string_char = None
+        elif not in_string:
+            if char == '(':
+                paren_count += 1
+            elif char == ')':
+                paren_count -= 1
+                if paren_count < 0:  # This closes the SELECT statement
+                    insert_pos = distinct_start + i
+                    break
+            elif char == ';' and paren_count == 0:
+                insert_pos = distinct_start + i
+                break
+
+    # Insert QUALIFY before the closing character
+    sql = sql[:insert_pos] + f"\n{qualify_clause}" + sql[insert_pos:]
+
+    return sql

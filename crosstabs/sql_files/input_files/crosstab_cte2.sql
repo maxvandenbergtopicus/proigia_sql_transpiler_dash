@@ -1,66 +1,57 @@
-SELECT * FROM crosstab($$
+    SELECT * FROM crosstab($$
     WITH alle_hb AS
     (
         SELECT
             patient_id,
-            nhgnr,
+            memo,
             datum,
-            uitslag_raw,
             uitslag_waarde
         FROM proigia_meetwaarden_filter_seg2
         WHERE omschrijving ilike '%hoofdbehandelaar%'
+        ORDER BY patient_id, memo, uitslag_waarde, datum desc
     ),
-    max_datum_niet_ha AS
+    grouping_uitslagen AS
     (
         SELECT
             patient_id,
-            nhgnr,
-            max(datum) as max_dd_niet_huisarts
+            memo,
+            datum,
+            array_agg(distinct uitslag_waarde) FILTER (WHERE uitslag_waarde IS NOT NULL) as uitslagen
         FROM alle_hb
-        WHERE (uitslag_waarde <> 'huisarts' or uitslag_waarde IS NULL)
-        GROUP BY patient_id, nhgnr
-    ),
-    min_datum_wel_ha AS
-    (
-        SELECT
-            patient_id,
-            nhgnr,
-            min(datum) as min_dd_huisarts
-        FROM alle_hb
-        LEFT JOIN max_datum_niet_ha USING (patient_id, nhgnr)
-        WHERE uitslag_waarde = 'huisarts'
-        AND (datum >= max_dd_niet_huisarts or max_dd_niet_huisarts IS NULL)
-        GROUP BY patient_id, nhgnr
+        GROUP BY patient_id, memo, datum
     )
-    SELECT
+    SELECT distinct on (patient_id, memo)
         patient_id,
-        nhgnr,
-        ARRAY[min_dd_huisarts, max_dd_niet_huisarts]
-    FROM min_datum_wel_ha
-    LEFT JOIN max_datum_niet_ha USING (patient_id, nhgnr)
-    ORDER BY patient_id, nhgnr
+        memo||'_db',
+        ARRAY[CASE WHEN array_length(uitslagen, 1) > 1 THEN 1 ELSE 0 END::varchar,
+                datum::varchar, uitslagen::varchar] as dubbel
+    FROM grouping_uitslagen
+    ORDER BY patient_id, memo, datum desc
     $$,$$
-    SELECT nhgnr FROM indelingen.nhg_labcodes
+    SELECT
+        memo||'_db'
+    FROM indelingen.nhg_labcodes
     JOIN proigia_labcodes_seg2 USING (nhgnr)
     WHERE omschrijving ilike '%hoofdbehandelaar%'
-    ORDER BY nhgnr
-    $$) AS (
+    ORDER BY memo
+    $$) AS ct(
         patient_id bigint,
-        dmhb date[],
-        ashb date[],
-        cohb date[],
-        gzhb date[],
-        cvhb date[],
-        ozhb date[],
-        dchb date[],
-        uihb date[],
-        skhb date[],
-        nfhb date[],
-        obhb date[],
-        afhb date[],
-        oshb date[],
-        clhb date[],
-        pahb date[],
-        czhb date[],
-        dehb date[],
-        adhb date[]);
+        adhb_db varchar[],
+        afhb_db varchar[],
+        ashb_db varchar[],
+        clhb_db varchar[],
+        cohb_db varchar[],
+        cvhb_db varchar[],
+        czhb_db varchar[],
+        dchb_db varchar[],
+        dehb_db varchar[],
+        dmhb_db varchar[],
+        gzhb_db varchar[],
+        nfhb_db varchar[],
+        obhb_db varchar[],
+        oshb_db varchar[],
+        ozhb_db varchar[],
+        pahb_db varchar[],
+        skhb_db varchar[],
+        uihb_db varchar[]
+    );

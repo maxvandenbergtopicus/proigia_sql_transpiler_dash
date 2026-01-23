@@ -149,7 +149,7 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
     Example: indelingen.translate_labcode_answers(col::int, val) -> {{ translate_labcode_answers('col::int', 'val') }}
     """
-    logging.info(f"Replacing functions with macros: {function_names}, SQL: {sql}")
+    logging.info(f"Replacing functions with macros: {function_names}")
     def smart_split_args(argstr):
         args = []
         current = ''
@@ -234,7 +234,6 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
                     quoted_args.append(f"'{arg_strip}'")
                 replacement = f"{{{{ {macro_name}({', '.join(quoted_args)}) }}}}"
             sql = sql[:start] + replacement + sql[end:]
-        logging.info(f"SQL after replacing function '{func_name}")
     return sql
 
 
@@ -284,7 +283,6 @@ def generate_dbt_model(
         # Replace custom functions with dbt macros AFTER sqlglot conversion
         if function_macros:
             converted_sql = replace_functions_with_macros(converted_sql, function_macros)
-            logging.debug(f"After function replacement (first 500 chars): {converted_sql[:500]}")
         
         # Restore macro calls
         for idx, macro in enumerate(macros):
@@ -313,9 +311,7 @@ def generate_dbt_model(
         # Check if actually converted
         if converted_sql == preprocessed:
             print("[WARNING] SQL was not modified during conversion")
-        
-        logging.debug(f"SQL before CREATE VIEW removal (first 500 chars): {converted_sql[:500]}")
-        
+                
         # Remove CREATE [MATERIALIZED] VIEW statement, keep only the SELECT/WITH
         converted_sql = re.sub(
             r'CREATE\s+(MATERIALIZED\s+)?VIEW\s+\w+\s+AS\s+',
@@ -324,9 +320,7 @@ def generate_dbt_model(
             count=1,
             flags=re.IGNORECASE
         )
-        
-        logging.debug(f"SQL after CREATE VIEW removal (first 500 chars): {converted_sql[:500]}")
-        
+                
         # Replace table references with dbt macros
         model_refs = config.get('model_refs', [])
         table_mapping = config.get('table_mapping', {})
@@ -339,7 +333,6 @@ def generate_dbt_model(
             
         if not re.match(r'^(WITH|SELECT)', converted_sql, re.IGNORECASE):
             print(f"[WARNING] Query doesn't start with WITH or SELECT after removing CREATE VIEW")
-            print(f"First 100 chars: {converted_sql[:100]}")
         # Build dbt variable section using {% set %}
         variables = [
             "{%- set report_name = '" + report_name + "' %}",
