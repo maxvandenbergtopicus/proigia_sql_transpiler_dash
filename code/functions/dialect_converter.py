@@ -279,10 +279,10 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         # Generate with custom Snowflake dialect
         converted = parsed.sql(dialect=FixedSnowflake, pretty=True)
     
-        # Pre-process: Convert DISTINCT ON to Snowflake-compatible syntax
+        # Post-process: Convert DISTINCT ON to Snowflake-compatible syntax
         if 'distinct on' in sql.lower():
             logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
-            sql = convert_distinct_on_to_snowflake(sql)
+            converted = convert_distinct_on_to_snowflake(converted)
             
         # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
         converted = re.sub(
@@ -295,6 +295,10 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         return converted
     except Exception as e:
         sys.stderr.write(f"[Error] Failed to convert SQL: {e}\n")
+        # Even on error, try to convert DISTINCT ON if present
+        if 'distinct on' in sql.lower():
+            logging.info("Converting DISTINCT ON to Snowflake-compatible syntax on error")
+            sql = convert_distinct_on_to_snowflake(sql)
         return sql
 
 def convert_array_overlap_to_snowflake(sql: str) -> str:
@@ -798,36 +802,18 @@ def convert_distinct_on_to_snowflake(sql: str) -> str:
     # Remove DISTINCT ON
     sql = sql[:distinct_start] + sql[distinct_end:]
 
-    # Find where to insert QUALIFY - before the closing ) of the CTE or ; of the statement
-    # Look for the end of this SELECT statement from the current position
-    insert_pos = len(sql)  # Default to end
+    # Insert QUALIFY before ORDER BY if present, else at the end
+    if order_match:
+        # Find ORDER BY in the modified sql
+        order_start = sql.find('ORDER BY', distinct_start)
+        if order_start != -1:
+            insert_pos = order_start
+        else:
+            insert_pos = len(sql)
+    else:
+        insert_pos = len(sql)
 
-    remaining_sql = sql[distinct_start:]
-    paren_count = 0
-    in_string = False
-    string_char = None
-
-    for i, char in enumerate(remaining_sql):
-        if char in ('"', "'") and (i == 0 or remaining_sql[i-1] != '\\'):
-            if not in_string:
-                in_string = True
-                string_char = char
-            elif char == string_char:
-                in_string = False
-                string_char = None
-        elif not in_string:
-            if char == '(':
-                paren_count += 1
-            elif char == ')':
-                paren_count -= 1
-                if paren_count < 0:  # This closes the SELECT statement
-                    insert_pos = distinct_start + i
-                    break
-            elif char == ';' and paren_count == 0:
-                insert_pos = distinct_start + i
-                break
-
-    # Insert QUALIFY before the closing character
-    sql = sql[:insert_pos] + f"\n{qualify_clause}" + sql[insert_pos:]
+    # Insert QUALIFY
+    sql = sql[:insert_pos] + f"{qualify_clause}\n" + sql[insert_pos:]
 
     return sql
