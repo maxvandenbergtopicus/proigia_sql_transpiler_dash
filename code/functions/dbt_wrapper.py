@@ -111,6 +111,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         # Create DBT models for each query
         metadata = parse_pry_file(content)
         report_name = metadata.get('name', 'Unknown Report')
+        report_name  = re.sub(r'[^a-zA-Z0-9_]+', '_', report_name)
         report_type = metadata.get('reporttype', 'normal')
         reportviews = metadata.get('reportviews', [])
         queries = metadata.get('parsed_queries', [])
@@ -533,36 +534,41 @@ def _replace_unqualified_tables(sql: str, cte_names: set, model_refs_lower: list
         
         # Check if we're inside a function call (e.g., EXTRACT(year FROM date_col))
         if _is_inside_function_call(sql, match.start()):
+            logging.debug(f"Skipping {table} at {match.start()} because it is inside a function call.")
             return match.group(0)
         
         # Priority 1: Skip CTEs
         if table_lower in cte_names:
+            logging.debug(f"Skipping {table} at {match.start()} because it is a CTE.")
             return match.group(0)
         
         # Priority 2: Skip special keywords/tables
         if table_lower in ['table', 'draaitabel_ct']:
+            logging.debug(f"Skipping {table} at {match.start()} because it is a special keyword/table.")
             return match.group(0)
         
         # Priority 3: Model refs -> {{ ref('table_name') }}
         if table_lower in model_refs_lower:
-            logging.debug(f"Model ref: {table} -> ref('{table_lower}')")
+            logging.debug(f"Model ref: {table} at {match.start()} -> ref('{table_lower}')")
             return f"{keyword} {{{{ ref('{table_lower}') }}}}"
         
         # Priority 4: External tables -> STG.P{{agb}}.table
         if table_lower in external_tables_lower:
-            logging.debug(f"External: {table} -> STG.P{{{{agb}}}}.{table}")
+            logging.debug(f"External: {table} at {match.start()} -> STG.P{{{{agb}}}}.{table}")
             return f"{keyword} STG.P{{{{agb}}}}.{table}"
         
         # Priority 5: Block mode - leave all non-external tables unchanged
         if is_block:
+            logging.debug(f"Block mode: leaving {table} at {match.start()} unchanged.")
             return match.group(0)
         
         # Priority 6: Skip block-created tables
         if table_lower in block_tables:
+            logging.debug(f"Skipping {table} at {match.start()} because it is a block-created table.")
             return match.group(0)
         
         # Priority 7: Everything else -> {{ ref('table_name') }}
-        logging.debug(f"Internal table: {table} -> ref('{table_lower}')")
+        logging.debug(f"Internal table: {table} at {match.start()} -> ref('{table}') (fallback case)")
         return f"{keyword} {{{{ ref('{table}') }}}}"
     
     return re.sub(table_pattern, table_replacer, sql, flags=re.IGNORECASE | re.DOTALL)

@@ -28,8 +28,8 @@ def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tab
     for pry_file in pry_files:
         try:
             content = pry_file.read_text(encoding='utf-8')
-            # Only match CREATE MATERIALIZED VIEW viewname (MATERIALIZED required)
-            matches = re.findall(r'CREATE\s+MATERIALIZED\s+VIEW\s+(\w+)', content, re.IGNORECASE)
+            # Match CREATE VIEW or CREATE MATERIALIZED VIEW viewname
+            matches = re.findall(r'CREATE\s+(?:MATERIALIZED\s+)?VIEW\s+(\w+)', content, re.IGNORECASE)
             materialized_views.update([m.lower() for m in matches])
         except Exception as e:
             logging.error(f"[ERROR] Failed to scan {pry_file.name} for materialized views: {e}")
