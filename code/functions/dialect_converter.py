@@ -68,12 +68,15 @@ class FixedSnowflake(Snowflake):
         
         def eq_sql(self, expression: exp.EQ) -> str:
             """Convert 'value' = ANY(array) to ARRAY_CONTAINS(TO_VARIANT(value), array)"""
+            print(f"eq_sql called: right type={type(expression.right)}, right={expression.right}, left={expression.left}")
             # Check if right side is ANY
             if isinstance(expression.right, exp.Any):
+                print(f"Converting = ANY: left={expression.left}, right={expression.right}")
                 array_expr = expression.right.this
                 value_expr = expression.left
-                # Snowflake ARRAY_CONTAINS requires value to be VARIANT type
-                return f"ARRAY_CONTAINS(TO_VARIANT({self.sql(value_expr)}), {self.sql(array_expr)})"
+                result = f"ARRAY_CONTAINS(TO_VARIANT({self.sql(value_expr)}), {self.sql(array_expr)})"
+                print(f"Generated: {result}")
+                return result
             
             # Default behavior for other equality expressions
             return super().eq_sql(expression)
@@ -143,6 +146,46 @@ class FixedSnowflake(Snowflake):
             # Fallback to default behavior
             return super().function_sql(expression)
 
+
+def convert_like_any_to_exists(sql: str) -> str:
+    """
+    Convert 'col LIKE ANY(array)' to Snowflake-compatible EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE col LIKE f.value)
+    Handles both qualified and unqualified column/array names.
+    """
+    # Pattern: <expr> LIKE ANY(<array_expr>)
+    pattern = re.compile(r'(\b[\w\.]+\b)\s+LIKE\s+ANY\s*\(([^\)]+)\)', re.IGNORECASE)
+    def repl(match):
+        col = match.group(1).strip()
+        arr = match.group(2).strip()
+        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
+    return pattern.sub(repl, sql)
+
+def convert_any_to_snowflake_post(sql: str) -> str:
+    """
+    Convert remaining PostgreSQL ANY expressions to Snowflake equivalents after sqlglot conversion.
+    - element = ANY(array) -> ARRAY_CONTAINS(element, array)
+    - element op ANY(array) -> EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE element op f.value)
+    """
+    # Pattern for = ANY
+    eq_pattern = re.compile(r'(\b[\w\.]+\b)\s*=\s*ANY\s*\(([^)]+)\)', re.IGNORECASE)
+    def eq_repl(match):
+        element = match.group(1).strip()
+        arr = match.group(2).strip()
+        return f"ARRAY_CONTAINS({element}, {arr})"
+    
+    sql = eq_pattern.sub(eq_repl, sql)
+    
+    # Pattern for other operators: <=, >=, <, >, <>, !=
+    other_pattern = re.compile(r'(\b[\w\.]+\b)\s*(<>|!=|<=|>=|<|>)\s*ANY\s*\(([^)]+)\)', re.IGNORECASE)
+    def other_repl(match):
+        element = match.group(1).strip()
+        op = match.group(2).strip()
+        arr = match.group(3).strip()
+        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {element} {op} f.value)"
+    
+    sql = other_pattern.sub(other_repl, sql)
+    
+    return sql
 
 def convert_postgres_escape_strings(sql: str) -> str:
     """
@@ -284,6 +327,15 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
             logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
             converted = convert_distinct_on_to_snowflake(converted)
             
+        # Post-process: Fix DATE_PART(day, date_expr - date_expr) to just date_expr - date_expr
+        # Since date subtraction in Snowflake returns an integer number of days
+        converted = re.sub(
+            r"DATE_PART\s*\(\s*day\s*,\s*(.+?)\s*-\s*(.+?)\s*\)",
+            r"\1 - \2",
+            converted,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+        
         # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
         converted = re.sub(
             r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
@@ -291,6 +343,14 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
             converted,
             flags=re.IGNORECASE | re.DOTALL
         )
+        
+        # Post-process: Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ...) to ARRAY_AGG
+        converted = convert_max_array_to_array_agg(converted)
+        
+        # Post-process: Convert remaining ANY expressions
+        if 'ANY(' in converted.upper():
+            logging.info("Converting remaining ANY expressions to Snowflake equivalents")
+            converted = convert_any_to_snowflake_post(converted)
         logging.info(f"[convert_postgres_to_snowflake] Output SQL:\n{converted}")
         return converted
     except Exception as e:
@@ -436,6 +496,33 @@ def convert_like_any_to_exists(sql: str) -> str:
         arr = match.group(2).strip()
         return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
     return pattern.sub(repl, sql)
+
+def convert_any_to_snowflake(sql: str) -> str:
+    """
+    Convert PostgreSQL ANY expressions to Snowflake equivalents.
+    - element = ANY(array) -> ARRAY_CONTAINS(element, array)
+    - element op ANY(array) -> EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE element op f.value)
+    """
+    # Pattern for = ANY
+    eq_pattern = re.compile(r'(\b[\w\.]+\b)\s*=\s*ANY\s*\(([^\)]+)\)', re.IGNORECASE)
+    def eq_repl(match):
+        element = match.group(1).strip()
+        arr = match.group(2).strip()
+        return f"ARRAY_CONTAINS({element}, {arr})"
+    
+    sql = eq_pattern.sub(eq_repl, sql)
+    
+    # Pattern for other operators: <=, >=, <, >, <>, !=
+    other_pattern = re.compile(r'(\b[\w\.]+\b)\s*(<>|!=|<=|>=|<|>)\s*ANY\s*\(([^\)]+)\)', re.IGNORECASE)
+    def other_repl(match):
+        element = match.group(1).strip()
+        op = match.group(2).strip()
+        arr = match.group(3).strip()
+        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {element} {op} f.value)"
+    
+    sql = other_pattern.sub(other_repl, sql)
+    
+    return sql
 
 def handle_crosstab(sql: str) -> str:
     """

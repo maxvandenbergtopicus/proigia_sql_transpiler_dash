@@ -403,7 +403,8 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # Transpile the main query from PostgreSQL to Snowflake (after array processing)
     logging.info(f"Transpiling main query: {modified_query1[:200]}...")
     try:
-        modified_query1 = sqlglot.transpile(modified_query1, read="postgres", write="snowflake", pretty=True)[0]
+        from code.functions.dialect_converter import convert_postgres_to_snowflake
+        modified_query1 = convert_postgres_to_snowflake(modified_query1)
         logging.info(f"Transpiled main query: {modified_query1[:200]}...")
         # After transpilation, check if the pivot column has an alias
         # Look for the pivot_key expression in the entire query (may have spaces added by sqlglot)
