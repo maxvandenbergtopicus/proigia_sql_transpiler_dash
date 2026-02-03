@@ -76,6 +76,9 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         table_mapping = config.get('table_mapping', {})
         converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, model_refs=model_refs, table_mapping=table_mapping, is_block=True)
         
+        # Extract all external variables like ${varname} in the SQL and replace them
+        converted_sql, external_vars = replace_template_variables(converted_sql)
+        
         # Extract all table/view names created by this block (look for "name AS (")
         created_tables = set()
         for match in re.finditer(r'\b(\w+)\s+AS\s*\(', converted_sql, re.IGNORECASE):
@@ -89,11 +92,22 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         
         macro_file = macro_path / f"{block_name}.sql"
         
-        # Check if macro contains {{agb}} and add variable declaration if needed
+        # Build dbt variable section using {% set %}
         macro_header = f"{{% macro {block_name}() %}}\n"
+        variables = []
+        
+        # Add agb variable if needed (legacy check)
         if '{{agb}}' in converted_sql or '{{ agb }}' in converted_sql:
-            macro_header += "{%- set agb = var('agb', 0) %}\n"
+            variables.append("{%- set agb = var('agb', 0) %}")
             logging.debug(f"Added agb variable to macro {block_name}")
+        
+        # Add each external variable as a dbt variable
+        for var in sorted(external_vars):
+            variables.append(f"{{%- set {var} = var(\"{var}\", \" \") %}}")
+        
+        # Add variables to macro header
+        if variables:
+            macro_header += '\n'.join(variables) + '\n'
         
         macro_content = f"{macro_header}{converted_sql}\n{{% endmacro %}}\n"
         
@@ -143,6 +157,31 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
                 config=config
             )
         return set()
+
+def replace_template_variables(sql: str) -> tuple[str, set[str]]:
+    """Replace ${varname} template variables with {{ varname }} and return external vars.
+    
+    Returns:
+        tuple: (modified_sql, set_of_external_variables)
+    """
+    # Extract all external variables like ${varname} in the SQL
+    external_vars = set(re.findall(r'\$\{([a-zA-Z_][\w]*)\}', sql))
+    
+    # Replace quoted '${varname}' or "${varname}" - always remove quotes
+    def replace_quoted_var(m):
+        var_name = m.group(2)
+        return f"'{{{{ {var_name} }}}}'"  # Remove quotes entirely
+    sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, sql)
+    
+    # Then replace any remaining unquoted ${varname} - add quotes if it's a datum variable
+    def replace_unquoted_var(m):
+        var_name = m.group(1)
+        if 'datum' in var_name.lower():
+            return f"'{{{{ {var_name} }}}}'"  # Add quotes for dates
+        return f"'{{{{ {var_name} }}}}'"
+    sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', replace_unquoted_var, sql)
+    
+    return sql, external_vars
 
 def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     """Replace SQL function calls with dbt macro calls.
@@ -341,27 +380,13 @@ def generate_dbt_model(
             "{%- set view_name = '" + view_name + "' %}",
             "{%- set agb = var(\"agb\", none) %}",
         ]
-        # Extract all external variables like ${varname} in the SQL
-        external_vars = set(re.findall(r'\$\{([a-zA-Z_][\w]*)\}', converted_sql))
+        # Extract all external variables like ${varname} in the SQL and replace them
+        converted_sql, external_vars = replace_template_variables(converted_sql)
         # Exclude agb (already set)
         external_vars.discard('agb')
         # Add each as a dbt variable
         for var in sorted(external_vars):
-            variables.append(f"{{%- set {var} = var(\"{var}\", none) %}}")
-        
-        # Replace quoted '${varname}' or "${varname}" - always remove quotes
-        def replace_quoted_var(m):
-            var_name = m.group(2)
-            return f"'{{{{ {var_name} }}}}'"  # Remove quotes entirely
-        converted_sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, converted_sql)
-        
-        # Then replace any remaining unquoted ${varname} - add quotes if it's a datum variable
-        def replace_unquoted_var(m):
-            var_name = m.group(1)
-            if 'datum' in var_name.lower():
-                return f"'{{{{ {var_name} }}}}'"  # Add quotes for dates
-            return f"'{{{{ {var_name} }}}}'"
-        converted_sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', replace_unquoted_var, converted_sql)
+            variables.append(f"{{%- set {var} = var(\"{var}\", \" \") %}}")
         if 'type' in view_metadata:
             variables.append("{%- set view_type = '" + view_metadata['type'] + "' %}")
         if 'displayname' in view_metadata:

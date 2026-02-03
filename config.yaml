@@ -30,3 +30,8 @@ model_refs:
 # Supports {{agb}} placeholder in target
 table_mapping:
   public.medewerker: "STG.P{{agb}}.medewerker_manual"
+
+# List of report folders that should be materialized as materialized_view in dbt
+materialized_view_reports:
+  - proigia_zorggroep_criteria_v4_0
+  - proigia_basisrapportage
