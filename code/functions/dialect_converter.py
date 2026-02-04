@@ -213,8 +213,12 @@ def convert_any_to_snowflake_post(sql: str) -> str:
 def convert_postgres_escape_strings(sql: str) -> str:
     """
     Convert PostgreSQL escape strings E'...' to regular strings.
-    In PostgreSQL, E'\\n' means newline, E'\\\\' means one backslash.
-    For Snowflake, we need to preserve the actual escape sequences.
+    In PostgreSQL E-strings:
+    - E'\\n' means newline, E'\\t' means tab
+    - E'\\\\' means one backslash
+    - E'\\X' means just X (backslash escapes the character)
+    
+    For Snowflake REGEXP_REPLACE: E'\.0\\1' -> '.0\\1' (dot is unescaped, \\1 stays for backreference)
     """
     result = []
     i = 0
@@ -229,20 +233,19 @@ def convert_postgres_escape_strings(sql: str) -> str:
             # Process the string content
             while i < len(sql):
                 if sql[i] == '\\' and i + 1 < len(sql):
-                    # Handle escape sequences
                     next_char = sql[i+1]
                     if next_char == '\\':
-                        # \\\\ in E'...' means one backslash
-                        result.append('\\\\')  # Keep as double backslash for Snowflake
+                        # E'\\' -> keep as \\ in output
+                        result.append('\\\\')
                         i += 2
                     elif next_char in ('n', 't', 'r'):
-                        # \\n, \\t, \\r are escape sequences
+                        # Special escape sequences
                         result.append('\\')
                         result.append(next_char)
                         i += 2
                     else:
-                        # Other escapes like \\. or \\1
-                        result.append('\\')
+                        # E'\X' -> just X (backslash escapes the character in E-string)
+                        # This handles E'\.' -> '.' and similar cases
                         result.append(next_char)
                         i += 2
                 elif sql[i] == quote_char:

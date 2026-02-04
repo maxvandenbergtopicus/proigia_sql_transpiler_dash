@@ -396,10 +396,14 @@ def generate_dbt_model(
         if 'queryorder' in view_metadata:
             variables.append("{%- set query_order = " + str(view_metadata['queryorder']) + " %}")
         # Build dbt config block
+        # Check if report should be materialized as table
+        materialized_view_reports = config.get('materialized_view_reports', [])
+        materialization = 'table' if report_name.lower() in materialized_view_reports else 'view'
+        
         config_lines = [
             "{{",
             "  config(",
-            f"    materialized='view',",
+            f"    materialized='{materialization}',",
             f"    tags=['{report_type}', 'report', '{report_name.replace(' ', '_').lower()}']"
         ]
         # Add schema if needed

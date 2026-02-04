@@ -336,6 +336,31 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # The pivoted category values are the output columns minus the id columns
     pivoted_values = [c for c in output_cols if c not in id_cols]
     
+    # Parse column types from output_section
+    column_types = {}
+    for col_def in output_section.split(','):
+        col_def = col_def.strip()
+        if col_def:
+            parts = col_def.split()
+            if len(parts) >= 2:
+                col_name = parts[0]
+                col_type = ' '.join(parts[1:])
+                column_types[col_name] = col_type
+    
+    # Determine output_type: 'scalar' if all pivoted columns are scalar types, 'array' otherwise
+    output_type = 'array'  # default
+    if pivoted_values:
+        is_scalar = True
+        for col in pivoted_values:
+            col_type = column_types.get(col, '').upper()
+            if '[]' in col_type or 'ARRAY' in col_type:
+                is_scalar = False
+                break
+        if is_scalar:
+            output_type = 'scalar'
+    
+    logging.debug(f"Column types: {column_types}")
+    logging.debug(f"Output type: {output_type}")
     logging.debug(f"ID columns: {id_cols}")
     logging.debug(f"Pivot key: {pivot_key}, Array: {array_name}")
     logging.debug(f"Pivoted category values: {pivoted_values}")
@@ -446,7 +471,7 @@ prepare AS (
 {modified_query1}
 )
 -- Call snowflake pivot macro
-{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}
+{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}')}}}}
 
 SELECT * FROM draaitabel_ct"""
     else:
@@ -455,7 +480,7 @@ SELECT * FROM draaitabel_ct"""
 {modified_query1}
 )
 -- Call snowflake pivot macro
-{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str})}}}}
+{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}')}}}}
 
 SELECT * FROM draaitabel_ct"""
     
