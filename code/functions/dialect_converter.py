@@ -251,26 +251,133 @@ def convert_any_to_snowflake_post(sql: str) -> str:
     """
     Convert remaining PostgreSQL ANY expressions to Snowflake equivalents after sqlglot conversion.
     - element = ANY(array) -> ARRAY_CONTAINS(element, array)
+    - element >= ANY(array) -> COALESCE(ARRAY_MIN(array) <= element, FALSE)
+    - element <= ANY(array) -> COALESCE(ARRAY_MAX(array) >= element, FALSE)
+    - element > ANY(array) -> COALESCE(ARRAY_MIN(array) < element, FALSE)
+    - element < ANY(array) -> COALESCE(ARRAY_MAX(array) > element, FALSE)
     - element op ANY(array) -> EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE element op f.value)
     """
-    # Pattern for = ANY
-    eq_pattern = re.compile(r'(\b[\w\.]+\b)\s*=\s*ANY\s*\(([^)]+)\)', re.IGNORECASE)
-    def eq_repl(match):
-        element = match.group(1).strip()
-        arr = match.group(2).strip()
-        return f"ARRAY_CONTAINS({element}, {arr})"
     
-    sql = eq_pattern.sub(eq_repl, sql)
+    def find_left_expr_before_operator(text, op_start_pos):
+        """
+        Extract the complete left expression before an operator by working backwards.
+        Handles nested parentheses, array indexing [n], type casts ::type, and unary -/+ operators.
+        """
+        i = op_start_pos - 1
+        
+        # Skip trailing whitespace
+        while i >= 0 and text[i].isspace():
+            i -= 1
+        
+        if i < 0:
+            return "", 0
+        
+        end_pos = i + 1
+        
+        # Work backwards through the complete expression
+        while i >= 0:
+            if text[i] == ')':
+                # Closing paren - find matching opening paren
+                paren_count = 1
+                i -= 1
+                while i >= 0 and paren_count > 0:
+                    if text[i] == ')':
+                        paren_count += 1
+                    elif text[i] == '(':
+                        paren_count -= 1
+                    i -= 1
+                i += 1  # Move back to the '('
+                # Continue backwards to get function name
+                i -= 1
+                while i >= 0 and (text[i].isalnum() or text[i] == '_'):
+                    i -= 1
+            elif text[i] == ']':
+                # Closing bracket - find matching opening bracket (array indexing)
+                bracket_count = 1
+                i -= 1
+                while i >= 0 and bracket_count > 0:
+                    if text[i] == ']':
+                        bracket_count += 1
+                    elif text[i] == '[':
+                        bracket_count -= 1
+                    i -= 1
+                # Continue - there's more before the [
+            elif i > 0 and text[i-1:i+1] == '::':
+                # Type cast - skip both colons
+                i -= 2
+            elif text[i].isalnum() or text[i] in ('_', '.', '$', '{', '}', "'", '"', ':'):
+                # Part of identifier or template variable
+                i -= 1
+            elif text[i] in ('-', '+') and i > 0:
+                # Potential unary operator - check if it's at the start of a number
+                # Look ahead to see if we have digits after
+                peek = i + 1
+                while peek < end_pos and text[peek].isspace():
+                    peek += 1
+                if peek < end_pos and (text[peek].isdigit() or text[peek] == '.'):
+                    # It's a unary operator for a number, include it
+                    i -= 1
+                else:
+                    # It's a binary operator, stop here
+                    break
+            else:
+                # Found a character that's not part of the expression
+                break
+        
+        start_pos = i + 1
+        return text[start_pos:end_pos].strip(), start_pos
     
-    # Pattern for other operators: <=, >=, <, >, <>, !=
-    other_pattern = re.compile(r'(\b[\w\.]+\b)\s*(<>|!=|<=|>=|<|>)\s*ANY\s*\(([^)]+)\)', re.IGNORECASE)
-    def other_repl(match):
-        element = match.group(1).strip()
-        op = match.group(2).strip()
-        arr = match.group(3).strip()
-        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {element} {op} f.value)"
+    # Process each operator type, starting with multi-char operators first
+    operators = [
+        ('>=', lambda l, a: f"COALESCE(ARRAY_MIN({a}) <= {l}, FALSE)"),
+        ('<=', lambda l, a: f"COALESCE(ARRAY_MAX({a}) >= {l}, FALSE)"),
+        ('<>', lambda l, a: f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {a})) f WHERE {l} <> f.value)"),
+        ('!=', lambda l, a: f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {a})) f WHERE {l} != f.value)"),
+        ('>', lambda l, a: f"COALESCE(ARRAY_MIN({a}) < {l}, FALSE)"),
+        ('<', lambda l, a: f"COALESCE(ARRAY_MAX({a}) > {l}, FALSE)"),
+        ('=', lambda l, a: f"ARRAY_CONTAINS({l}, {a})"),
+    ]
     
-    sql = other_pattern.sub(other_repl, sql)
+    for op, replacement_func in operators:
+        # Find all occurrences of "operator ANY("
+        pattern = re.escape(op) + r'\s*ANY\s*\('
+        
+        while True:
+            match = re.search(pattern, sql, re.IGNORECASE)
+            if not match:
+                break
+            
+            op_start = match.start()
+            
+            # Extract left expression
+            left_expr, left_start = find_left_expr_before_operator(sql, op_start)
+            
+            if not left_expr:
+                # Couldn't extract left expression, skip this match
+                break
+            
+            # Find the array argument inside ANY(...)
+            any_paren_start = match.end()
+            paren_count = 1
+            i = any_paren_start
+            while i < len(sql) and paren_count > 0:
+                if sql[i] == '(':
+                    paren_count += 1
+                elif sql[i] == ')':
+                    paren_count -= 1
+                i += 1
+            
+            if paren_count != 0:
+                # Malformed, skip
+                break
+            
+            array_expr = sql[any_paren_start:i-1].strip()
+            
+            # Build replacement
+            replacement = replacement_func(left_expr, array_expr)
+            
+            # Replace in sql
+            sql = sql[:left_start] + replacement + sql[i:]
     
     return sql
 
@@ -411,225 +518,215 @@ def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
 
 def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str:
     """Convert SQL from PostgreSQL to Snowflake dialect using sqlglot."""
-    logging.info(f"[convert_postgres_to_snowflake] Input SQL:\n{sql}")
+    logging.debug(f"[convert_postgres_to_snowflake] Input SQL:\n{sql}")
+    
+    # Pre-process: Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
+    if "E'" in sql or 'E"' in sql:
+        logging.info("Converting PostgreSQL escape strings (E'...')")
+        sql = convert_postgres_escape_strings(sql)
+    
+    # Pre-process: Replace citext with varchar (case-insensitive text type)
+    if 'citext' in sql.lower():
+        logging.info("Converting citext to VARCHAR")
+        sql = re.sub(r'\bcitext\b', 'VARCHAR', sql, flags=re.IGNORECASE)
+    
+    # Pre-process: Replace array_accum with array_agg
+    if 'array_accum' in sql.lower():
+        count = sql.lower().count('array_accum')
+        logging.info(f"Converting {count} occurrence(s) of array_accum to array_agg")
+        sql = sql.replace('array_accum', 'array_agg')
+        sql = sql.replace('ARRAY_ACCUM', 'ARRAY_AGG')
+    
+    # Pre-process: Replace string_to_array with SPLIT
+    if 'string_to_array' in sql.lower():
+        logging.info("Converting string_to_array to SPLIT")
+        sql = re.sub(r'\bstring_to_array\b', 'SPLIT', sql, flags=re.IGNORECASE)
+    
+    # Pre-process: Remove MATERIALIZED keyword from CTEs (not supported in Snowflake)
+    if 'materialized' in sql.lower():
+        logging.info("Removing MATERIALIZED keyword from CTEs")
+        # Remove AS MATERIALIZED from CTEs: WITH cte AS MATERIALIZED (...) -> WITH cte AS (...)
+        sql = re.sub(r'\bAS\s+MATERIALIZED\b', 'AS', sql, flags=re.IGNORECASE)
+    
+    # Pre-process: Convert SIMILAR TO to RLIKE (Snowflake equivalent)
+    if 'similar to' in sql.lower():
+        logging.info("Converting SIMILAR TO to RLIKE")
+        sql = re.sub(r'\bSIMILAR\s+TO\b', 'RLIKE', sql, flags=re.IGNORECASE)
+    
+    # Pre-process: Convert PostgreSQL regex match operator ~ to RLIKE
+    if '~' in sql:
+        logging.info("Converting PostgreSQL regex match operator ~ to RLIKE")
+        # Replace ~ with RLIKE (but not ~* which is case-insensitive and handled separately)
+        sql = re.sub(r'(\s)~(\s)', r'\1RLIKE\2', sql)
+    
+    # Pre-process: Convert ARRAY[...] to ARRAY_CONSTRUCT(...)
+    if 'array[' in sql.lower():
+        logging.info("Converting ARRAY[...] to ARRAY_CONSTRUCT(...)")
+        sql = convert_array_to_array_construct(sql)
+    
+    # Pre-process: Remove PostgreSQL array type casts (::text[], ::varchar[], etc.)
+    if '::' in sql and '[]' in sql:
+        logging.info("Removing PostgreSQL array type casts")
+        sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
+    
+    # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
+    sql = convert_date_arithmetic_to_snowflake(sql)
+    
+    # Pre-process: Handle crosstab function (not supported in Snowflake)
+    if re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE):
+        sql = handle_crosstab(sql)
+
+    # Pre-process: Convert unnest(ARRAY[...]) to SELECT ... FROM VALUES (...)
+    sql = convert_unnest_array_to_values(sql)
+
+    # Pre-process: Convert CROSS JOIN LATERAL unnest(...) to Snowflake FLATTEN
+    sql = convert_lateral_unnest_to_snowflake(sql)
+
+    # Pre-process: Convert generate_series to Snowflake-compatible TABLE(GENERATOR(...))
+    sql = convert_generate_series_to_snowflake(sql)
+    
+    # Try sqlglot conversion
+    converted = sql
     try:
-        # Pre-process: Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
-        if "E'" in sql or 'E"' in sql:
-            logging.info("Converting PostgreSQL escape strings (E'...')")
-            sql = convert_postgres_escape_strings(sql)
-        
-        # Pre-process: Replace citext with varchar (case-insensitive text type)
-        if 'citext' in sql.lower():
-            logging.info("Converting citext to VARCHAR")
-            sql = re.sub(r'\bcitext\b', 'VARCHAR', sql, flags=re.IGNORECASE)
-        
-        # Pre-process: Replace array_accum with array_agg
-        if 'array_accum' in sql.lower():
-            count = sql.lower().count('array_accum')
-            logging.info(f"Converting {count} occurrence(s) of array_accum to array_agg")
-            sql = sql.replace('array_accum', 'array_agg')
-            sql = sql.replace('ARRAY_ACCUM', 'ARRAY_AGG')
-        
-        # Pre-process: Replace string_to_array with SPLIT
-        if 'string_to_array' in sql.lower():
-            logging.info("Converting string_to_array to SPLIT")
-            sql = re.sub(r'\bstring_to_array\b', 'SPLIT', sql, flags=re.IGNORECASE)
-        
-        # Pre-process: Remove MATERIALIZED keyword from CTEs (not supported in Snowflake)
-        if 'materialized' in sql.lower():
-            logging.info("Removing MATERIALIZED keyword from CTEs")
-            # Remove AS MATERIALIZED from CTEs: WITH cte AS MATERIALIZED (...) -> WITH cte AS (...)
-            sql = re.sub(r'\bAS\s+MATERIALIZED\b', 'AS', sql, flags=re.IGNORECASE)
-        
-        # Pre-process: Convert SIMILAR TO to RLIKE (Snowflake equivalent)
-        if 'similar to' in sql.lower():
-            logging.info("Converting SIMILAR TO to RLIKE")
-            sql = re.sub(r'\bSIMILAR\s+TO\b', 'RLIKE', sql, flags=re.IGNORECASE)
-        
-        # Pre-process: Convert PostgreSQL regex match operator ~ to RLIKE
-        if '~' in sql:
-            logging.info("Converting PostgreSQL regex match operator ~ to RLIKE")
-            # Replace ~ with RLIKE (but not ~* which is case-insensitive and handled separately)
-            sql = re.sub(r'(\s)~(\s)', r'\1RLIKE\2', sql)
-        
-        # Pre-process: Convert ARRAY[...] to ARRAY_CONSTRUCT(...)
-        if 'array[' in sql.lower():
-            logging.info("Converting ARRAY[...] to ARRAY_CONSTRUCT(...)")
-            sql = convert_array_to_array_construct(sql)
-        
-        # Pre-process: Remove PostgreSQL array type casts (::text[], ::varchar[], etc.)
-        if '::' in sql and '[]' in sql:
-            logging.info("Removing PostgreSQL array type casts")
-            sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
-        
-        # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
-        sql = convert_date_arithmetic_to_snowflake(sql)
-        # Pre-process: Handle crosstab function (not supported in Snowflake)
-        if re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE):
-            sql = handle_crosstab(sql)
-
-        # Pre-process: Convert unnest(ARRAY[...]) to SELECT ... FROM VALUES (...)
-        sql = convert_unnest_array_to_values(sql)
-
-        # Pre-process: Convert CROSS JOIN LATERAL unnest(...) to Snowflake FLATTEN
-        sql = convert_lateral_unnest_to_snowflake(sql)
-
-        # Pre-process: Convert generate_series to Snowflake-compatible TABLE(GENERATOR(...))
-        sql = convert_generate_series_to_snowflake(sql)
-        
         # Parse with PostgreSQL dialect
         parsed = sqlglot.parse_one(sql, read="postgres")
-
         # Generate with custom Snowflake dialect
         converted = parsed.sql(dialect=FixedSnowflake, pretty=True)
-    
-        # Post-process: Convert DISTINCT ON to Snowflake-compatible syntax
-        if 'distinct on' in sql.lower():
-            logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
-            converted = convert_distinct_on_to_snowflake(converted)
-        
-        # Post-process: Convert CAST(... AS DATE|DECIMAL|NUMBER) to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL
-        if 'CAST(' in converted.upper():
-            logging.info("Converting CAST to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL for DATE, DECIMAL, NUMBER types")
-            converted = convert_cast_to_try_cast(converted)
-        
-        # Post-process: Convert any remaining && to ARRAYS_OVERLAP
-        if '&&' in converted:
-            logging.info("Converting remaining && to ARRAYS_OVERLAP")
-            converted = convert_array_overlap_to_snowflake(converted)
-            
-        # Post-process: Fix DATE_PART(day, date_expr - date_expr) to just date_expr - date_expr
-        # Since date subtraction in Snowflake returns an integer number of days
-        converted = re.sub(
-            r"DATE_PART\s*\(\s*day\s*,\s*(.+?)\s*-\s*(.+?)\s*\)",
-            r"\1 - \2",
-            converted,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-        
-        # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
-        converted = re.sub(
-            r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
-            r"ARRAY_AGG(DISTINCT \1)",
-            converted,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-        
-        # Post-process: Fix aggregate functions with IFF(condition, DISTINCT expression, NULL)
-        converted = fix_aggregate_distinct_iff(converted)
-        
-        # Post-process: Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ...) to ARRAY_AGG
-        converted = convert_max_array_to_array_agg(converted)
-        
-        # Post-process: Convert remaining ANY expressions
-        if 'ANY(' in converted.upper():
-            logging.info("Converting remaining ANY expressions to Snowflake equivalents")
-            converted = convert_any_to_snowflake_post(converted)
-
-        # Post-process: Convert ILIKE ANY(ARRAY_CONSTRUCT(...)) to ILIKE ANY('...', ...)
-        def ilike_any_array_construct_repl(match):
-            args = match.group(1)
-            # Remove whitespace and split by comma, but keep quoted strings intact
-            # This regex splits on commas not inside quotes
-            import re
-            parts = re.findall(r"'[^']*'|\"[^\"]*\"|[^,]+", args)
-            # Clean up whitespace
-            parts = [p.strip() for p in parts if p.strip()]
-            return f"ILIKE ANY({', '.join(parts)})"
-
-        converted = re.sub(
-            r"ILIKE\s+ANY\s*\(\s*ARRAY_CONSTRUCT\((.*?)\)\s*\)",
-            ilike_any_array_construct_repl,
-            converted,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-
-        # Post-process: Convert ILIKE ANY(column1 || column2 || ...) to ILIKE ANY(ARRAY_CONCAT(SPLIT(column1, ','), SPLIT(column2, ','), ...))
-        def ilike_any_concat_repl(match):
-            concat_expr = match.group(1)
-            # Split by || and strip
-            columns = [col.strip() for col in re.split(r'\s*\|\|\s*', concat_expr)]
-            # Build ARRAY_CONCAT(ARRAY_TO_STRING(col, ','), ...)
-            splits = [f"ARRAY_TO_STRING({col}, ',')" for col in columns]
-            if len(splits) == 1:
-                return f"ILIKE ANY({splits[0]})"
-            else:
-                return f"ILIKE ANY(CONCAT({', '.join(splits)}))"
-
-        converted = re.sub(
-            r"ILIKE\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*\|\|\s*[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
-            ilike_any_concat_repl,
-            converted,
-            flags=re.IGNORECASE
-        )
-
-        # Post-process: Convert ILIKE ANY(column) to ILIKE ANY(ARRAY_TO_STRING(column, ','))
-        converted = re.sub(
-            r"ILIKE\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
-            r"ILIKE ANY(ARRAY_TO_STRING(\1, ','))",
-            converted,
-            flags=re.IGNORECASE
-        )
-
-
-        # Post-process: Convert ARRAY_AGG(IFF(..., expr ORDER BY ..., NULL)) to ARRAY_AGG(IFF(..., expr, NULL)) WITHIN GROUP(ORDER BY ...)
-        def array_agg_iff_orderby_repl(match):
-            condition = match.group(1)
-            expr = match.group(2)
-            orderby = match.group(3)
-            return f"ARRAY_AGG(\n  IFF(\n    {condition},\n    {expr},\n    NULL\n  )\n) WITHIN GROUP(ORDER BY {orderby})"
-
-        converted = re.sub(
-            r"ARRAY_AGG\(\s*IFF\(\s*(.*?),\s*(.*?)\s+ORDER\s+BY\s+(.*?),\s*NULL\s*\)\s*\)",
-            array_agg_iff_orderby_repl,
-            converted,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-
-        # Post-process: Fix COUNT(IFF(..., *, NULL)) to COUNT(IFF(..., 1, NULL)), supporting multiline and whitespace
-        converted = re.sub(
-            r'COUNT\s*\(\s*IFF\s*\((.*?),\s*\*,\s*NULL\s*\)\s*\)',
-            lambda m: f"COUNT(IFF({m.group(1)}, 1, NULL))",
-            converted,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-
-        # Post-process: Pretty-format COUNT(IFF(...)) expressions for readability
-        def pretty_count_iff(match):
-            condition = match.group(1).strip()
-            return (
-                "COUNT(\n    IFF(\n        "
-                + condition.replace(", 1, NULL", ",\n        1, NULL")
-                + "\n    )\n)"
-            )
-        converted = re.sub(
-            r"COUNT\s*\(\s*IFF\s*\((.*?, 1, NULL)\)\s*\)",
-            pretty_count_iff,
-            converted,
-            flags=re.DOTALL,
-        )
-
-        # Post-process: Convert JOIN table ON col LIKE ANY(array) to LATERAL FLATTEN
-        if re.search(r'JOIN\s+.*\s+ON\s+.*\s+(LIKE|ILIKE)\s+ANY\s*\(', converted, re.IGNORECASE | re.DOTALL):
-            logging.info("Converting JOIN ... ON ... LIKE ANY(array) to LATERAL FLATTEN")
-            converted = convert_join_like_any_to_lateral_flatten(converted)
-
-        return converted
     except Exception as e:
-        logging.info(f"[Error] Failed to convert SQL: {e}\n")
-        # Even on error, try to convert DISTINCT ON if present
-        if 'distinct on' in sql.lower():
-            logging.info("Converting DISTINCT ON to Snowflake-compatible syntax on error")
-            sql = convert_distinct_on_to_snowflake(sql)
-        # Also convert any remaining && to ARRAYS_OVERLAP
-        if '&&' in sql:
-            logging.info("Converting remaining && to ARRAYS_OVERLAP on error")
-            sql = convert_array_overlap_to_snowflake(sql)
-        # Convert JOIN table ON col LIKE ANY(array) to LATERAL FLATTEN even on error
-        if re.search(r'JOIN\s+.*\s+ON\s+.*\s+(LIKE|ILIKE)\s+ANY\s*\(', sql, re.IGNORECASE | re.DOTALL):
-            logging.info("Converting JOIN ... ON ... LIKE ANY(array) to LATERAL FLATTEN on error")
-            sql = convert_join_like_any_to_lateral_flatten(sql)
-        return sql
+        logging.info(f"[Error] Failed to convert SQL with sqlglot: {e}\n")
+        logging.info("Continuing with pre-processed SQL and applying post-processing steps")
+    
+    # Post-process: Convert DISTINCT ON to Snowflake-compatible syntax
+    if 'distinct on' in sql.lower():
+        logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
+        converted = convert_distinct_on_to_snowflake(converted)
+    
+    # Post-process: Convert CAST(... AS DATE|DECIMAL|NUMBER) to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL
+    if 'CAST(' in converted.upper():
+        logging.info("Converting CAST to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL for DATE, DECIMAL, NUMBER types")
+        converted = convert_cast_to_try_cast(converted)
+    
+    # Post-process: Convert any remaining && to ARRAYS_OVERLAP
+    if '&&' in converted:
+        logging.info("Converting remaining && to ARRAYS_OVERLAP")
+        converted = convert_array_overlap_to_snowflake(converted)
+        
+    # Post-process: Fix DATE_PART(day, date_expr - date_expr) to just date_expr - date_expr
+    # Since date subtraction in Snowflake returns an integer number of days
+    converted = re.sub(
+        r"DATE_PART\s*\(\s*day\s*,\s*(.+?)\s*-\s*(.+?)\s*\)",
+        r"\1 - \2",
+        converted,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
+    # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
+    converted = re.sub(
+        r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
+        r"ARRAY_AGG(DISTINCT \1)",
+        converted,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
+    # Post-process: Fix aggregate functions with IFF(condition, DISTINCT expression, NULL)
+    converted = fix_aggregate_distinct_iff(converted)
+    
+    # Post-process: Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ...) to ARRAY_AGG
+    converted = convert_max_array_to_array_agg(converted)
+    
+    # Post-process: Convert remaining ANY expressions (CRITICAL - runs regardless of sqlglot success)
+    if 'ANY(' in converted.upper():
+        logging.info("Converting remaining ANY expressions to Snowflake equivalents")
+        converted = convert_any_to_snowflake_post(converted)
+
+    # Post-process: Convert ILIKE ANY(ARRAY_CONSTRUCT(...)) to ILIKE ANY('...', ...)
+    def ilike_any_array_construct_repl(match):
+        args = match.group(1)
+        # Remove whitespace and split by comma, but keep quoted strings intact
+        # This regex splits on commas not inside quotes
+        import re
+        parts = re.findall(r"'[^']*'|\"[^\"]*\"|[^,]+", args)
+        # Clean up whitespace
+        parts = [p.strip() for p in parts if p.strip()]
+        return f"ILIKE ANY({', '.join(parts)})"
+
+    converted = re.sub(
+        r"ILIKE\s+ANY\s*\(\s*ARRAY_CONSTRUCT\((.*?)\)\s*\)",
+        ilike_any_array_construct_repl,
+        converted,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Post-process: Convert ILIKE ANY(column1 || column2 || ...) to ILIKE ANY(ARRAY_CONCAT(SPLIT(column1, ','), SPLIT(column2, ','), ...))
+    def ilike_any_concat_repl(match):
+        concat_expr = match.group(1)
+        # Split by || and strip
+        columns = [col.strip() for col in re.split(r'\s*\|\|\s*', concat_expr)]
+        # Build ARRAY_CONCAT(ARRAY_TO_STRING(col, ','), ...)
+        splits = [f"ARRAY_TO_STRING({col}, ',')" for col in columns]
+        if len(splits) == 1:
+            return f"ILIKE ANY({splits[0]})"
+        else:
+            return f"ILIKE ANY(CONCAT({', '.join(splits)}))"
+
+    converted = re.sub(
+        r"ILIKE\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*\|\|\s*[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
+        ilike_any_concat_repl,
+        converted,
+        flags=re.IGNORECASE
+    )
+
+    # Post-process: Convert ILIKE ANY(column) to ILIKE ANY(ARRAY_TO_STRING(column, ','))
+    converted = re.sub(
+        r"ILIKE\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
+        r"ILIKE ANY(ARRAY_TO_STRING(\1, ','))",
+        converted,
+        flags=re.IGNORECASE
+    )
+
+    # Post-process: Convert ARRAY_AGG(IFF(..., expr ORDER BY ..., NULL)) to ARRAY_AGG(IFF(..., expr, NULL)) WITHIN GROUP(ORDER BY ...)
+    def array_agg_iff_orderby_repl(match):
+        condition = match.group(1)
+        expr = match.group(2)
+        orderby = match.group(3)
+        return f"ARRAY_AGG(\n  IFF(\n    {condition},\n    {expr},\n    NULL\n  )\n) WITHIN GROUP(ORDER BY {orderby})"
+
+    converted = re.sub(
+        r"ARRAY_AGG\(\s*IFF\(\s*(.*?),\s*(.*?)\s+ORDER\s+BY\s+(.*?),\s*NULL\s*\)\s*\)",
+        array_agg_iff_orderby_repl,
+        converted,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Post-process: Fix COUNT(IFF(..., *, NULL)) to COUNT(IFF(..., 1, NULL)), supporting multiline and whitespace
+    converted = re.sub(
+        r'COUNT\s*\(\s*IFF\s*\((.*?),\s*\*,\s*NULL\s*\)\s*\)',
+        lambda m: f"COUNT(IFF({m.group(1)}, 1, NULL))",
+        converted,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Post-process: Pretty-format COUNT(IFF(...)) expressions for readability
+    def pretty_count_iff(match):
+        condition = match.group(1).strip()
+        return (
+            "COUNT(\n    IFF(\n        "
+            + condition.replace(", 1, NULL", ",\n        1, NULL")
+            + "\n    )\n)"
+        )
+    converted = re.sub(
+        r"COUNT\s*\(\s*IFF\s*\((.*?, 1, NULL)\)\s*\)",
+        pretty_count_iff,
+        converted,
+        flags=re.DOTALL,
+    )
+
+    # Post-process: Convert JOIN table ON col LIKE ANY(array) to LATERAL FLATTEN
+    if re.search(r'JOIN\s+.*\s+ON\s+.*\s+(LIKE|ILIKE)\s+ANY\s*\(', converted, re.IGNORECASE | re.DOTALL):
+        logging.info("Converting JOIN ... ON ... LIKE ANY(array) to LATERAL FLATTEN")
+        converted = convert_join_like_any_to_lateral_flatten(converted)
+
+    return converted
 
 def convert_array_overlap_to_snowflake(sql: str) -> str:
     """

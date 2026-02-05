@@ -1,10 +1,55 @@
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import re
 import logging
 from code.functions.dialect_converter import convert_postgres_to_snowflake
 from code.functions.functions import *
 import traceback
+
+
+def preserve_dbt_macros(sql: str) -> Tuple[str, List[str]]:
+    """Preserve DBT macro calls by replacing with placeholders before SQL transpilation.
+    
+    Returns:
+        Tuple of (sql_with_placeholders, list_of_original_macros)
+    """
+    macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^}]*\)\s*\}\})"
+    macros = []
+    
+    def replacer(match):
+        macro_call = match.group(1)
+        macros.append(macro_call)
+        placeholder = f"__DBT_MACRO_{len(macros)-1}__"
+        logging.debug(f"Preserving macro: '{macro_call}' -> '{placeholder}'")
+        return placeholder
+    
+    result = re.sub(macro_pattern, replacer, sql)
+    logging.debug(f"Found {len(macros)} macro calls to preserve")
+    return result, macros
+
+
+def restore_dbt_macros(sql: str, macros: List[str]) -> str:
+    """Restore DBT macro calls from placeholders after SQL transpilation."""
+    for idx, macro in enumerate(macros):
+        placeholder = f"__DBT_MACRO_{idx}__"
+        
+        # Check if placeholder is in a set statement context
+        pattern_in_set = rf'\{{%\-\s*set\s+\w+\s*=\s*{re.escape(placeholder)}\s*\-%\}}'
+        if re.search(pattern_in_set, sql):
+            # Extract just the macro call without {{ }}
+            macro_without_brackets = re.sub(r'^\{\{\s*|\s*\}\}$', '', macro)
+            sql = sql.replace(placeholder, macro_without_brackets)
+            logging.debug(f"Restored macro in set context: '{placeholder}' -> '{macro_without_brackets}'")
+        else:
+            # Normal restoration with {{ }}
+            sql = sql.replace(placeholder, macro)
+            logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
+    return sql
+
+
+def convert_includes_to_macros(sql: str) -> str:
+    """Convert {% include 'blockname.pry' %} to {{ blockname() }}."""
+    return re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", sql)
 
 def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=None, seed_tables=None) -> set:
     """Convert PRY file to dbt models.
@@ -62,52 +107,18 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         
         # Regular block processing
         preprocessed = preprocess_sql(content)
+        preprocessed = convert_includes_to_macros(preprocessed)
         
-        # Replace {% include 'blockname.pry' %} with {{ blockname() }} BEFORE SQL transpilation
-        # This allows blocks to reference other blocks that were processed earlier
-        preprocessed = re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", preprocessed)
+        # Preserve, convert, and restore macros
+        temp_sql, macros = preserve_dbt_macros(preprocessed)
         
-        # Preserve dbt macro calls by replacing them with placeholders (to survive sqlglot)
-        # Match macros with or without arguments: {{ macro() }} or {{ macro('arg') }}
-        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^}]*\)\s*\}\})"
-        macros = []
-        
-        def macro_replacer(match):
-            macro_call = match.group(1)
-            macros.append(macro_call)
-            placeholder = f"__DBT_MACRO_{len(macros)-1}__"
-            logging.debug(f"Preserving macro: '{macro_call}' -> '{placeholder}'")
-            return placeholder
-        
-        temp_sql = re.sub(macro_pattern, macro_replacer, preprocessed)
-        logging.debug(f"Found {len(macros)} macro calls to preserve in block")
-        
-        # Convert PostgreSQL to Snowflake FIRST (before function macro replacement)
         function_macros = config.get('function_macros', [])
         converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=function_macros)
         
-        # Replace custom functions with dbt macros AFTER sqlglot conversion
         if function_macros:
             converted_sql = replace_functions_with_macros(converted_sql, function_macros)
         
-        # Restore macro calls
-        for idx, macro in enumerate(macros):
-            placeholder = f"__DBT_MACRO_{idx}__"
-            
-            # Check if placeholder is in a set statement context
-            # In that case, restore without the {{ }} brackets
-            pattern_in_set = rf'\{{%\-\s*set\s+\w+\s*=\s*{re.escape(placeholder)}\s*\-%\}}'
-            if re.search(pattern_in_set, converted_sql):
-                # Extract just the macro call without {{ }}
-                macro_without_brackets = re.sub(r'^\{\{\s*', '', macro)
-                macro_without_brackets = re.sub(r'\s*\}\}$', '', macro_without_brackets)
-                converted_sql = converted_sql.replace(placeholder, macro_without_brackets)
-                logging.debug(f"Restored macro in set context: '{placeholder}' -> '{macro_without_brackets}'")
-            else:
-                # Normal restoration with {{ }}
-                converted_sql = converted_sql.replace(placeholder, macro)
-                logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
-        
+        converted_sql = restore_dbt_macros(converted_sql, macros)        
         # For blocks: only replace external tables, leave all others unchanged
         model_refs = config.get('model_refs', [])
         table_mapping = config.get('table_mapping', {})
@@ -172,8 +183,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         full_output_dir = output_dir / folder_name
         full_output_dir.mkdir(parents=True, exist_ok=True)
         for i, query in enumerate(queries):
-            # Replace any {% include 'blockname.pry' %} with {{ blockname() }} even if it's part of a line
-            query = re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", query)
+            query = convert_includes_to_macros(query)
             view_name = extract_view_name_from_query(query)
             if not view_name:
                 logging.warning(f"Could not extract view name from query {i+1}")
@@ -334,57 +344,24 @@ def generate_dbt_model(
     
     try:
         logging.debug(f"\n{'='*80}\nProcessing: {report_name} - {view_name}\n{'='*80}")
-        # Preprocess SQL (handles comment conversion and includes)
+        
+        # Preprocess, preserve macros, convert SQL, restore macros
         preprocessed = preprocess_sql(query)
+        temp_sql, macros = preserve_dbt_macros(preprocessed)
         
-        # Preserve dbt macro calls by replacing them with placeholders (to survive sqlglot)
-        # Match macros with or without arguments: {{ macro() }} or {{ macro('arg') }}
-        # Updated pattern to handle quotes and nested parentheses properly
-        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^}]*\)\s*\}\})"
-        macros = []
-        
-        def macro_replacer(match):
-            macro_call = match.group(1)
-            macros.append(macro_call)
-            placeholder = f"__DBT_MACRO_{len(macros)-1}__"
-            logging.debug(f"Preserving macro: '{macro_call}' -> '{placeholder}'")
-            return placeholder
-        
-        temp_sql = re.sub(macro_pattern, macro_replacer, preprocessed)
-        logging.debug(f"Found {len(macros)} macro calls to preserve")
-        
-        # Convert SQL from PostgreSQL to Snowflake
         function_macros = config.get('function_macros', [])
         converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=function_macros)
         
-        # Replace custom functions with dbt macros AFTER sqlglot conversion
         if function_macros:
             converted_sql = replace_functions_with_macros(converted_sql, function_macros)
         
-        # Restore macro calls
-        for idx, macro in enumerate(macros):
-            placeholder = f"__DBT_MACRO_{idx}__"
-            
-            # Check if placeholder is in a set statement context
-            # In that case, restore without the {{ }} brackets
-            pattern_in_set = rf'\{{%\-\s*set\s+\w+\s*=\s*{re.escape(placeholder)}\s*\-%\}}'
-            if re.search(pattern_in_set, converted_sql):
-                # Extract just the macro call without {{ }}
-                macro_without_brackets = re.sub(r'^\{\{\s*', '', macro)
-                macro_without_brackets = re.sub(r'\s*\}\}$', '', macro_without_brackets)
-                converted_sql = converted_sql.replace(placeholder, macro_without_brackets)
-                logging.debug(f"Restored macro in set context: '{placeholder}' -> '{macro_without_brackets}'")
-            else:
-                # Normal restoration with {{ }}
-                converted_sql = converted_sql.replace(placeholder, macro)
-                logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
-        # Replace all SQL comments with Jinja comments (after SQL conversion)
-        # Multi-line comments: /* ... */  ->  {# ... #}
+        converted_sql = restore_dbt_macros(converted_sql, macros)
+        
+        # Convert SQL comments to Jinja comments
         converted_sql = re.sub(r'/\*', r'{#', converted_sql)
         converted_sql = re.sub(r'\*/', r'#}', converted_sql)
-        # Single-line comments: -- ...  ->  {# ... #}
-        # Only match the first -- on each line to avoid nested comments
         converted_sql = re.sub(r'^(\s*)--(.*)$', r'\1{# \2 #}', converted_sql, flags=re.MULTILINE)
+        
         # Check if actually converted
         if converted_sql == preprocessed:
             print("[WARNING] SQL was not modified during conversion")
