@@ -63,13 +63,50 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         # Regular block processing
         preprocessed = preprocess_sql(content)
         
+        # Replace {% include 'blockname.pry' %} with {{ blockname() }} BEFORE SQL transpilation
+        # This allows blocks to reference other blocks that were processed earlier
+        preprocessed = re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", preprocessed)
+        
+        # Preserve dbt macro calls by replacing them with placeholders (to survive sqlglot)
+        # Match macros with or without arguments: {{ macro() }} or {{ macro('arg') }}
+        macro_pattern = r"(\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([^}]*\)\s*\}\})"
+        macros = []
+        
+        def macro_replacer(match):
+            macro_call = match.group(1)
+            macros.append(macro_call)
+            placeholder = f"__DBT_MACRO_{len(macros)-1}__"
+            logging.debug(f"Preserving macro: '{macro_call}' -> '{placeholder}'")
+            return placeholder
+        
+        temp_sql = re.sub(macro_pattern, macro_replacer, preprocessed)
+        logging.debug(f"Found {len(macros)} macro calls to preserve in block")
+        
         # Convert PostgreSQL to Snowflake FIRST (before function macro replacement)
         function_macros = config.get('function_macros', [])
-        converted_sql = convert_postgres_to_snowflake(preprocessed, function_macros=function_macros)
+        converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=function_macros)
         
         # Replace custom functions with dbt macros AFTER sqlglot conversion
         if function_macros:
             converted_sql = replace_functions_with_macros(converted_sql, function_macros)
+        
+        # Restore macro calls
+        for idx, macro in enumerate(macros):
+            placeholder = f"__DBT_MACRO_{idx}__"
+            
+            # Check if placeholder is in a set statement context
+            # In that case, restore without the {{ }} brackets
+            pattern_in_set = rf'\{{%\-\s*set\s+\w+\s*=\s*{re.escape(placeholder)}\s*\-%\}}'
+            if re.search(pattern_in_set, converted_sql):
+                # Extract just the macro call without {{ }}
+                macro_without_brackets = re.sub(r'^\{\{\s*', '', macro)
+                macro_without_brackets = re.sub(r'\s*\}\}$', '', macro_without_brackets)
+                converted_sql = converted_sql.replace(placeholder, macro_without_brackets)
+                logging.debug(f"Restored macro in set context: '{placeholder}' -> '{macro_without_brackets}'")
+            else:
+                # Normal restoration with {{ }}
+                converted_sql = converted_sql.replace(placeholder, macro)
+                logging.debug(f"Restored macro: '{placeholder}' -> '{macro}'")
         
         # For blocks: only replace external tables, leave all others unchanged
         model_refs = config.get('model_refs', [])
@@ -386,7 +423,7 @@ def generate_dbt_model(
         external_vars.discard('agb')
         # Add each as a dbt variable
         for var in sorted(external_vars):
-            variables.append(f"{{%- set {var} = var(\"{var}\", \" \") %}}")
+            variables.append(f"{{%- set {var} = var(\"{var}\", \" 0 \") %}}")
         if 'type' in view_metadata:
             variables.append("{%- set view_type = '" + view_metadata['type'] + "' %}")
         if 'displayname' in view_metadata:

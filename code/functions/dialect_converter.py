@@ -183,6 +183,70 @@ def convert_like_any_to_exists(sql: str) -> str:
         return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
     return pattern.sub(repl, sql)
 
+def convert_cast_to_try_cast(sql: str) -> str:
+    """
+    Convert CAST(... AS DATE|DECIMAL|NUMBER) to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL functions.
+    Wraps the inner expression in TO_VARCHAR to ensure proper type handling for VARIANT types.
+    """
+    # Map target types to their conversion functions
+    type_to_function = {
+        'DATE': 'TRY_TO_DATE',
+        'DECIMAL': 'TRY_TO_DECIMAL',
+        'NUMBER': 'TRY_TO_NUMBER'
+    }
+    
+    # Process each target type
+    for dtype, func_name in type_to_function.items():
+        # Find all CAST occurrences
+        result = []
+        i = 0
+        while i < len(sql):
+            # Look for CAST(
+            match = re.match(r'\bCAST\s*\(', sql[i:], re.IGNORECASE)
+            if match:
+                # Found CAST(, now find the matching closing parenthesis
+                start = i
+                i += match.end()
+                paren_count = 1
+                expr_start = i
+                
+                # Track parentheses to find the end of CAST
+                while i < len(sql) and paren_count > 0:
+                    if sql[i] == '(':
+                        paren_count += 1
+                    elif sql[i] == ')':
+                        paren_count -= 1
+                    i += 1
+                
+                if paren_count == 0:
+                    # Extract the full CAST expression
+                    cast_content = sql[expr_start:i-1]
+                    
+                    # Check if this CAST is for our target type
+                    # Look for AS TYPE at the end of the expression
+                    as_pattern = rf'\s+AS\s+{dtype}\s*$'
+                    if re.search(as_pattern, cast_content, re.IGNORECASE):
+                        # Extract the expression being cast (before AS)
+                        as_match = re.search(as_pattern, cast_content, re.IGNORECASE)
+                        expr = cast_content[:as_match.start()].strip()
+                        
+                        # Replace with TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL function
+                        # Wrap expression in TO_VARCHAR to handle VARIANT types
+                        result.append(f'{func_name}(TO_VARCHAR({expr}))')
+                    else:
+                        # Keep original CAST
+                        result.append(sql[start:i])
+                else:
+                    # Malformed, keep original
+                    result.append(sql[start:i])
+            else:
+                result.append(sql[i])
+                i += 1
+        
+        sql = ''.join(result)
+    
+    return sql
+
 def convert_any_to_snowflake_post(sql: str) -> str:
     """
     Convert remaining PostgreSQL ANY expressions to Snowflake equivalents after sqlglot conversion.
@@ -423,6 +487,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         if 'distinct on' in sql.lower():
             logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
             converted = convert_distinct_on_to_snowflake(converted)
+        
+        # Post-process: Convert CAST(... AS DATE|DECIMAL|NUMBER) to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL
+        if 'CAST(' in converted.upper():
+            logging.info("Converting CAST to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL for DATE, DECIMAL, NUMBER types")
+            converted = convert_cast_to_try_cast(converted)
         
         # Post-process: Convert any remaining && to ARRAYS_OVERLAP
         if '&&' in converted:
