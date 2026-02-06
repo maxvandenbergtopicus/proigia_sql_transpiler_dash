@@ -183,6 +183,120 @@ def convert_like_any_to_exists(sql: str) -> str:
         return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
     return pattern.sub(repl, sql)
 
+def convert_array_remove_to_variant(sql: str) -> str:
+    """
+    Convert ARRAY_REMOVE(array, value) to ARRAY_REMOVE(array, TO_VARIANT(value))
+    to ensure proper type matching in Snowflake.
+    Processes all occurrences by repeatedly finding and wrapping one at a time.
+    """
+    max_iterations = 20  # Safety limit
+    
+    for iteration in range(max_iterations):
+        # Find the first array_remove with unwrapped value
+        i = 0
+        found = False
+        
+        while i < len(sql):
+            # Look for array_remove(
+            match = re.match(r'\barray_remove\s*\(', sql[i:], re.IGNORECASE)
+            if not match:
+                i += 1
+                continue
+            
+            # Found array_remove at position i
+            func_start = i
+            func_end = i + match.end()
+            i = func_end
+            
+            # Find comma separating array from value
+            paren_count = 1
+            bracket_count = 0
+            in_string = False
+            string_char = None
+            comma_pos = None
+            j = i
+            
+            while j < len(sql) and paren_count > 0:
+                char = sql[j]
+                
+                if char in ('"', "'") and (j == 0 or sql[j-1] != '\\'):
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                        string_char = None
+                
+                if not in_string:
+                    if char == '(':
+                        paren_count += 1
+                    elif char == ')':
+                        paren_count -= 1
+                        if paren_count == 0:
+                            break
+                    elif char == '[':
+                        bracket_count += 1
+                    elif char == ']':
+                        bracket_count -= 1
+                    elif char == ',' and paren_count == 1 and bracket_count == 0 and comma_pos is None:
+                        comma_pos = j
+                
+                j += 1
+            
+            if comma_pos is None:
+                i = func_end
+                continue
+            
+            # Check if value is already wrapped
+            value_start = comma_pos + 1
+            while value_start < len(sql) and sql[value_start].isspace():
+                value_start += 1
+            
+            if sql[value_start:value_start+11].upper() == 'TO_VARIANT(':
+                # Already wrapped, skip this one
+                i = func_end
+                continue
+            
+            # Find end of value (closing paren of array_remove)
+            paren_count = 1
+            value_end = value_start
+            in_string = False
+            string_char = None
+            
+            while value_end < len(sql) and paren_count > 0:
+                char = sql[value_end]
+                
+                if char in ('"', "'") and (value_end == 0 or sql[value_end-1] != '\\'):
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                        string_char = None
+                
+                if not in_string:
+                    if char == '(':
+                        paren_count += 1
+                    elif char == ')':
+                        paren_count -= 1
+                
+                value_end += 1
+            
+            # value_end is now pointing right after the closing paren
+            value_expr = sql[value_start:value_end-1].strip()
+            
+            # Wrap this value and reconstruct SQL
+            sql = (sql[:value_start] + 
+                   f"TO_VARIANT({value_expr})" + 
+                   sql[value_end-1:])
+            found = True
+            break  # Process one at a time, restart from beginning
+        
+        if not found:
+            break  # No more unwrapped calls
+    
+    return sql
+
 def convert_cast_to_try_cast(sql: str) -> str:
     """
     Convert CAST(... AS DATE|DECIMAL|NUMBER) to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL functions.
@@ -244,6 +358,130 @@ def convert_cast_to_try_cast(sql: str) -> str:
                 i += 1
         
         sql = ''.join(result)
+    
+    return sql
+
+def convert_all_to_snowflake_post(sql: str) -> str:
+    """
+    Convert PostgreSQL ALL expressions to Snowflake equivalents.
+    - element <= ALL(array) -> element <= ARRAY_MIN(array)
+    - element < ALL(array) -> element < ARRAY_MIN(array)
+    - element >= ALL(array) -> element >= ARRAY_MAX(array)
+    - element > ALL(array) -> element > ARRAY_MAX(array)
+    - element = ALL(array) -> ARRAY_SIZE(ARRAY_DISTINCT(array)) = 1 AND ARRAY_CONTAINS(element, array)
+    - element <> ALL(array) -> NOT ARRAY_CONTAINS(element, array)
+    - element != ALL(array) -> NOT ARRAY_CONTAINS(element, array)
+    """
+    
+    def find_left_expr_before_operator(text, op_start_pos):
+        """Extract the complete left expression before an operator by working backwards."""
+        i = op_start_pos - 1
+        
+        # Skip trailing whitespace
+        while i >= 0 and text[i].isspace():
+            i -= 1
+        
+        if i < 0:
+            return "", 0
+        
+        end_pos = i + 1
+        
+        # Work backwards through the complete expression
+        while i >= 0:
+            if text[i] == ')':
+                # Closing paren - find matching opening paren
+                paren_count = 1
+                i -= 1
+                while i >= 0 and paren_count > 0:
+                    if text[i] == ')':
+                        paren_count += 1
+                    elif text[i] == '(':
+                        paren_count -= 1
+                    i -= 1
+                i += 1
+                # Continue backwards to get function name
+                i -= 1
+                while i >= 0 and (text[i].isalnum() or text[i] == '_'):
+                    i -= 1
+            elif text[i] == ']':
+                # Closing bracket - find matching opening bracket
+                bracket_count = 1
+                i -= 1
+                while i >= 0 and bracket_count > 0:
+                    if text[i] == ']':
+                        bracket_count += 1
+                    elif text[i] == '[':
+                        bracket_count -= 1
+                    i -= 1
+            elif i > 0 and text[i-1:i+1] == '::':
+                # Type cast - skip both colons
+                i -= 2
+            elif text[i].isalnum() or text[i] in ('_', '.', '$', '{', '}', "'", '"', ':', ','):
+                i -= 1
+            elif text[i] in ('-', '+') and i > 0:
+                # Potential unary operator
+                peek = i + 1
+                while peek < end_pos and text[peek].isspace():
+                    peek += 1
+                if peek < end_pos and (text[peek].isdigit() or text[peek] == '.'):
+                    i -= 1
+                else:
+                    break
+            else:
+                break
+        
+        start_pos = i + 1
+        return text[start_pos:end_pos].strip(), start_pos
+    
+    # Process each operator type
+    operators = [
+        ('<=', lambda l, a: f"{l} <= ARRAY_MIN({a})"),
+        ('>=', lambda l, a: f"{l} >= ARRAY_MAX({a})"),
+        ('<>', lambda l, a: f"NOT ARRAY_CONTAINS({l}, {a})"),
+        ('!=', lambda l, a: f"NOT ARRAY_CONTAINS({l}, {a})"),
+        ('<', lambda l, a: f"{l} < ARRAY_MIN({a})"),
+        ('>', lambda l, a: f"{l} > ARRAY_MAX({a})"),
+        ('=', lambda l, a: f"ARRAY_SIZE(ARRAY_DISTINCT({a})) = 1 AND ARRAY_CONTAINS({l}, {a})"),
+    ]
+    
+    for op, replacement_func in operators:
+        # Find all occurrences of "operator ALL("
+        pattern = re.escape(op) + r'\s*ALL\s*\('
+        
+        while True:
+            match = re.search(pattern, sql, re.IGNORECASE)
+            if not match:
+                break
+            
+            op_start = match.start()
+            
+            # Extract left expression
+            left_expr, left_start = find_left_expr_before_operator(sql, op_start)
+            
+            if not left_expr:
+                break
+            
+            # Find the array argument inside ALL(...)
+            all_paren_start = match.end()
+            paren_count = 1
+            i = all_paren_start
+            while i < len(sql) and paren_count > 0:
+                if sql[i] == '(':
+                    paren_count += 1
+                elif sql[i] == ')':
+                    paren_count -= 1
+                i += 1
+            
+            if paren_count != 0:
+                break
+            
+            array_expr = sql[all_paren_start:i-1].strip()
+            
+            # Build replacement
+            replacement = replacement_func(left_expr, array_expr)
+            
+            # Replace in sql
+            sql = sql[:left_start] + replacement + sql[i:]
     
     return sql
 
@@ -581,6 +819,9 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
 
     # Pre-process: Convert CROSS JOIN LATERAL unnest(...) to Snowflake FLATTEN
     sql = convert_lateral_unnest_to_snowflake(sql)
+    
+    # Pre-process: Convert SELECT unnest(column) in subqueries to LATERAL FLATTEN
+    sql = convert_select_unnest_to_flatten(sql)
 
     # Pre-process: Convert generate_series to Snowflake-compatible TABLE(GENERATOR(...))
     sql = convert_generate_series_to_snowflake(sql)
@@ -605,6 +846,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     if 'CAST(' in converted.upper():
         logging.info("Converting CAST to TRY_TO_DATE/TRY_TO_NUMBER/TRY_TO_DECIMAL for DATE, DECIMAL, NUMBER types")
         converted = convert_cast_to_try_cast(converted)
+    
+    # Post-process: Wrap ARRAY_REMOVE value parameter in TO_VARIANT
+    if 'array_remove(' in converted.lower():
+        logging.info("Wrapping ARRAY_REMOVE value parameters in TO_VARIANT")
+        converted = convert_array_remove_to_variant(converted)
     
     # Post-process: Convert any remaining && to ARRAYS_OVERLAP
     if '&&' in converted:
@@ -638,6 +884,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     if 'ANY(' in converted.upper():
         logging.info("Converting remaining ANY expressions to Snowflake equivalents")
         converted = convert_any_to_snowflake_post(converted)
+    
+    # Post-process: Convert ALL expressions to Snowflake equivalents
+    if 'ALL(' in converted.upper():
+        logging.info("Converting ALL expressions to Snowflake equivalents")
+        converted = convert_all_to_snowflake_post(converted)
 
     # Post-process: Convert ILIKE ANY(ARRAY_CONSTRUCT(...)) to ILIKE ANY('...', ...)
     def ilike_any_array_construct_repl(match):
@@ -813,6 +1064,111 @@ def convert_unnest_array_to_values(sql: str) -> str:
         return f"SELECT\n    {col}\n  FROM (VALUES\n    {values}\n  ) AS t({col})"
 
     return pattern.sub(repl, sql)
+
+def convert_select_unnest_to_flatten(sql: str) -> str:
+    """
+    Convert SELECT col1, col2, unnest(array_col) AS alias FROM table
+    to SELECT col1, col2, f.value AS alias FROM table, LATERAL FLATTEN(input => array_col) f
+    
+    Also handles:
+    FROM unnest(array) AS table_alias(column_name) -> FROM TABLE(FLATTEN(input => array)) AS table_alias
+    And replaces column_name references with table_alias.value
+    """
+    # First, handle FROM unnest(array) AS table_alias(column_name) pattern
+    # This is common in correlated subqueries
+    from_unnest_pattern = re.compile(
+        r'\bFROM\s+unnest\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)',
+        re.IGNORECASE
+    )
+    
+    # Collect mappings of column_name -> table_alias for later replacement
+    column_mappings = {}
+    for match in from_unnest_pattern.finditer(sql):
+        array_col = match.group(1)
+        table_alias = match.group(2)
+        column_name = match.group(3)
+        column_mappings[column_name] = table_alias
+    
+    # Replace FROM unnest(...) AS table(col) with FROM TABLE(FLATTEN(...)) AS table
+    def repl_from_unnest(match):
+        array_col = match.group(1)
+        table_alias = match.group(2)
+        column_name = match.group(3)
+        return f"FROM TABLE(FLATTEN(input => {array_col})) AS {table_alias}"
+    
+    sql = from_unnest_pattern.sub(repl_from_unnest, sql)
+    
+    # Now replace standalone column references with table_alias.value
+    # We need to be careful to only replace in the right context (after the FROM clause)
+    for column_name, table_alias in column_mappings.items():
+        # Replace column_name with table_alias.value in WHERE, SELECT, etc.
+        # But not when it's already qualified or part of another identifier
+        # Use word boundaries and negative lookbehind/lookahead
+        sql = re.sub(
+            rf'\b{column_name}\b(?!\s*\()',  # Not followed by ( to avoid replacing function names
+            f'{table_alias}.value',
+            sql,
+            flags=re.IGNORECASE
+        )
+    
+    # Now handle SELECT unnest(column) AS alias patterns
+    # Pattern: SELECT ... unnest(column_name) AS alias ... FROM
+    pattern = re.compile(
+        r'\bunnest\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)',
+        re.IGNORECASE
+    )
+    
+    # Find all unnest calls and collect their info
+    matches = list(pattern.finditer(sql))
+    
+    if not matches:
+        return sql
+    
+    # Process each SELECT block that contains unnest
+    # We need to find the SELECT...FROM structure and modify it
+    result = sql
+    for match in reversed(matches):  # Process in reverse to maintain positions
+        array_col = match.group(1)
+        alias = match.group(2)
+        unnest_start = match.start()
+        unnest_end = match.end()
+        
+        # Find the FROM clause after this unnest
+        from_match = re.search(r'\bFROM\b', result[unnest_end:], re.IGNORECASE)
+        if not from_match:
+            continue
+        
+        from_pos = unnest_end + from_match.start()
+        from_end = unnest_end + from_match.end()
+        
+        # Find the table/subquery after FROM (until WHERE, GROUP, ORDER, LIMIT, ), or end)
+        table_match = re.match(
+            r'\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?|\([^)]+\)\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)',
+            result[from_end:],
+            re.IGNORECASE | re.DOTALL
+        )
+        
+        if not table_match:
+            continue
+        
+        table_expr = table_match.group(1).strip()
+        table_end = from_end + table_match.end()
+        
+        # Replace unnest(array_col) AS alias with f.value AS alias
+        result = (result[:unnest_start] + 
+                  f"f.value AS {alias}" + 
+                  result[unnest_end:])
+        
+        # Adjust positions after replacement
+        pos_diff = len(f"f.value AS {alias}") - (unnest_end - unnest_start)
+        table_end += pos_diff
+        from_end += pos_diff
+        
+        # Add LATERAL FLATTEN after the table expression
+        flatten_clause = f", LATERAL FLATTEN(input => {array_col}) AS f"
+        result = result[:table_end] + flatten_clause + result[table_end:]
+    
+    return result
 
 def convert_lateral_unnest_to_snowflake(sql: str) -> str:
     """
