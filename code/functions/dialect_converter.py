@@ -7,14 +7,10 @@ from sqlglot.dialects.snowflake import Snowflake
 
 from crosstabs.crosstabs_new import parse_crosstab_sql
 
-# Suppress sqlglot's verbose debug output
-logging.getLogger("sqlglot").setLevel(logging.WARNING)
-
-
 # ---- Custom Dialect Definition ----
 class FixedSnowflake(Snowflake):
     class Generator(Snowflake.Generator):
-        # Override TRANSFORMS to handle EXTRACT(YEAR FROM AGE(...)) pattern
+        # Override TRANSFORMS to handle EXTRACT(YEAR FROM AGE(...)) pattern and ArrayOverlaps
         TRANSFORMS = {
             **Snowflake.Generator.TRANSFORMS,
             exp.Extract: lambda self, e: (
@@ -22,6 +18,7 @@ class FixedSnowflake(Snowflake):
                 if e.this and e.this.this == "YEAR" and isinstance(e.expression, exp.Anonymous) and e.expression.this.upper() == "AGE"
                 else Snowflake.Generator.TRANSFORMS[exp.Extract](self, e)
             ),
+            exp.ArrayOverlaps: lambda self, e: self.arrayoverlaps_sql(e),
         }
         
         def cast_sql(self, expression: exp.Cast) -> str:
@@ -437,11 +434,11 @@ def convert_all_to_snowflake_post(sql: str) -> str:
     operators = [
         ('<=', lambda l, a: f"{l} <= ARRAY_MIN({a})"),
         ('>=', lambda l, a: f"{l} >= ARRAY_MAX({a})"),
-        ('<>', lambda l, a: f"NOT ARRAY_CONTAINS({l}, {a})"),
-        ('!=', lambda l, a: f"NOT ARRAY_CONTAINS({l}, {a})"),
+        ('<>', lambda l, a: f"NOT ARRAY_CONTAINS(TO_VARIANT({l}), {a})"),
+        ('!=', lambda l, a: f"NOT ARRAY_CONTAINS(TO_VARIANT({l}), {a})"),
         ('<', lambda l, a: f"{l} < ARRAY_MIN({a})"),
         ('>', lambda l, a: f"{l} > ARRAY_MAX({a})"),
-        ('=', lambda l, a: f"ARRAY_SIZE(ARRAY_DISTINCT({a})) = 1 AND ARRAY_CONTAINS({l}, {a})"),
+        ('=', lambda l, a: f"ARRAY_SIZE(ARRAY_DISTINCT({a})) = 1 AND ARRAY_CONTAINS(TO_VARIANT({l}), {a})"),
     ]
     
     for op, replacement_func in operators:
@@ -633,8 +630,12 @@ def convert_postgres_escape_strings(sql: str) -> str:
     i = 0
     
     while i < len(sql):
-        # Look for E' or E"
-        if i < len(sql) - 1 and sql[i].upper() == 'E' and sql[i+1] in ("'", '"'):
+        # Look for E' or E" - but only if E is not part of an identifier
+        # Check that E is preceded by whitespace, operator, or start of string
+        if (i < len(sql) - 1 and 
+            sql[i].upper() == 'E' and 
+            sql[i+1] in ("'", '"') and
+            (i == 0 or not sql[i-1].isalnum() and sql[i-1] != '_')):
             quote_char = sql[i+1]
             result.append(quote_char)  # Remove the E, keep the quote
             i += 2  # Skip past E'
@@ -739,14 +740,23 @@ def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
         marker_start = marker_match.start()
         marker_end = marker_match.end()
         
-        # Find the insertion point: before UNION/GROUP/ORDER or at line end
+        # Find the insertion point: before UNION/GROUP/ORDER/closing paren or at line end
         after_marker = sql[marker_end:]
-        insert_match = re.search(r'(\s*)(UNION|GROUP|ORDER|$)', after_marker, re.IGNORECASE)
+        insert_match = re.search(r'(\s*)(\)|\bUNION\b|\bGROUP\b|\bORDER\b|$)', after_marker, re.IGNORECASE)
         
         if insert_match:
             insert_pos = marker_end + insert_match.start()
-            # Remove marker and insert WHERE
-            sql = sql[:marker_start] + sql[marker_end:insert_pos] + f"\n  WHERE {where_condition}" + sql[insert_pos:]
+            section_to_check = sql[marker_end:insert_pos]
+            
+            # Check if there's already a WHERE clause in this section
+            existing_where = re.search(r'\bWHERE\b', section_to_check, re.IGNORECASE)
+            
+            if existing_where:
+                # There's already a WHERE, append with AND instead
+                sql = sql[:marker_start] + sql[marker_end:insert_pos] + f"\n  AND {where_condition}" + sql[insert_pos:]
+            else:
+                # No WHERE yet, add new WHERE clause
+                sql = sql[:marker_start] + sql[marker_end:insert_pos] + f"\n  WHERE {where_condition}" + sql[insert_pos:]
         else:
             # Just remove marker
             sql = sql[:marker_start] + sql[marker_end:]
@@ -856,6 +866,22 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     if '&&' in converted:
         logging.info("Converting remaining && to ARRAYS_OVERLAP")
         converted = convert_array_overlap_to_snowflake(converted)
+    
+    # Post-process: Convert EXTRACT(ISODOW FROM ...) and DATE_PART(ISODOW, ...) to DAYOFWEEKISO(...)
+    if 'ISODOW' in converted.upper():
+        logging.info("Converting EXTRACT(ISODOW FROM ...) and DATE_PART(ISODOW, ...) to DAYOFWEEKISO(...)")
+        converted = re.sub(
+            r'EXTRACT\s*\(\s*ISODOW\s+FROM\s+([^)]+)\)',
+            r'DAYOFWEEKISO(\1)',
+            converted,
+            flags=re.IGNORECASE
+        )
+        converted = re.sub(
+            r'DATE_PART\s*\(\s*ISODOW\s*,\s*([^)]+)\)',
+            r'DAYOFWEEKISO(\1)',
+            converted,
+            flags=re.IGNORECASE
+        )
         
     # Post-process: Fix DATE_PART(day, date_expr - date_expr) to just date_expr - date_expr
     # Since date subtraction in Snowflake returns an integer number of days
@@ -876,6 +902,41 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     
     # Post-process: Fix aggregate functions with IFF(condition, DISTINCT expression, NULL)
     converted = fix_aggregate_distinct_iff(converted)
+    
+    # Post-process: Convert AGE() to DATEDIFF(year, ...)
+    if 'AGE(' in converted.upper():
+        logging.info("Converting AGE() to DATEDIFF(year, ...)")
+        
+        # First, handle EXTRACT(YEAR FROM AGE(...)) and DATE_PART(YEAR, AGE(...)) -> DATEDIFF(year, ...)
+        # This removes the redundant wrapper since DATEDIFF already returns years
+        converted = re.sub(
+            r'(?:EXTRACT\s*\(\s*YEAR\s+FROM|DATE_PART\s*\(\s*YEAR\s*,)\s*AGE\s*\(\s*([^,()]+(?:\([^)]*\))?[^,()]*)\s*,\s*([^,()]+(?:\([^)]*\))?[^,()]*)\s*\)\s*\)',
+            r'DATEDIFF(year, \2, \1)',
+            converted,
+            flags=re.IGNORECASE
+        )
+        converted = re.sub(
+            r'(?:EXTRACT\s*\(\s*YEAR\s+FROM|DATE_PART\s*\(\s*YEAR\s*,)\s*AGE\s*\(\s*([^,()]+(?:\([^)]*\))?[^,()]*)\s*\)\s*\)',
+            r'DATEDIFF(year, \1, CURRENT_TIMESTAMP())',
+            converted,
+            flags=re.IGNORECASE
+        )
+        
+        # Then handle remaining plain AGE() calls
+        # AGE(end, start) -> DATEDIFF(year, start, end) - swap arguments
+        converted = re.sub(
+            r'\bAGE\s*\(\s*([^,()]+(?:\([^)]*\))?[^,()]*)\s*,\s*([^,()]+(?:\([^)]*\))?[^,()]*)\s*\)',
+            r'DATEDIFF(year, \2, \1)',
+            converted,
+            flags=re.IGNORECASE
+        )
+        # AGE(date) -> DATEDIFF(year, date, CURRENT_TIMESTAMP())
+        converted = re.sub(
+            r'\bAGE\s*\(\s*([^,()]+(?:\([^)]*\))?[^,()]*)\s*\)',
+            r'DATEDIFF(year, \1, CURRENT_TIMESTAMP())',
+            converted,
+            flags=re.IGNORECASE
+        )
     
     # Post-process: Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ...) to ARRAY_AGG
     converted = convert_max_array_to_array_agg(converted)
@@ -1421,7 +1482,7 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     # Also handles: column + interval 'N unit' * expression
     pattern1 = re.compile(
         r"""
-        (\w+(?:::\w+)?)  # base column (with optional ::type cast)
+        (\w+(?:\.\w+)?(?:::\w+)?)  # base column (with optional table.column qualification and ::type cast)
         \s*([-+])\s*  # operator (+ or -)
         (?:  # non-capturing group for two variations
         (.*?)\s*\*\s*interval\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'  # expr * interval 'N unit'
@@ -1540,7 +1601,7 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     # Pattern 2b: Simple column or literal + 'N unit'::interval
     # Capture: base expression, operator (+ or -), number, unit
     pattern2b = re.compile(
-        r"(\w+(?:::\w+)?|'[^']+'::\w+)"  # simple column or literal with cast
+        r"(\w+(?:\.\w+)?(?:::\w+)?|'[^']+'::\w+)"  # simple column or literal with cast (supports table.column)
         r"\s*([-+])\s*"  # operator (+ or -)
         r"'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'::interval",  # interval
         re.IGNORECASE
@@ -1567,7 +1628,7 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     # Pattern 3: date + concat(..., ' unit')::interval (dynamic interval from string concat)
     # Example: '1900-01-01'::date + concat(cast(value as varchar), ' day')::interval
     pattern3 = re.compile(
-        r"(\([^)]+\)(?:::\w+)?|'[^']+'::\w+|\w+(?:::\w+)?)"  # base: parenthesized expr, string literal, or column (with optional cast)
+        r"(\([^)]+\)(?:::\w+)?|'[^']+'::\w+|\w+(?:\.\w+)?(?:::\w+)?)"  # base: parenthesized expr, string literal, or column (with optional table.column and cast)
         r"\s*([-+])\s*"  # operator
         r"concat\s*\(([^)]+),\s*'[^']*\s*(year|month|week|day|hour|minute|second)s?[^']*'\s*\)::interval",
         re.IGNORECASE
@@ -1587,55 +1648,134 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     
     sql = pattern3.sub(repl3, sql)
     
+    # Helper function to match balanced parentheses from a position
+    def extract_balanced_expression(text, start_pos):
+        """Extract a balanced parenthesized expression starting at start_pos."""
+        if start_pos >= len(text) or text[start_pos] != '(':
+            return None, start_pos
+        
+        depth = 0
+        i = start_pos
+        while i < len(text):
+            if text[i] == '(':
+                depth += 1
+            elif text[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    return text[start_pos:i+1], i+1
+            i += 1
+        return None, start_pos
+    
+    # Pattern for base_expr [+|-] 'N unit'::interval with proper DATEADD handling
+    # Process this iteratively to handle nested DATEADD expressions
+    def process_chained_intervals(sql_text):
+        """Process chained interval arithmetic, handling DATEADD expressions correctly."""
+        result = []
+        i = 0
+        
+        while i < len(sql_text):
+            # Look for DATEADD or other expressions followed by interval arithmetic
+            # Match: DATEADD(...) +/- 'N unit'::interval
+            dateadd_match = re.match(r'DATEADD\s*\(', sql_text[i:], re.IGNORECASE)
+            
+            if dateadd_match:
+                # Extract the full DATEADD expression with balanced parens
+                dateadd_start = i
+                expr, end_pos = extract_balanced_expression(sql_text, i + dateadd_match.end() - 1)
+                if expr:
+                    full_dateadd = sql_text[i:end_pos]
+                    
+                    # Check if followed by +/- interval
+                    interval_match = re.match(
+                        r"\s*([-+])\s*'([\d\.]+)\s*(year|month|week|day|hour|minute|second)s?'::interval",
+                        sql_text[end_pos:],
+                        re.IGNORECASE
+                    )
+                    
+                    if interval_match:
+                        operator = interval_match.group(1)
+                        amount = interval_match.group(2)
+                        unit = interval_match.group(3).upper()
+                        amount_val = f"-{amount}" if operator == '-' else amount
+                        result.append(f"DATEADD({unit}, {amount_val}, {full_dateadd})")
+                        i = end_pos + interval_match.end()
+                    else:
+                        result.append(full_dateadd)
+                        i = end_pos
+                else:
+                    result.append(sql_text[i])
+                    i += 1
+            else:
+                # Look for other patterns: column/literal +/- interval
+                other_match = re.match(
+                    r"([\w'\"]+(?:\.[\w'\"]+)?(?:::\w+)?)"  # simple base (column with optional table.column, literal with cast)
+                    r"\s*([-+])\s*"
+                    r"'([\d\.]+)\s*(year|month|week|day|hour|minute|second)s?'::interval",
+                    sql_text[i:],
+                    re.IGNORECASE
+                )
+                
+                if other_match:
+                    base = other_match.group(1)
+                    operator = other_match.group(2)
+                    amount = other_match.group(3)
+                    unit = other_match.group(4).upper()
+                    amount_val = f"-{amount}" if operator == '-' else amount
+                    result.append(f"DATEADD({unit}, {amount_val}, {base})")
+                    i += other_match.end()
+                else:
+                    result.append(sql_text[i])
+                    i += 1
+        
+        return ''.join(result)
+    
+    sql = process_chained_intervals(sql)
+    
     # Pattern 4 (run LAST): Edge case for integer columns representing months (validtime, loopduur, etc.)
     # Handles: date_expr - table.column or date_expr + table.column
     # where column is validtime, loopduur, looptijd (integer months)
     # This pattern runs after all interval conversions so it can handle DATEADD results
-    pattern4 = re.compile(
-        r"(DATEADD\([^)]+\)|"  # DATEADD expression
-        r"\([^)]+\)(?:::\w+)?|"  # parenthesized expr with optional cast
-        r"'[^']+'::\w+|"  # string literal with cast
-        r"\w+(?:::\w+)?)"  # column with optional cast
-        r"\s*([-+])\s*"  # operator (+ or -)
-        r"(\w+\.)?(validtime|loopduur|looptijd)\b",  # optional table prefix + month column name
-        re.IGNORECASE
-    )
+    def process_month_columns(sql_text):
+        """Process DATEADD expressions followed by month column arithmetic."""
+        result = []
+        i = 0
+        
+        while i < len(sql_text):
+            dateadd_match = re.match(r'DATEADD\s*\(', sql_text[i:], re.IGNORECASE)
+            
+            if dateadd_match:
+                expr, end_pos = extract_balanced_expression(sql_text, i + dateadd_match.end() - 1)
+                if expr:
+                    full_dateadd = sql_text[i:end_pos]
+                    
+                    # Check if followed by +/- month column
+                    month_match = re.match(
+                        r"\s*([-+])\s*(\w+\.)?(validtime|loopduur|looptijd)\b",
+                        sql_text[end_pos:],
+                        re.IGNORECASE
+                    )
+                    
+                    if month_match:
+                        operator = month_match.group(1)
+                        table_prefix = month_match.group(2) if month_match.group(2) else ''
+                        column_name = month_match.group(3)
+                        full_column = f"{table_prefix}{column_name}"
+                        amount_expr = f"-{full_column}" if operator == '-' else full_column
+                        result.append(f"DATEADD(MONTH, {amount_expr}, {full_dateadd})")
+                        i = end_pos + month_match.end()
+                    else:
+                        result.append(full_dateadd)
+                        i = end_pos
+                else:
+                    result.append(sql_text[i])
+                    i += 1
+            else:
+                result.append(sql_text[i])
+                i += 1
+        
+        return ''.join(result)
     
-    def repl4(match):
-        base = match.group(1).strip()
-        operator = match.group(2)
-        table_prefix = match.group(3) if match.group(3) else ''
-        column_name = match.group(4)
-        
-        # Build the full column reference
-        full_column = f"{table_prefix}{column_name}"
-        
-        # Apply operator to amount
-        if operator == '-':
-            amount_expr = f"-{full_column}"
-        else:
-            amount_expr = full_column
-        
-        # Snowflake DATEADD with MONTH hardcoded
-        return f"DATEADD(MONTH, {amount_expr}, {base})"
-
-    # Pattern for base_expr [+|-] 'N unit'::interval (decimal, plural/singular)
-    pattern_new = re.compile(
-        r"([\w\(\)\{\}\$'\":, ]+)"  # base expression (function, cast, etc.)
-        r"\s*([-+])\s*"
-        r"'([\d\.]+)\s*(year|month|week|day|hour|minute|second)s?'::interval",
-        re.IGNORECASE
-    )
-
-    def repl_new(match):
-        base = match.group(1).strip()
-        operator = match.group(2)
-        amount = match.group(3)
-        unit = match.group(4).upper()
-        amount_val = f"-{amount}" if operator == '-' else amount
-        return f"DATEADD({unit}, {amount_val}, {base})"
-
-    sql = pattern_new.sub(repl_new, sql)
+    sql = process_month_columns(sql)
     
     return sql
 
@@ -1690,3 +1830,133 @@ def convert_distinct_on_to_snowflake(sql: str) -> str:
     sql = sql[:insert_pos] + f"{qualify_clause}\n" + sql[insert_pos:]
 
     return sql
+
+def convert_filter_clause_to_case(sql: str) -> str:
+    """
+    Convert PostgreSQL FILTER (WHERE ...) clause to Snowflake-compatible CASE WHEN syntax.
+    PostgreSQL allows filtering aggregate functions with a WHERE clause in the FILTER clause.
+    Snowflake requires using CASE WHEN inside the aggregate function instead.
+    
+    Examples:
+    COUNT(patient_id) FILTER (WHERE p58_o_p=1)
+    -> COUNT(CASE WHEN p58_o_p=1 THEN patient_id END)
+    
+    array_agg(DISTINCT atc_codes) FILTER (WHERE atc_codes IS NOT NULL)
+    -> array_agg(DISTINCT CASE WHEN atc_codes IS NOT NULL THEN atc_codes END)
+    
+    SUM(amount) FILTER (WHERE status='active')
+    -> SUM(CASE WHEN status='active' THEN amount END)
+    """
+    # Use iterative approach to handle nested parentheses properly
+    result = []
+    i = 0
+    
+    # Aggregate function names we're looking for
+    agg_functions = (
+        'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ARRAY_AGG', 'STRING_AGG', 
+        'BOOL_AND', 'BOOL_OR', 'EVERY', 'STDDEV', 'VARIANCE', 'VAR_POP', 
+        'VAR_SAMP', 'STDDEV_POP', 'STDDEV_SAMP', 'CORR', 'COVAR_POP', 
+        'COVAR_SAMP', 'REGR_SLOPE', 'REGR_INTERCEPT'
+    )
+    
+    while i < len(sql):
+        # Look for aggregate function followed by FILTER
+        match = None
+        for func in agg_functions:
+            pattern = re.compile(r'\b' + func + r'\s*\(', re.IGNORECASE)
+            match = pattern.match(sql, i)
+            if match:
+                break
+        
+        if not match:
+            result.append(sql[i])
+            i += 1
+            continue
+        
+        # Found aggregate function, now parse it
+        func_start = i
+        func_name = match.group(0)[:-1].strip()  # Remove trailing '('
+        i = match.end()
+        
+        # Find matching closing paren for function args
+        paren_count = 1
+        args_start = i
+        in_string = False
+        string_char = None
+        
+        while i < len(sql) and paren_count > 0:
+            char = sql[i]
+            
+            # Handle string literals
+            if char in ('"', "'") and (i == 0 or sql[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+            
+            if not in_string:
+                if char == '(':
+                    paren_count += 1
+                elif char == ')':
+                    paren_count -= 1
+            
+            i += 1
+        
+        args = sql[args_start:i-1].strip()
+        
+        # Check if FILTER follows
+        filter_match = re.match(r'\s*[Ff][Ii][Ll][Tt][Ee][Rr]\s*\(\s*[Ww][Hh][Ee][Rr][Ee]\s+', sql[i:], re.IGNORECASE)
+        
+        if not filter_match:
+            # No FILTER clause, just append what we found
+            result.append(sql[func_start:i])
+            continue
+        
+        # Found FILTER clause, parse the WHERE condition
+        filter_start = i
+        i += filter_match.end()
+        
+        # Find the closing paren of FILTER clause
+        paren_count = 1
+        condition_start = i
+        in_string = False
+        string_char = None
+        
+        while i < len(sql) and paren_count > 0:
+            char = sql[i]
+            
+            # Handle string literals
+            if char in ('"', "'") and (i == 0 or sql[i-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+            
+            if not in_string:
+                if char == '(':
+                    paren_count += 1
+                elif char == ')':
+                    paren_count -= 1
+            
+            i += 1
+        
+        condition = sql[condition_start:i-1].strip()
+        
+        # Build the converted expression
+        distinct_match = re.match(r'(DISTINCT\s+)(.*)', args, re.IGNORECASE)
+        if distinct_match:
+            distinct_keyword = distinct_match.group(1)
+            expression = distinct_match.group(2).strip()
+            converted_expr = f"{func_name}({distinct_keyword}CASE WHEN {condition} THEN {expression} END)"
+        elif args.strip() == '*':
+            converted_expr = f"{func_name}(CASE WHEN {condition} THEN 1 END)"
+        else:
+            converted_expr = f"{func_name}(CASE WHEN {condition} THEN {args} END)"
+        
+        result.append(converted_expr)
+    
+    return ''.join(result)

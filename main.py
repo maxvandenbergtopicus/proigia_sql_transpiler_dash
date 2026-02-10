@@ -67,22 +67,29 @@ def main():
     logs_dir.mkdir(exist_ok=True)
     setup_logging(logs_dir / "main.log", config.get('log_level', 'all'))
     
-    # Get paths from config
-    input_path = Path(config["proigia_defintion_path"])
+    # Get paths from config or command line
+    if len(sys.argv) > 1:
+        input_path = Path(sys.argv[1])
+    else:
+        input_path = Path(config["proigia_defintion_path"])
+    
     output_dir = Path(config["dbt_output_path"])
     seed_tables = config.get("seed_tabellen", [])
     
     if not input_path.exists():
         logging.error(f"Error: Path not found: {input_path}")
-        logging.error(f"Check 'proigia_defintion_path' in config.yaml")
+        logging.error(f"Check path or 'proigia_defintion_path' in config.yaml")
         sys.exit(1)
     
     if input_path.is_dir():
         process_directory(input_path, output_dir, config, seed_tables)
     else:
+        # For single file processing, use local test_output directory for debugging
+        local_output_dir = Path("test_output")
+        local_output_dir.mkdir(exist_ok=True)
         logging.info(f"Processing single file: {input_path}")
-        convert_pry_to_dbt(input_path, output_dir, config, seed_tables=seed_tables)
-        logging.info(f"\nDone! Models generated in: {output_dir}")
+        convert_pry_to_dbt(input_path, local_output_dir, config, seed_tables=seed_tables)
+        logging.info(f"\nDone! Models generated in: {local_output_dir}")
         
 if __name__ == '__main__':
     main()
