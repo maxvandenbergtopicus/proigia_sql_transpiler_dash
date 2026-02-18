@@ -84,7 +84,10 @@ def setup_logging(log_file: Path, log_level: str = 'all'):
     return logger
 
 
-def find_pry_files(repo_path: Path, ignored_keywords: list) -> list:
-    """Find PRY files, excluding those with ignored keywords."""
+def find_pry_files(repo_path: Path, ignored_keywords: list, skip_files: list = None) -> list:
+    """Find PRY files, excluding those with ignored keywords or in skip_files list."""
+    if skip_files is None:
+        skip_files = []
     return [f for f in repo_path.rglob("*.pry") 
-            if not any(kw.lower() in f.name.lower() for kw in ignored_keywords)]
+            if not any(kw.lower() in f.name.lower() for kw in ignored_keywords) 
+            and f.name not in skip_files]

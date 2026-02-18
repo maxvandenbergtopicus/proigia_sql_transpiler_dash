@@ -19,7 +19,36 @@ class FixedSnowflake(Snowflake):
                 else Snowflake.Generator.TRANSFORMS[exp.Extract](self, e)
             ),
             exp.ArrayOverlaps: lambda self, e: self.arrayoverlaps_sql(e),
+            exp.DPipe: lambda self, e: self.dpipe_sql(e),
+            exp.Substring: lambda self, e: self.substring_sql(e),
         }
+        
+        def substring_sql(self, expression: exp.Substring) -> str:
+            """Convert PostgreSQL SUBSTRING(value FROM pattern) to Snowflake REGEXP_SUBSTR(value, pattern)"""
+            # In sqlglot, SUBSTRING(value FROM pattern) is parsed with:
+            # - this: the value
+            # - start: the pattern (as a Literal string)
+            # When FROM contains a regex pattern, it appears in args['start'] as a string literal
+            
+            value = self.sql(expression.this)
+            args = expression.args
+            
+            # Check if 'start' exists and is a string literal (indicating regex pattern from FROM clause)
+            if 'start' in args and args['start'] is not None:
+                start_arg = args['start']
+                # If start is a string literal, it's a regex pattern - use REGEXP_SUBSTR
+                if isinstance(start_arg, exp.Literal) and start_arg.is_string:
+                    pattern = self.sql(start_arg)
+                    return f"REGEXP_SUBSTR({value}, {pattern})"
+                else:
+                    # Numeric start position - use standard SUBSTRING
+                    parts = [value, self.sql(start_arg)]
+                    if 'length' in args and args['length'] is not None:
+                        parts.append(self.sql(args['length']))
+                    return f"SUBSTRING({', '.join(parts)})"
+            
+            # No start argument - just return value
+            return f"SUBSTRING({value})"
         
         def cast_sql(self, expression: exp.Cast) -> str:
             """Handle PostgreSQL interval casts for Snowflake compatibility"""
@@ -53,6 +82,51 @@ class FixedSnowflake(Snowflake):
             """Convert array overlap to ARRAYS_OVERLAP function"""
             return f"ARRAYS_OVERLAP({self.sql(expression.this)}, {self.sql(expression.expression)})"
         
+        def dpipe_sql(self, expression: exp.DPipe) -> str:
+            """
+            Convert || operator to appropriate Snowflake function:
+            - For arrays: ARRAY_CAT(left, right)
+            - For strings: Keep default || or CONCAT behavior
+            """
+            # Check if either side is an array-related expression
+            left = expression.this
+            right = expression.expression
+            
+            # Array-related expression types that indicate array concatenation
+            array_types = (
+                exp.Array, exp.ArrayAgg, exp.ArrayConcat, exp.ArrayConstructCompact,
+                exp.ArrayFilter, exp.ArrayRemove, exp.ArraySlice, exp.ArraySort,
+                exp.StringToArray, exp.ToArray
+            )
+            
+            # Array-related function names (for Anonymous functions)
+            array_function_names = {
+                'ARRAY_CONSTRUCT', 'ARRAY_AGG', 'ARRAY_CONCAT', 'ARRAY_SLICE',
+                'ARRAY_SORT', 'ARRAY_FILTER', 'ARRAY_REMOVE', 'STRING_TO_ARRAY',
+                'SPLIT', 'FLATTEN'
+            }
+            
+            # Helper function to check if an expression is array-related
+            def is_array_expr(e):
+                if isinstance(e, array_types):
+                    return True
+                # Check for Anonymous functions with array-related names
+                if isinstance(e, exp.Anonymous) and e.this.upper() in array_function_names:
+                    return True
+                # Check nested DPipe for arrays
+                if isinstance(e, exp.DPipe):
+                    return is_array_expr(e.this) or is_array_expr(e.expression)
+                return False
+            
+            # If either side is an array-related expression, use ARRAY_CAT
+            if is_array_expr(left) or is_array_expr(right):
+                return f"ARRAY_CAT({self.sql(left)}, {self.sql(right)})"
+            
+            # Default to string concatenation (|| or CONCAT)
+            # Use the parent Snowflake dialect's default behavior
+            return f"{self.sql(left)} || {self.sql(right)}"
+
+        
         def anonymous_sql(self, expression: exp.Anonymous) -> str:
             """Handle AGE function conversion to DATEDIFF"""
             if expression.this.upper() == "AGE":
@@ -84,8 +158,23 @@ class FixedSnowflake(Snowflake):
             return super().eq_sql(expression)
         
         def similarto_sql(self, expression: exp.SimilarTo) -> str:
-            """Convert PostgreSQL SIMILAR TO to Snowflake RLIKE"""
-            return f"{self.sql(expression.this)} RLIKE {self.sql(expression.expression)}"
+            """Convert PostgreSQL SIMILAR TO to Snowflake RLIKE with pattern translation"""
+            def translate_similar_to_pattern(pattern: str) -> str:
+                # Replace SIMILAR TO wildcards with regex equivalents
+                translated = pattern.replace('%', '.*').replace('_', '.')
+                # Add ^ at the beginning if not already present
+                if not translated.startswith('^'):
+                    translated = '^' + translated
+                return translated
+            
+            pattern_expr = expression.expression
+            if isinstance(pattern_expr, exp.Literal):
+                pattern = pattern_expr.this
+                translated_pattern = translate_similar_to_pattern(pattern)
+                return f"{self.sql(expression.this)} RLIKE '{translated_pattern}'"
+            else:
+                # Fallback for non-literal patterns
+                return f"{self.sql(expression.this)} RLIKE {self.sql(expression.expression)}"
 
         def interval_sql(self, expression: exp.Interval) -> str:
             """Convert PostgreSQL INTERVAL to Snowflake format"""
@@ -166,19 +255,6 @@ class FixedSnowflake(Snowflake):
             # Fallback to default behavior
             return super().function_sql(expression)
 
-
-def convert_like_any_to_exists(sql: str) -> str:
-    """
-    Convert 'col LIKE ANY(array)' to Snowflake-compatible EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE col LIKE f.value)
-    Handles both qualified and unqualified column/array names.
-    """
-    # Pattern: <expr> LIKE ANY(<array_expr>)
-    pattern = re.compile(r'(\b[\w\.]+\b)\s+LIKE\s+ANY\s*\(([^\)]+)\)', re.IGNORECASE)
-    def repl(match):
-        col = match.group(1).strip()
-        arr = match.group(2).strip()
-        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
-    return pattern.sub(repl, sql)
 
 def convert_array_remove_to_variant(sql: str) -> str:
     """
@@ -358,6 +434,72 @@ def convert_cast_to_try_cast(sql: str) -> str:
     
     return sql
 
+def _find_left_expr_before_operator(text: str, op_start_pos: int) -> tuple:
+    """
+    Extract the complete left expression before an operator by working backwards.
+    Handles nested parentheses, array indexing [n], type casts ::type, and unary -/+ operators.
+    
+    Returns:
+        Tuple of (expression_text, start_position)
+    """
+    i = op_start_pos - 1
+    
+    # Skip trailing whitespace
+    while i >= 0 and text[i].isspace():
+        i -= 1
+    
+    if i < 0:
+        return "", 0
+    
+    end_pos = i + 1
+    
+    # Work backwards through the complete expression
+    while i >= 0:
+        if text[i] == ')':
+            # Closing paren - find matching opening paren
+            paren_count = 1
+            i -= 1
+            while i >= 0 and paren_count > 0:
+                if text[i] == ')':
+                    paren_count += 1
+                elif text[i] == '(':
+                    paren_count -= 1
+                i -= 1
+            i += 1
+            # Continue backwards to get function name
+            i -= 1
+            while i >= 0 and (text[i].isalnum() or text[i] == '_'):
+                i -= 1
+        elif text[i] == ']':
+            # Closing bracket - find matching opening bracket
+            bracket_count = 1
+            i -= 1
+            while i >= 0 and bracket_count > 0:
+                if text[i] == ']':
+                    bracket_count += 1
+                elif text[i] == '[':
+                    bracket_count -= 1
+                i -= 1
+        elif i > 0 and text[i-1:i+1] == '::':
+            # Type cast - skip both colons
+            i -= 2
+        elif text[i].isalnum() or text[i] in ('_', '.', '$', '{', '}', "'", '"', ':', ','):
+            i -= 1
+        elif text[i] in ('-', '+') and i > 0:
+            # Potential unary operator
+            peek = i + 1
+            while peek < end_pos and text[peek].isspace():
+                peek += 1
+            if peek < end_pos and (text[peek].isdigit() or text[peek] == '.'):
+                i -= 1
+            else:
+                break
+        else:
+            break
+    
+    start_pos = i + 1
+    return text[start_pos:end_pos].strip(), start_pos
+
 def convert_all_to_snowflake_post(sql: str) -> str:
     """
     Convert PostgreSQL ALL expressions to Snowflake equivalents.
@@ -369,66 +511,6 @@ def convert_all_to_snowflake_post(sql: str) -> str:
     - element <> ALL(array) -> NOT ARRAY_CONTAINS(element, array)
     - element != ALL(array) -> NOT ARRAY_CONTAINS(element, array)
     """
-    
-    def find_left_expr_before_operator(text, op_start_pos):
-        """Extract the complete left expression before an operator by working backwards."""
-        i = op_start_pos - 1
-        
-        # Skip trailing whitespace
-        while i >= 0 and text[i].isspace():
-            i -= 1
-        
-        if i < 0:
-            return "", 0
-        
-        end_pos = i + 1
-        
-        # Work backwards through the complete expression
-        while i >= 0:
-            if text[i] == ')':
-                # Closing paren - find matching opening paren
-                paren_count = 1
-                i -= 1
-                while i >= 0 and paren_count > 0:
-                    if text[i] == ')':
-                        paren_count += 1
-                    elif text[i] == '(':
-                        paren_count -= 1
-                    i -= 1
-                i += 1
-                # Continue backwards to get function name
-                i -= 1
-                while i >= 0 and (text[i].isalnum() or text[i] == '_'):
-                    i -= 1
-            elif text[i] == ']':
-                # Closing bracket - find matching opening bracket
-                bracket_count = 1
-                i -= 1
-                while i >= 0 and bracket_count > 0:
-                    if text[i] == ']':
-                        bracket_count += 1
-                    elif text[i] == '[':
-                        bracket_count -= 1
-                    i -= 1
-            elif i > 0 and text[i-1:i+1] == '::':
-                # Type cast - skip both colons
-                i -= 2
-            elif text[i].isalnum() or text[i] in ('_', '.', '$', '{', '}', "'", '"', ':', ','):
-                i -= 1
-            elif text[i] in ('-', '+') and i > 0:
-                # Potential unary operator
-                peek = i + 1
-                while peek < end_pos and text[peek].isspace():
-                    peek += 1
-                if peek < end_pos and (text[peek].isdigit() or text[peek] == '.'):
-                    i -= 1
-                else:
-                    break
-            else:
-                break
-        
-        start_pos = i + 1
-        return text[start_pos:end_pos].strip(), start_pos
     
     # Process each operator type
     operators = [
@@ -453,7 +535,7 @@ def convert_all_to_snowflake_post(sql: str) -> str:
             op_start = match.start()
             
             # Extract left expression
-            left_expr, left_start = find_left_expr_before_operator(sql, op_start)
+            left_expr, left_start = _find_left_expr_before_operator(sql, op_start)
             
             if not left_expr:
                 break
@@ -493,75 +575,6 @@ def convert_any_to_snowflake_post(sql: str) -> str:
     - element op ANY(array) -> EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE element op f.value)
     """
     
-    def find_left_expr_before_operator(text, op_start_pos):
-        """
-        Extract the complete left expression before an operator by working backwards.
-        Handles nested parentheses, array indexing [n], type casts ::type, and unary -/+ operators.
-        """
-        i = op_start_pos - 1
-        
-        # Skip trailing whitespace
-        while i >= 0 and text[i].isspace():
-            i -= 1
-        
-        if i < 0:
-            return "", 0
-        
-        end_pos = i + 1
-        
-        # Work backwards through the complete expression
-        while i >= 0:
-            if text[i] == ')':
-                # Closing paren - find matching opening paren
-                paren_count = 1
-                i -= 1
-                while i >= 0 and paren_count > 0:
-                    if text[i] == ')':
-                        paren_count += 1
-                    elif text[i] == '(':
-                        paren_count -= 1
-                    i -= 1
-                i += 1  # Move back to the '('
-                # Continue backwards to get function name
-                i -= 1
-                while i >= 0 and (text[i].isalnum() or text[i] == '_'):
-                    i -= 1
-            elif text[i] == ']':
-                # Closing bracket - find matching opening bracket (array indexing)
-                bracket_count = 1
-                i -= 1
-                while i >= 0 and bracket_count > 0:
-                    if text[i] == ']':
-                        bracket_count += 1
-                    elif text[i] == '[':
-                        bracket_count -= 1
-                    i -= 1
-                # Continue - there's more before the [
-            elif i > 0 and text[i-1:i+1] == '::':
-                # Type cast - skip both colons
-                i -= 2
-            elif text[i].isalnum() or text[i] in ('_', '.', '$', '{', '}', "'", '"', ':'):
-                # Part of identifier or template variable
-                i -= 1
-            elif text[i] in ('-', '+') and i > 0:
-                # Potential unary operator - check if it's at the start of a number
-                # Look ahead to see if we have digits after
-                peek = i + 1
-                while peek < end_pos and text[peek].isspace():
-                    peek += 1
-                if peek < end_pos and (text[peek].isdigit() or text[peek] == '.'):
-                    # It's a unary operator for a number, include it
-                    i -= 1
-                else:
-                    # It's a binary operator, stop here
-                    break
-            else:
-                # Found a character that's not part of the expression
-                break
-        
-        start_pos = i + 1
-        return text[start_pos:end_pos].strip(), start_pos
-    
     # Process each operator type, starting with multi-char operators first
     operators = [
         ('>=', lambda l, a: f"COALESCE(ARRAY_MIN({a}) <= {l}, FALSE)"),
@@ -585,7 +598,7 @@ def convert_any_to_snowflake_post(sql: str) -> str:
             op_start = match.start()
             
             # Extract left expression
-            left_expr, left_start = find_left_expr_before_operator(sql, op_start)
+            left_expr, left_start = _find_left_expr_before_operator(sql, op_start)
             
             if not left_expr:
                 # Couldn't extract left expression, skip this match
@@ -688,23 +701,22 @@ def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
     CROSS JOIN table, LATERAL FLATTEN(input => array) AS f
     WHERE col LIKE f.value AND other_conditions
     
-    Uses CROSS JOIN instead of comma syntax to work properly with {{ ref() }} templates.
+    Handles LEFT/RIGHT/INNER JOIN types as well.
     """
-    # Simple pattern: match JOIN ... ON ... LIKE ANY (...) including multi-line
-    # Updated to handle:
-    # - spaces before parentheses: LIKE ANY (array)
-    # - both "table alias" and "table AS alias" patterns
+    # Pattern to match [LEFT|RIGHT|INNER] JOIN ... ON ... LIKE ANY (...)
+    # Captures the join type (if any) separately
     pattern = re.compile(
-        r'JOIN\s+([\w\{\}\.\'\']+(?:\s+(?:AS\s+)?\w+)?)\s+ON\s+([\w\.]+)\s+(LIKE|ILIKE)\s+ANY\s*\(\s*([^\)]+?)\s*\)(.*?)(?=\s*(?:UNION|FROM|WHERE|GROUP|ORDER|$))',
+        r'(LEFT|RIGHT|INNER)?\s*JOIN\s+([\w\{\}\.\'\']+(?:\s+(?:AS\s+)?\w+)?)\s+ON\s+([\w\.]+)\s+(LIKE|ILIKE)\s+ANY\s*\(\s*([^\)]+?)\s*\)(.*?)(?=\s*(?:UNION|FROM|WHERE|GROUP|ORDER|JOIN|$))',
         re.IGNORECASE | re.DOTALL
     )
     
     def replace_join(match):
-        table_ref = match.group(1).strip()
-        column_ref = match.group(2).strip()
-        like_op = match.group(3).upper()
-        array_ref = match.group(4).strip()
-        trailing = match.group(5) if match.group(5) else ""
+        join_type = match.group(1)  # LEFT, RIGHT, INNER, or None
+        table_ref = match.group(2).strip()
+        column_ref = match.group(3).strip()
+        like_op = match.group(4).upper()
+        array_ref = match.group(5).strip()
+        trailing = match.group(6) if match.group(6) else ""
         
         # Extract AND conditions from trailing text
         and_conditions = ""
@@ -715,9 +727,14 @@ def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
                 and_conditions = and_match.group(1).strip()
                 trailing = ""  # Consumed the AND part
         
-        # Build replacement: CROSS JOIN with LATERAL FLATTEN
-        # Use CROSS JOIN instead of comma syntax to work properly with {{ ref() }} templates
-        result = f" CROSS JOIN {table_ref}, LATERAL FLATTEN(input => {array_ref}) AS f{trailing}"
+        # Build replacement based on join type
+        if join_type:
+            # For LEFT/RIGHT/INNER JOIN, preserve the join type
+            join_prefix = join_type.upper()
+            result = f" {join_prefix} JOIN {table_ref}, LATERAL FLATTEN(input => {array_ref}) AS f{trailing}"
+        else:
+            # For simple JOIN, use CROSS JOIN
+            result = f" CROSS JOIN {table_ref}, LATERAL FLATTEN(input => {array_ref}) AS f{trailing}"
         
         # Mark WHERE condition for injection
         where_cond = f"{column_ref} {like_op} f.value"
@@ -740,12 +757,36 @@ def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
         marker_start = marker_match.start()
         marker_end = marker_match.end()
         
-        # Find the insertion point: before UNION/GROUP/ORDER/closing paren or at line end
+        # Find the insertion point: before closing paren (subquery), UNION, JOIN, GROUP, ORDER, etc.
         after_marker = sql[marker_end:]
-        insert_match = re.search(r'(\s*)(\)|\bUNION\b|\bGROUP\b|\bORDER\b|$)', after_marker, re.IGNORECASE)
         
-        if insert_match:
-            insert_pos = marker_end + insert_match.start()
+        # Check for closing parenthesis (end of subquery) - this is highest priority
+        next_close_paren = re.search(r'\s*\)', after_marker)
+        # Check for JOIN
+        next_join = re.search(r'\s+((?:LEFT|RIGHT|INNER|CROSS)?\s*JOIN)\s+', after_marker, re.IGNORECASE)
+        # Check for other clause keywords
+        next_clause = re.search(r'\s+(\bUNION\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b)', after_marker, re.IGNORECASE)
+        
+        # Determine insertion point (use the nearest one)
+        candidates = []
+        if next_close_paren:
+            candidates.append(next_close_paren.start())
+        if next_join:
+            candidates.append(next_join.start())
+        if next_clause:
+            candidates.append(next_clause.start())
+        
+        if candidates:
+            insert_pos = marker_end + min(candidates)
+        else:
+            # No keywords found, insert at end of line or before semicolon
+            eol = re.search(r'(;|\n\s*$|$)', after_marker)
+            if eol:
+                insert_pos = marker_end + eol.start()
+            else:
+                insert_pos = len(sql)
+        
+        if insert_pos:
             section_to_check = sql[marker_end:insert_pos]
             
             # Check if there's already a WHERE clause in this section
@@ -764,11 +805,101 @@ def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
     return sql
 
 
+def remove_date_part_day(sql: str) -> str:
+    """
+    Remove DATE_PART('day', ...) or DATE_PART(day, ...) wrappers.
+    Properly handles nested parentheses and only removes when the content is a date subtraction.
+    
+    In Snowflake, date subtraction returns days directly, so DATE_PART(day, ...) is redundant.
+    """
+    result = []
+    i = 0
+    
+    while i < len(sql):
+        # Look for DATE_PART pattern (case-insensitive)
+        match = re.match(r'DATE_PART\s*\(\s*["\']?day["\']?\s*,\s*', sql[i:], re.IGNORECASE)
+        if match:
+            # Found DATE_PART(day,
+            start_pos = i
+            i += match.end()
+            
+            # Now find the matching closing parenthesis by counting parens
+            paren_count = 1
+            content_start = i
+            
+            while i < len(sql) and paren_count > 0:
+                if sql[i] == '(':
+                    paren_count += 1
+                elif sql[i] == ')':
+                    paren_count -= 1
+                i += 1
+            
+            if paren_count == 0:
+                # Found the matching closing paren
+                content = sql[content_start:i-1]
+                # Remove the DATE_PART wrapper and just keep the content
+                result.append(content)
+            else:
+                # Unmatched parentheses, keep original
+                result.append(sql[start_pos:i])
+        else:
+            result.append(sql[i])
+            i += 1
+    
+    return ''.join(result)
+
+
+def fix_flatten_column_qualifiers(sql: str) -> str:
+    """
+    Fix incorrect table alias prefixes in FLATTEN subqueries.
+    
+    Sqlglot incorrectly adds the alias prefix to ALL column references,
+    but only columns in the explicit FLATTEN column list should have it.
+    
+    Example: d.datum is valid, but d.controledatum (from outer context) is not.
+    """
+    pattern = r'TABLE\s*\(\s*FLATTEN\s*\(\s*INPUT\s*=>\s*[^)]+\)\s*\)\s*AS\s+(\w+)\s*\(\s*([^)]+)\s*\)'
+    
+    for match in re.finditer(pattern, sql, re.IGNORECASE):
+        table_alias = match.group(1)
+        column_list_str = match.group(2)
+        valid_columns = set(col.strip() for col in column_list_str.split(','))
+        
+        # Replace alias.column with just column if column is not in the FLATTEN result
+        ref_pattern = rf'\b{re.escape(table_alias)}\.(\w+)\b'
+        
+        def replace_func(m):
+            column_name = m.group(1)
+            if column_name not in valid_columns:
+                return column_name  # Remove invalid prefix
+            return m.group(0)  # Keep valid prefix
+        
+        sql = re.sub(ref_pattern, replace_func, sql)
+    
+    return sql
+
 def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str:
-    """Convert SQL from PostgreSQL to Snowflake dialect using sqlglot."""
+    """
+    Convert SQL from PostgreSQL to Snowflake dialect using sqlglot.
+    
+    This function applies a series of pre-processing transformations, attempts conversion
+    with sqlglot, and then applies post-processing fixes for patterns that sqlglot
+    doesn't handle correctly.
+    
+    Args:
+        sql: PostgreSQL SQL statement to convert
+        function_macros: Optional list of function names to preserve as macros
+        
+    Returns:
+        Converted Snowflake SQL statement
+    """
     logging.debug(f"[convert_postgres_to_snowflake] Input SQL:\n{sql}")
     
-    # Pre-process: Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
+    # ============================================================================
+    # PRE-PROCESSING: Transform PostgreSQL-specific syntax before sqlglot parsing
+    # ============================================================================
+    
+    # Convert PostgreSQL escape strings E'...' to regular strings with proper escaping
     if "E'" in sql or 'E"' in sql:
         logging.info("Converting PostgreSQL escape strings (E'...')")
         sql = convert_postgres_escape_strings(sql)
@@ -796,11 +927,6 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         # Remove AS MATERIALIZED from CTEs: WITH cte AS MATERIALIZED (...) -> WITH cte AS (...)
         sql = re.sub(r'\bAS\s+MATERIALIZED\b', 'AS', sql, flags=re.IGNORECASE)
     
-    # Pre-process: Convert SIMILAR TO to RLIKE (Snowflake equivalent)
-    if 'similar to' in sql.lower():
-        logging.info("Converting SIMILAR TO to RLIKE")
-        sql = re.sub(r'\bSIMILAR\s+TO\b', 'RLIKE', sql, flags=re.IGNORECASE)
-    
     # Pre-process: Convert PostgreSQL regex match operator ~ to RLIKE
     if '~' in sql:
         logging.info("Converting PostgreSQL regex match operator ~ to RLIKE")
@@ -812,31 +938,33 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         logging.info("Converting ARRAY[...] to ARRAY_CONSTRUCT(...)")
         sql = convert_array_to_array_construct(sql)
     
+    # Pre-process: Replace ::bigint with ::int (Snowflake uses INT for big integers)
+    if '::bigint' in sql.lower():
+        logging.info("Converting ::bigint to ::int")
+        sql = re.sub(r'::bigint\b', '::int', sql, flags=re.IGNORECASE)
+    
     # Pre-process: Remove PostgreSQL array type casts (::text[], ::varchar[], etc.)
     if '::' in sql and '[]' in sql:
         logging.info("Removing PostgreSQL array type casts")
         sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
     
     # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
-    sql = convert_date_arithmetic_to_snowflake(sql)
+    sql = convert_date_arithmetic_to_snowflake(sql) # 600 filers affected
     
     # Pre-process: Handle crosstab function (not supported in Snowflake)
     if re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE):
         sql = handle_crosstab(sql)
 
     # Pre-process: Convert unnest(ARRAY[...]) to SELECT ... FROM VALUES (...)
-    sql = convert_unnest_array_to_values(sql)
+    sql = convert_unnest_array_to_values(sql) # 19 files affected
 
-    # Pre-process: Convert CROSS JOIN LATERAL unnest(...) to Snowflake FLATTEN
-    sql = convert_lateral_unnest_to_snowflake(sql)
+    # Pre-process: Convert CROSS JOIN LATERAL unnest(...) to Snowflake FLATTEN 
+    sql = convert_lateral_unnest_to_snowflake(sql) # 2 files affected
     
-    # Pre-process: Convert SELECT unnest(column) in subqueries to LATERAL FLATTEN
-    sql = convert_select_unnest_to_flatten(sql)
-
-    # Pre-process: Convert generate_series to Snowflake-compatible TABLE(GENERATOR(...))
-    sql = convert_generate_series_to_snowflake(sql)
+    # ============================================================================
+    # SQLGLOT CONVERSION: Parse as PostgreSQL, generate as Snowflake
+    # ============================================================================
     
-    # Try sqlglot conversion
     converted = sql
     try:
         # Parse with PostgreSQL dialect
@@ -847,7 +975,16 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         logging.info(f"[Error] Failed to convert SQL with sqlglot: {e}\n")
         logging.info("Continuing with pre-processed SQL and applying post-processing steps")
     
-    # Post-process: Convert DISTINCT ON to Snowflake-compatible syntax
+    # ============================================================================
+    # POST-PROCESSING: Fix patterns that sqlglot doesn't handle correctly
+    # ============================================================================
+    
+    # Post-process: Fix incorrect FLATTEN column qualifiers
+    if 'TABLE(FLATTEN(INPUT =>' in converted.upper():
+        logging.info("Fixing incorrect table alias prefixes in FLATTEN subqueries")
+        converted = fix_flatten_column_qualifiers(converted)
+    
+    # Convert DISTINCT ON to Snowflake-compatible syntax
     if 'distinct on' in sql.lower():
         logging.info("Converting DISTINCT ON to Snowflake-compatible syntax")
         converted = convert_distinct_on_to_snowflake(converted)
@@ -885,12 +1022,18 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         
     # Post-process: Fix DATE_PART(day, date_expr - date_expr) to just date_expr - date_expr
     # Since date subtraction in Snowflake returns an integer number of days
-    converted = re.sub(
-        r"DATE_PART\s*\(\s*day\s*,\s*(.+?)\s*-\s*(.+?)\s*\)",
-        r"\1 - \2",
-        converted,
-        flags=re.IGNORECASE | re.DOTALL
-    )
+    # Use a custom function to handle nested parentheses properly
+    converted = remove_date_part_day(converted)
+    
+    # Post-process: Convert ARRAY_GENERATE_RANGE in SELECT to row-generating FLATTEN
+    if 'ARRAY_GENERATE_RANGE' in converted and 'SELECT' in converted.upper():
+        logging.info("Converting ARRAY_GENERATE_RANGE to TABLE(FLATTEN(...))")  
+        converted = convert_array_generate_range_to_flatten(converted)
+    
+    # Post-process: Simplify overly complex UNNEST/EXPLODE patterns generated by sqlglot
+    if '_u.pos = _u_2.pos_2' in converted and 'ARRAY_GENERATE_RANGE' in converted:
+        logging.info("Simplifying overly complex UNNEST/EXPLODE patterns")
+        converted = simplify_unnest_flatten(converted)
     
     # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
     converted = re.sub(
@@ -951,47 +1094,59 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         logging.info("Converting ALL expressions to Snowflake equivalents")
         converted = convert_all_to_snowflake_post(converted)
 
-    # Post-process: Convert ILIKE ANY(ARRAY_CONSTRUCT(...)) to ILIKE ANY('...', ...)
-    def ilike_any_array_construct_repl(match):
-        args = match.group(1)
+    # Post-process: Convert SIMILAR TO to RLIKE (handles cases when sqlglot fails)
+    if 'SIMILAR TO' in converted.upper():
+        logging.info("Converting SIMILAR TO to RLIKE (post-processing)")
+        converted = convert_similar_to_to_rlike(converted)
+
+    # Post-process: Convert LIKE/ILIKE ANY(ARRAY_CONSTRUCT(...)) to LIKE/ILIKE ANY('...', ...)
+    def like_any_array_construct_repl(match):
+        like_op = match.group(1).upper()  # LIKE or ILIKE
+        args = match.group(2)
         # Remove whitespace and split by comma, but keep quoted strings intact
         # This regex splits on commas not inside quotes
         import re
         parts = re.findall(r"'[^']*'|\"[^\"]*\"|[^,]+", args)
         # Clean up whitespace
         parts = [p.strip() for p in parts if p.strip()]
-        return f"ILIKE ANY({', '.join(parts)})"
+        return f"{like_op} ANY({', '.join(parts)})"
 
     converted = re.sub(
-        r"ILIKE\s+ANY\s*\(\s*ARRAY_CONSTRUCT\((.*?)\)\s*\)",
-        ilike_any_array_construct_repl,
+        r"(I?LIKE)\s+ANY\s*\(\s*ARRAY_CONSTRUCT\((.*?)\)\s*\)",
+        like_any_array_construct_repl,
         converted,
         flags=re.IGNORECASE | re.DOTALL
     )
 
-    # Post-process: Convert ILIKE ANY(column1 || column2 || ...) to ILIKE ANY(ARRAY_CONCAT(SPLIT(column1, ','), SPLIT(column2, ','), ...))
-    def ilike_any_concat_repl(match):
-        concat_expr = match.group(1)
+    # Post-process: Convert LIKE/ILIKE ANY(column1 || column2 || ...) to LIKE/ILIKE ANY(ARRAY_CONCAT(SPLIT(column1, ','), SPLIT(column2, ','), ...))
+    def like_any_concat_repl(match):
+        like_op = match.group(1).upper()  # LIKE or ILIKE
+        concat_expr = match.group(2)
         # Split by || and strip
         columns = [col.strip() for col in re.split(r'\s*\|\|\s*', concat_expr)]
         # Build ARRAY_CONCAT(ARRAY_TO_STRING(col, ','), ...)
         splits = [f"ARRAY_TO_STRING({col}, ',')" for col in columns]
         if len(splits) == 1:
-            return f"ILIKE ANY({splits[0]})"
+            return f"{like_op} ANY({splits[0]})"
         else:
-            return f"ILIKE ANY(CONCAT({', '.join(splits)}))"
+            return f"{like_op} ANY(CONCAT({', '.join(splits)}))"
 
     converted = re.sub(
-        r"ILIKE\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*\|\|\s*[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
-        ilike_any_concat_repl,
+        r"(I?LIKE)\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s*\|\|\s*[a-zA-Z_][a-zA-Z0-9_]*)+)\s*\)",
+        like_any_concat_repl,
         converted,
         flags=re.IGNORECASE
     )
 
-    # Post-process: Convert ILIKE ANY(column) to ILIKE ANY(ARRAY_TO_STRING(column, ','))
+    # Post-process: Convert LIKE/ILIKE ANY(column) to LIKE/ILIKE ANY(ARRAY_TO_STRING(column, ','))
+    def like_any_column_repl(match):
+        like_op = match.group(1).upper()  # LIKE or ILIKE
+        column = match.group(2)
+        return f"{like_op} ANY(ARRAY_TO_STRING({column}, ','))"
+
     converted = re.sub(
-        r"ILIKE\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
-        r"ILIKE ANY(ARRAY_TO_STRING(\1, ','))",
+        r"(I?LIKE)\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
+        like_any_column_repl,
         converted,
         flags=re.IGNORECASE
     )
@@ -1010,27 +1165,25 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         flags=re.IGNORECASE | re.DOTALL
     )
 
-    # Post-process: Fix COUNT(IFF(..., *, NULL)) to COUNT(IFF(..., 1, NULL)), supporting multiline and whitespace
-    converted = re.sub(
-        r'COUNT\s*\(\s*IFF\s*\((.*?),\s*\*,\s*NULL\s*\)\s*\)',
-        lambda m: f"COUNT(IFF({m.group(1)}, 1, NULL))",
-        converted,
-        flags=re.IGNORECASE | re.DOTALL
-    )
-
-    # Post-process: Pretty-format COUNT(IFF(...)) expressions for readability
-    def pretty_count_iff(match):
+    # Post-process: Fix COUNT(IFF(..., *, NULL)) to COUNT(IFF(..., 1, NULL)) and pretty-format
+    def fix_and_format_count_iff(match):
         condition = match.group(1).strip()
+        # Replace * with 1 if present, otherwise keep as is
+        then_value = match.group(2).strip()
+        if then_value == '*':
+            then_value = '1'
         return (
             "COUNT(\n    IFF(\n        "
-            + condition.replace(", 1, NULL", ",\n        1, NULL")
+            + condition
+            + ",\n        " + then_value + ", NULL"
             + "\n    )\n)"
         )
+    
     converted = re.sub(
-        r"COUNT\s*\(\s*IFF\s*\((.*?, 1, NULL)\)\s*\)",
-        pretty_count_iff,
+        r'COUNT\s*\(\s*IFF\s*\((.*?),\s*(\*|1),\s*NULL\s*\)\s*\)',
+        fix_and_format_count_iff,
         converted,
-        flags=re.DOTALL,
+        flags=re.IGNORECASE | re.DOTALL
     )
 
     # Post-process: Convert JOIN table ON col LIKE ANY(array) to LATERAL FLATTEN
@@ -1039,6 +1192,46 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         converted = convert_join_like_any_to_lateral_flatten(converted)
 
     return converted
+
+def convert_similar_to_to_rlike(sql: str) -> str:
+    """
+    Convert PostgreSQL SIMILAR TO to Snowflake RLIKE with pattern translation.
+    This is a post-processing step that ensures conversion even when sqlglot fails.
+    
+    Pattern translation:
+    - % → .* (zero or more characters)
+    - _ → . (single character)
+    - Add ^ at the beginning if not present (SIMILAR TO is anchored by default)
+    
+    Example:
+        column SIMILAR TO '(C|V|T|E)%' → column RLIKE '^(C|V|T|E).*'
+        column SIMILAR TO '_abc%' → column RLIKE '^.abc.*'
+    """
+    def translate_similar_to_pattern(pattern: str) -> str:
+        """Translate SIMILAR TO pattern to regex pattern for RLIKE"""
+        # Replace SIMILAR TO wildcards with regex equivalents
+        translated = pattern.replace('%', '.*').replace('_', '.')
+        # Add ^ at the beginning if not already present
+        if not translated.startswith('^'):
+            translated = '^' + translated
+        return translated
+    
+    def repl(match):
+        expression = match.group(1)
+        pattern = match.group(2)
+        translated_pattern = translate_similar_to_pattern(pattern)
+        return f"{expression} RLIKE '{translated_pattern}'"
+    
+    # Match: expression SIMILAR TO 'pattern'
+    # Handles multi-line and different whitespace
+    sql = re.sub(
+        r'(\S+(?:\s+\S+)*?)\s+SIMILAR\s+TO\s+\'([^\']+)\'',
+        repl,
+        sql,
+        flags=re.IGNORECASE
+    )
+    
+    return sql
 
 def convert_array_overlap_to_snowflake(sql: str) -> str:
     """
@@ -1126,108 +1319,167 @@ def convert_unnest_array_to_values(sql: str) -> str:
 
     return pattern.sub(repl, sql)
 
-def convert_select_unnest_to_flatten(sql: str) -> str:
+def find_matching_paren(s: str, start_pos: int) -> int:
+    """Find the index of the closing parenthesis that matches the opening one at start_pos."""
+    count = 1
+    i = start_pos + 1
+    while i < len(s) and count > 0:
+        if s[i] == '(':
+            count += 1
+        elif s[i] == ')':
+            count -= 1
+        i += 1
+    return i - 1 if count == 0 else -1
+
+def simplify_unnest_flatten(sql: str) -> str:
     """
-    Convert SELECT col1, col2, unnest(array_col) AS alias FROM table
-    to SELECT col1, col2, f.value AS alias FROM table, LATERAL FLATTEN(input => array_col) f
+    Simplify overly complex UNNEST/EXPLODE patterns generated by sqlglot's Snowflake dialect.
     
-    Also handles:
-    FROM unnest(array) AS table_alias(column_name) -> FROM TABLE(FLATTEN(input => array)) AS table_alias
-    And replaces column_name references with table_alias.value
+    sqlglot converts PostgreSQL UNNEST to a complex dual-FLATTEN approach with ARRAY_GENERATE_RANGE:
+    - IFF(_u.pos = _u_2.pos_2, _u_2.column, NULL) AS column
+    - CROSS JOIN TABLE(FLATTEN(INPUT => ARRAY_GENERATE_RANGE(...))) AS _u(...)
+    - CROSS JOIN TABLE(FLATTEN(INPUT => array_expr)) AS _u_2(...)
+    - WHERE _u.pos = _u_2.pos_2 OR (...)
+    
+    This function simplifies it to:
+    - _f.value AS column
+    - CROSS JOIN LATERAL FLATTEN(INPUT => array_expr) AS _f
+    
+    Processes ALL occurrences of this pattern in the SQL.
     """
-    # First, handle FROM unnest(array) AS table_alias(column_name) pattern
-    # This is common in correlated subqueries
-    from_unnest_pattern = re.compile(
-        r'\bFROM\s+unnest\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)',
-        re.IGNORECASE
-    )
     
-    # Collect mappings of column_name -> table_alias for later replacement
-    column_mappings = {}
-    for match in from_unnest_pattern.finditer(sql):
-        array_col = match.group(1)
-        table_alias = match.group(2)
-        column_name = match.group(3)
-        column_mappings[column_name] = table_alias
-    
-    # Replace FROM unnest(...) AS table(col) with FROM TABLE(FLATTEN(...)) AS table
-    def repl_from_unnest(match):
-        array_col = match.group(1)
-        table_alias = match.group(2)
-        column_name = match.group(3)
-        return f"FROM TABLE(FLATTEN(input => {array_col})) AS {table_alias}"
-    
-    sql = from_unnest_pattern.sub(repl_from_unnest, sql)
-    
-    # Now replace standalone column references with table_alias.value
-    # We need to be careful to only replace in the right context (after the FROM clause)
-    for column_name, table_alias in column_mappings.items():
-        # Replace column_name with table_alias.value in WHERE, SELECT, etc.
-        # But not when it's already qualified or part of another identifier
-        # Use word boundaries and negative lookbehind/lookahead
-        sql = re.sub(
-            rf'\b{column_name}\b(?!\s*\()',  # Not followed by ( to avoid replacing function names
-            f'{table_alias}.value',
-            sql,
-            flags=re.IGNORECASE
-        )
-    
-    # Now handle SELECT unnest(column) AS alias patterns
-    # Pattern: SELECT ... unnest(column_name) AS alias ... FROM
-    pattern = re.compile(
-        r'\bunnest\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)',
-        re.IGNORECASE
-    )
-    
-    # Find all unnest calls and collect their info
-    matches = list(pattern.finditer(sql))
-    
-    if not matches:
+    # Check if this pattern exists
+    if not ('_u.pos = _u_2.pos_2' in sql and 'ARRAY_GENERATE_RANGE' in sql):
         return sql
     
-    # Process each SELECT block that contains unnest
-    # We need to find the SELECT...FROM structure and modify it
     result = sql
-    for match in reversed(matches):  # Process in reverse to maintain positions
-        array_col = match.group(1)
-        alias = match.group(2)
-        unnest_start = match.start()
-        unnest_end = match.end()
+    max_iterations = 50  # Safety limit to prevent infinite loops
+    iteration = 0
+    
+    # Keep processing until no more patterns are found
+    while '_u.pos = _u_2.pos_2' in result and 'ARRAY_GENERATE_RANGE' in result and iteration < max_iterations:
+        iteration += 1
+        old_result = result
         
-        # Find the FROM clause after this unnest
-        from_match = re.search(r'\bFROM\b', result[unnest_end:], re.IGNORECASE)
-        if not from_match:
-            continue
+        # Step 1: Replace IFF expressions with simple _f.value (only the first occurrence)
+        iff_pattern = r'IFF\s*\(\s*_u\.pos\s*=\s*_u_2\.pos_2\s*,\s*_u_2\.(\w+)\s*,\s*NULL\s*\)\s+AS\s+(\w+)'
+        result = re.sub(iff_pattern, r'_f.value AS \2', result, count=1, flags=re.IGNORECASE)
         
-        from_pos = unnest_end + from_match.start()
-        from_end = unnest_end + from_match.end()
-        
-        # Find the table/subquery after FROM (until WHERE, GROUP, ORDER, LIMIT, ), or end)
-        table_match = re.match(
-            r'\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*)?|\([^)]+\)\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)',
-            result[from_end:],
-            re.IGNORECASE | re.DOTALL
+        # Step 2: Extract the array expression from the FIRST second FLATTEN before we modify it
+        # Try function call pattern first (e.g., SPLIT(col, '|'))
+        second_match = re.search(
+            r'FLATTEN\s*\(\s*INPUT\s*=>\s*([A-Z_]+\s*\([^)]*\))\s*\)\s*\)\s*AS\s+_u_2',
+            result,
+            re.IGNORECASE
         )
         
-        if not table_match:
-            continue
+        # If no function call, try simple column/expression pattern (e.g., column_name or table.column)
+        if not second_match:
+            second_match = re.search(
+                r'FLATTEN\s*\(\s*INPUT\s*=>\s*([a-zA-Z_][\w.]*)\s*\)\s*\)\s*AS\s+_u_2',
+                result,
+                re.IGNORECASE
+            )
         
-        table_expr = table_match.group(1).strip()
-        table_end = from_end + table_match.end()
+        if not second_match:
+            break
         
-        # Replace unnest(array_col) AS alias with f.value AS alias
-        result = (result[:unnest_start] + 
-                  f"f.value AS {alias}" + 
-                  result[unnest_end:])
+        array_expr = second_match.group(1).strip()
         
-        # Adjust positions after replacement
-        pos_diff = len(f"f.value AS {alias}") - (unnest_end - unnest_start)
-        table_end += pos_diff
-        from_end += pos_diff
+        # Step 3: Remove FIRST ARRAY_GENERATE_RANGE CROSS JOIN using position-based matching
+        array_gen_match = re.search(
+            r'\s+(CROSS\s+JOIN\s+TABLE\s*\(\s*FLATTEN\s*\(\s*INPUT\s*=>\s*ARRAY_GENERATE_RANGE)',
+            result,
+            re.IGNORECASE
+        )
         
-        # Add LATERAL FLATTEN after the table expression
-        flatten_clause = f", LATERAL FLATTEN(input => {array_col}) AS f"
-        result = result[:table_end] + flatten_clause + result[table_end:]
+        if array_gen_match:
+            start = array_gen_match.start()
+            # Find the AS _u part
+            as_u_match = re.search(r'\)\s*AS\s+_u\s*\(', result[array_gen_match.start():])
+            if as_u_match:
+                # Find the closing paren of _u(...)
+                paren_start = array_gen_match.start() + as_u_match.end() - 1
+                paren_end = find_matching_paren(result, paren_start)
+                if paren_end != -1:
+                    # Remove from start to after the closing paren, including trailing whitespace
+                    end = paren_end + 1
+                    # Skip trailing whitespace/newlines
+                    while end < len(result) and result[end] in ' \t\n':
+                        end += 1
+                    result = result[:start] + '\n  ' + result[end:]
+        
+        # Step 4: Replace FIRST second FLATTEN with simple LATERAL FLATTEN
+        # Match either a function call or a simple column/expression
+        second_pattern = r'CROSS\s+JOIN\s+TABLE\s*\(\s*FLATTEN\s*\(\s*INPUT\s*=>\s*(?:[A-Z_]+\s*\([^)]*\)|[a-zA-Z_][\w.]*)\s*\)\s*\)\s*AS\s+_u_2\s*\([^)]+\)'
+        result = re.sub(
+            second_pattern,
+            f'CROSS JOIN LATERAL FLATTEN(INPUT => {array_expr}) AS _f',
+            result,
+            count=1,  # Only replace the first occurrence
+            flags=re.IGNORECASE
+        )
+        
+        # Step 5: Remove the FIRST WHERE/AND (..._u.pos...) clause
+        # First try to find as WHERE clause (beginning of conditions)
+        where_match = re.search(
+            r'\s+WHERE\s+[^A-Z]*?_u\.pos\s*=\s*_u_2\.pos_2',
+            result,
+            re.IGNORECASE
+        )
+        
+        if where_match:
+            start = where_match.start()
+            # Find text after WHERE up to the condition
+            where_start = re.search(r'WHERE', result[start:], re.IGNORECASE)
+            if where_start:
+                where_pos = start + where_start.end()
+                # Find the complete condition block - look for the outer OR expression
+                # Pattern: _u.pos = _u_2.pos_2 OR (...)
+                condition_match = re.search(
+                    r'_u\.pos\s*=\s*_u_2\.pos_2\s+OR\s+\(',
+                    result[where_pos:],
+                    re.IGNORECASE
+                )
+                if condition_match:
+                    # Find the closing paren of the OR clause
+                    or_paren_start = where_pos + condition_match.end() - 1
+                    or_paren_end = find_matching_paren(result, or_paren_start)
+                    if or_paren_end != -1:
+                        # Remove entire WHERE clause from WHERE to the end of the OR clause
+                        end_pos = or_paren_end + 1
+                        # Skip trailing whitespace/newlines
+                        while end_pos < len(result) and result[end_pos] in ' \t\n':
+                            end_pos += 1
+                        result = result[:start + where_start.start()] + '\n  ' + result[end_pos:]
+        else:
+            # Try as AND clause (middle of existing conditions)
+            and_match = re.search(
+                r'\s+AND\s+\(\s*_u\.pos\s*=\s*_u_2\.pos_2',
+                result,
+                re.IGNORECASE
+            )
+            
+            if and_match:
+                start = and_match.start()
+                # Find the opening paren after AND
+                paren_pos = result.find('(', and_match.start() + 4)
+                if paren_pos != -1:
+                    paren_end = find_matching_paren(result, paren_pos)
+                    if paren_end != -1:
+                        # Remove from AND to closing paren
+                        result = result[:start] + result[paren_end + 1:]
+        
+        # If nothing changed, break to avoid infinite loop
+        if result == old_result:
+            break
+    
+    # Clean up empty parentheses and orphaned WHERE clauses
+    result = re.sub(r'\(\s*\)', '', result)
+    result = re.sub(r'WHERE\s*\)', ')', result, flags=re.IGNORECASE)
+    
+    if iteration >= max_iterations:
+        logging.warning(f"simplify_unnest_flatten reached max iterations ({max_iterations})")
     
     return result
 
@@ -1317,46 +1569,6 @@ def convert_array_to_array_construct(sql: str) -> str:
     
     return ''.join(result)
 
-def convert_like_any_to_exists(sql: str) -> str:
-    """
-    Convert 'col LIKE ANY(array)' to Snowflake-compatible EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE col LIKE f.value)
-    Handles both qualified and unqualified column/array names.
-    """
-    # Pattern: <expr> LIKE ANY(<array_expr>)
-    pattern = re.compile(r'(\b[\w\.]+\b)\s+LIKE\s+ANY\s*\(([^\)]+)\)', re.IGNORECASE)
-    def repl(match):
-        col = match.group(1).strip()
-        arr = match.group(2).strip()
-        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {col} LIKE f.value)"
-    return pattern.sub(repl, sql)
-
-def convert_any_to_snowflake(sql: str) -> str:
-    """
-    Convert PostgreSQL ANY expressions to Snowflake equivalents.
-    - element = ANY(array) -> ARRAY_CONTAINS(element, array)
-    - element op ANY(array) -> EXISTS(SELECT 1 FROM TABLE(FLATTEN(input => array)) f WHERE element op f.value)
-    """
-    # Pattern for = ANY
-    eq_pattern = re.compile(r'(\b[\w\.]+\b)\s*=\s*ANY\s*\(([^\)]+)\)', re.IGNORECASE)
-    def eq_repl(match):
-        element = match.group(1).strip()
-        arr = match.group(2).strip()
-        return f"ARRAY_CONTAINS({element}, {arr})"
-    
-    sql = eq_pattern.sub(eq_repl, sql)
-    
-    # Pattern for other operators: <=, >=, <, >, <>, !=
-    other_pattern = re.compile(r'(\b[\w\.]+\b)\s*(<>|!=|<=|>=|<|>)\s*ANY\s*\(([^\)]+)\)', re.IGNORECASE)
-    def other_repl(match):
-        element = match.group(1).strip()
-        op = match.group(2).strip()
-        arr = match.group(3).strip()
-        return f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {arr})) f WHERE {element} {op} f.value)"
-    
-    sql = other_pattern.sub(other_repl, sql)
-    
-    return sql
-
 def handle_crosstab(sql: str) -> str:
     """
     Replace crosstab block with a dbt-compatible crosstab SQL using parse_crosstab_sql.
@@ -1381,36 +1593,34 @@ def handle_crosstab(sql: str) -> str:
         logging.warning(f"Error in parse_crosstab_sql: {e}")
         return "{# WARNING: crosstab() block could not be converted, skipped for dbt compile #}"
 
-def convert_generate_series_to_snowflake(sql: str) -> str:
+def convert_array_generate_range_to_flatten(sql: str) -> str:
     """
-    Replace FROM generate_series(start, end, step) AS s(a)
-    with FROM TABLE(GENERATOR(ROWCOUNT => ...)) AS g, LATERAL (SELECT DATEADD(...) AS a) AS s
-    Handles both date and numeric series.
+    Convert ARRAY_GENERATE_RANGE in SELECT clauses to TABLE(FLATTEN(...)) to produce rows.
+    
+    Transforms:
+      SELECT ARRAY_GENERATE_RANGE(start, end + 1) AS col
+    To:
+      SELECT f.VALUE AS col FROM TABLE(FLATTEN(INPUT => ARRAY_GENERATE_RANGE(start, end + 1))) AS f
+    
+    This handles the case when sqlglot converts generate_series to ARRAY_GENERATE_RANGE,
+    which creates a single row with an array instead of multiple rows.
     """
+    # Pattern to match SELECT with ARRAY_GENERATE_RANGE
+    # Match: SELECT ARRAY_GENERATE_RANGE(start, end[, step]) AS alias
+    pattern = re.compile(
+        r'SELECT\s+(ARRAY_GENERATE_RANGE\s*\([^)]+\))\s+AS\s+(\w+)',
+        re.IGNORECASE
+    )
+    
     def repl(match):
-        start = match.group(1).strip()
-        end = match.group(2).strip()
-        step = match.group(3)
-        alias = match.group(4) or "s"
-        col = match.group(5) or "a"
-        if step:
-            step = step.strip()
-        else:
-            step = "INTERVAL '1 day'"
-        # Detect INTERVAL steps
-        interval_match = re.search(r"INTERVAL\s+'(\d+)\s+(\w+)'", step, re.IGNORECASE)
-        if interval_match:
-            step_value = interval_match.group(1)
-            step_unit = interval_match.group(2).upper()
-            rowcount = f"DATEDIFF({step_unit}, {start}, {end}) / {step_value} + 1"
-            return f"FROM TABLE(GENERATOR(ROWCOUNT => {rowcount})) AS g, LATERAL (SELECT DATEADD({step_unit}, SEQ4() * {step_value}, {start}) AS {col}) AS {alias}"
-        else:
-            # Numeric series
-            rowcount = f"(({end}) - ({start})) / ({step}) + 1"
-            return f"FROM TABLE(GENERATOR(ROWCOUNT => {rowcount})) AS g, LATERAL (SELECT ({start}) + SEQ4() * ({step}) AS {col}) AS {alias}"
-    # Regex: FROM generate_series(start, end, [step]) AS s(a)
-    pattern = re.compile(r"FROM\s+generate_series\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*(?:,\s*([^\)]+))?\)\s+AS\s+(\w+)\s*\((\w+)\)", re.IGNORECASE)
+        array_expr = match.group(1)
+        alias = match.group(2)
+        
+        # Convert to FLATTEN to generate rows
+        return f"SELECT f.VALUE AS {alias} FROM TABLE(FLATTEN(INPUT => {array_expr})) AS f"
+    
     return pattern.sub(repl, sql)
+
 
 def convert_max_array_to_array_agg(sql: str) -> str:
     """
@@ -1522,6 +1732,32 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     
     sql = pattern1.sub(repl1, sql)
     
+    # Pattern 1b: Handle (function(...) +/- 'N unit'::interval)::cast
+    # Example: (max(voorschrijfdatum) + '1 year'::interval)::date
+    pattern1b = re.compile(
+        r'\((\w+)\(([^)]+)\)\s*([-+])\s*\'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?\'::interval\)::\s*(\w+)',
+        re.IGNORECASE
+    )
+    
+    def repl1b(match):
+        func_name = match.group(1)
+        func_args = match.group(2)
+        operator = match.group(3)
+        amount = match.group(4)
+        unit = match.group(5).upper()
+        cast_type = match.group(6).upper()
+        
+        # Build DATEADD - wrap the arguments in TRY_TO_DATE/TO_VARCHAR if cast is DATE
+        amount_val = f"-{amount}" if operator == '-' else amount
+        if cast_type == 'DATE':
+            # Wrap the function arguments to ensure they're properly cast to date
+            wrapped_args = f"TRY_TO_DATE(TO_VARCHAR({func_args}))"
+            return f"DATEADD({unit}, {amount_val}, {func_name}({wrapped_args}))"
+        else:
+            return f"DATEADD({unit}, {amount_val}, {func_name}({func_args}))"
+    
+    sql = pattern1b.sub(repl1b, sql)
+    
     # Pattern 2a: Function calls or parenthesized expressions + 'N unit'::interval
     # Example: COALESCE(col1, col2) + '1 day'::interval
     # This needs to handle nested parentheses properly
@@ -1536,6 +1772,34 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
                 count -= 1
             i += 1
         return i if count == 0 else -1
+    
+    # Pattern 2a_pre: Specifically handle FUNCTION(...)::cast +/- interval
+    # This pattern uses recursion - we apply it multiple times until no more matches
+    # This way it handles nested functions from innermost to outermost
+    def convert_func_cast_interval(sql_text):
+        """Convert FUNCTION(args)::cast +/- 'N unit'::interval to DATEADD"""
+        # Match: word(anything)::word-'number unit'::interval
+        # We use a non-greedy match for the function arguments and apply recursively
+        pattern = re.compile(
+            r'\b(\w+)\(([^()]*)\)::\s*(\w+)\s*([-+])\s*\'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?\'::interval',
+            re.IGNORECASE | re.DOTALL
+        )
+        
+        # Apply the pattern recursively until no more matches
+        max_iterations = 10
+        for iteration in range(max_iterations):
+            new_sql = pattern.sub(
+                lambda m: f"DATEADD({m.group(6).upper()}, {'-' + m.group(5) if m.group(4) == '-' else m.group(5)}, {m.group(1)}({m.group(2)}))",
+                sql_text
+            )
+            if new_sql == sql_text:
+                break
+            sql_text = new_sql
+        
+        return sql_text
+    
+    # Apply the conversion for function(...)::cast +/- interval
+    sql = convert_func_cast_interval(sql)
     
     # Pattern 2a: Match function_name(...) + 'N unit'::interval
     pattern2a = re.compile(
@@ -1574,10 +1838,17 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
             else:  # Just parentheses
                 base_expr = sql_text[match.start():paren_end]
             
+            # Check if there's a type cast after the closing paren (e.g., ::date, allowing whitespace)
+            cast_match = re.match(r'::\s*\w+', sql_text[paren_end:], re.DOTALL)
+            check_start = paren_end
+            if cast_match:
+                base_expr += cast_match.group(0)
+                check_start = paren_end + cast_match.end()
+            
             # Check if followed by +/- interval
             interval_match = re.match(
                 r"\s*([-+])\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'::interval",
-                sql_text[paren_end:],
+                sql_text[check_start:],
                 re.IGNORECASE
             )
             
@@ -1589,10 +1860,10 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
                 # Convert to DATEADD
                 amount_val = f"-{amount}" if operator == '-' else amount
                 result.append(f"DATEADD({unit}, {amount_val}, {base_expr})")
-                i = paren_end + interval_match.end()
+                i = check_start + interval_match.end()
             else:
                 result.append(base_expr)
-                i = paren_end
+                i = check_start
         
         return ''.join(result)
     
@@ -1777,6 +2048,96 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     
     sql = process_month_columns(sql)
     
+    # Pattern 5: Handle remaining INTERVAL expressions (from sqlglot conversion)
+    # Matches patterns like: function(...) + INTERVAL 'N' UNIT or column + INTERVAL 'N' UNIT
+    # This needs to handle function calls properly
+    def process_remaining_intervals(sql_text):
+        """Process INTERVAL expressions that sqlglot partially converted."""
+        result = []
+        i = 0
+        
+        interval_pattern = re.compile(
+            r"\s*([-+])\s*INTERVAL\s+'([0-9.]+)'\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?",
+            re.IGNORECASE
+        )
+        
+        while i < len(sql_text):
+            # Search for INTERVAL starting from position i
+            match = interval_pattern.search(sql_text, i)
+            if not match:
+                result.append(sql_text[i:])
+                break
+            
+            # Found an interval - need to find the base expression before it
+            interval_start = match.start()
+            operator = match.group(1)
+            amount = match.group(2)
+            unit = match.group(3).upper()
+            
+            # Look backward from interval_start to find the base expression
+            # Skip whitespace before the operator
+            expr_end = interval_start
+            while expr_end > i and sql_text[expr_end - 1].isspace():
+                expr_end -= 1
+            
+            # Now find the start of the base expression
+            expr_start = expr_end - 1
+            if expr_start < i:
+                # Can't find base expression, skip this interval
+                result.append(sql_text[i:match.end()])
+                i = match.end()
+                continue
+            
+            # If it ends with ), find the matching opening paren (could be a function)
+            if sql_text[expr_end - 1] == ')':
+                paren_count = 1
+                expr_start = expr_end - 2
+                while expr_start >= i and paren_count > 0:
+                    if sql_text[expr_start] == ')':
+                        paren_count += 1
+                    elif sql_text[expr_start] == '(':
+                        paren_count -= 1
+                    expr_start -= 1
+                expr_start += 1
+                
+                # Check if there's a function name before the opening paren
+                temp = expr_start - 1
+                while temp >= i and sql_text[temp].isspace():
+                    temp -= 1
+                
+                if temp >= i and (sql_text[temp].isalnum() or sql_text[temp] == '_'):
+                    # There's a function name, go back to include it
+                    while temp >= i and (sql_text[temp].isalnum() or sql_text[temp] == '_'):
+                        temp -= 1
+                    expr_start = temp + 1
+            else:
+                # Simple identifier or literal - go back to find its start
+                while expr_start >= i and (sql_text[expr_start].isalnum() or sql_text[expr_start] in ('_', '.', "'", '"')):
+                    expr_start -= 1
+                expr_start += 1
+            
+            # Extract the base expression
+            base_expr = sql_text[expr_start:expr_end].strip()
+            
+            if not base_expr:
+                # Couldn't find base expression, skip
+                result.append(sql_text[i:match.end()])
+                i = match.end()
+                continue
+            
+            # Apply operator to amount
+            amount_val = f"-{amount}" if operator == '-' else amount
+            
+            # Add everything before the base expression
+            result.append(sql_text[i:expr_start])
+            # Add the DATEADD replacement
+            result.append(f"DATEADD({unit}, {amount_val}, {base_expr})")
+            i = match.end()
+        
+        return ''.join(result)
+    
+    sql = process_remaining_intervals(sql)
+    
     return sql
 
 def convert_distinct_on_to_snowflake(sql: str) -> str:
@@ -1830,133 +2191,3 @@ def convert_distinct_on_to_snowflake(sql: str) -> str:
     sql = sql[:insert_pos] + f"{qualify_clause}\n" + sql[insert_pos:]
 
     return sql
-
-def convert_filter_clause_to_case(sql: str) -> str:
-    """
-    Convert PostgreSQL FILTER (WHERE ...) clause to Snowflake-compatible CASE WHEN syntax.
-    PostgreSQL allows filtering aggregate functions with a WHERE clause in the FILTER clause.
-    Snowflake requires using CASE WHEN inside the aggregate function instead.
-    
-    Examples:
-    COUNT(patient_id) FILTER (WHERE p58_o_p=1)
-    -> COUNT(CASE WHEN p58_o_p=1 THEN patient_id END)
-    
-    array_agg(DISTINCT atc_codes) FILTER (WHERE atc_codes IS NOT NULL)
-    -> array_agg(DISTINCT CASE WHEN atc_codes IS NOT NULL THEN atc_codes END)
-    
-    SUM(amount) FILTER (WHERE status='active')
-    -> SUM(CASE WHEN status='active' THEN amount END)
-    """
-    # Use iterative approach to handle nested parentheses properly
-    result = []
-    i = 0
-    
-    # Aggregate function names we're looking for
-    agg_functions = (
-        'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ARRAY_AGG', 'STRING_AGG', 
-        'BOOL_AND', 'BOOL_OR', 'EVERY', 'STDDEV', 'VARIANCE', 'VAR_POP', 
-        'VAR_SAMP', 'STDDEV_POP', 'STDDEV_SAMP', 'CORR', 'COVAR_POP', 
-        'COVAR_SAMP', 'REGR_SLOPE', 'REGR_INTERCEPT'
-    )
-    
-    while i < len(sql):
-        # Look for aggregate function followed by FILTER
-        match = None
-        for func in agg_functions:
-            pattern = re.compile(r'\b' + func + r'\s*\(', re.IGNORECASE)
-            match = pattern.match(sql, i)
-            if match:
-                break
-        
-        if not match:
-            result.append(sql[i])
-            i += 1
-            continue
-        
-        # Found aggregate function, now parse it
-        func_start = i
-        func_name = match.group(0)[:-1].strip()  # Remove trailing '('
-        i = match.end()
-        
-        # Find matching closing paren for function args
-        paren_count = 1
-        args_start = i
-        in_string = False
-        string_char = None
-        
-        while i < len(sql) and paren_count > 0:
-            char = sql[i]
-            
-            # Handle string literals
-            if char in ('"', "'") and (i == 0 or sql[i-1] != '\\'):
-                if not in_string:
-                    in_string = True
-                    string_char = char
-                elif char == string_char:
-                    in_string = False
-                    string_char = None
-            
-            if not in_string:
-                if char == '(':
-                    paren_count += 1
-                elif char == ')':
-                    paren_count -= 1
-            
-            i += 1
-        
-        args = sql[args_start:i-1].strip()
-        
-        # Check if FILTER follows
-        filter_match = re.match(r'\s*[Ff][Ii][Ll][Tt][Ee][Rr]\s*\(\s*[Ww][Hh][Ee][Rr][Ee]\s+', sql[i:], re.IGNORECASE)
-        
-        if not filter_match:
-            # No FILTER clause, just append what we found
-            result.append(sql[func_start:i])
-            continue
-        
-        # Found FILTER clause, parse the WHERE condition
-        filter_start = i
-        i += filter_match.end()
-        
-        # Find the closing paren of FILTER clause
-        paren_count = 1
-        condition_start = i
-        in_string = False
-        string_char = None
-        
-        while i < len(sql) and paren_count > 0:
-            char = sql[i]
-            
-            # Handle string literals
-            if char in ('"', "'") and (i == 0 or sql[i-1] != '\\'):
-                if not in_string:
-                    in_string = True
-                    string_char = char
-                elif char == string_char:
-                    in_string = False
-                    string_char = None
-            
-            if not in_string:
-                if char == '(':
-                    paren_count += 1
-                elif char == ')':
-                    paren_count -= 1
-            
-            i += 1
-        
-        condition = sql[condition_start:i-1].strip()
-        
-        # Build the converted expression
-        distinct_match = re.match(r'(DISTINCT\s+)(.*)', args, re.IGNORECASE)
-        if distinct_match:
-            distinct_keyword = distinct_match.group(1)
-            expression = distinct_match.group(2).strip()
-            converted_expr = f"{func_name}({distinct_keyword}CASE WHEN {condition} THEN {expression} END)"
-        elif args.strip() == '*':
-            converted_expr = f"{func_name}(CASE WHEN {condition} THEN 1 END)"
-        else:
-            converted_expr = f"{func_name}(CASE WHEN {condition} THEN {args} END)"
-        
-        result.append(converted_expr)
-    
-    return ''.join(result)

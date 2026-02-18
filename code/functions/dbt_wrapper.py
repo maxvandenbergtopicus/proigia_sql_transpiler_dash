@@ -125,7 +125,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         converted_sql = replace_table_references(converted_sql, seed_tables=seed_tables, model_refs=model_refs, table_mapping=table_mapping, is_block=True)
         
         # Extract all external variables like ${varname} in the SQL and replace them
-        converted_sql, external_vars = replace_template_variables(converted_sql)
+        converted_sql, external_vars = replace_template_variables(converted_sql, config)
         
         # Extract all table/view names created by this block (look for "name AS (")
         created_tables = set()
@@ -205,27 +205,33 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
             )
         return set()
 
-def replace_template_variables(sql: str) -> tuple[str, set[str]]:
+def replace_template_variables(sql: str, config: dict = None) -> tuple[str, set[str]]:
     """Replace ${varname} template variables with {{ varname }} and return external vars.
+    
+    Args:
+        config: Configuration dict containing default_zg_agb for zg_agb variables
     
     Returns:
         tuple: (modified_sql, set_of_external_variables)
     """
+    config = config or {}
+    default_zg_agb = config.get('default_zg_agb', '')
+    
     # Extract all external variables like ${varname} in the SQL
     external_vars = set(re.findall(r'\$\{([a-zA-Z_][\w]*)\}', sql))
     
     # Replace quoted '${varname}' or "${varname}" - always remove quotes
     def replace_quoted_var(m):
         var_name = m.group(2)
-        return f"'{{{{ {var_name} }}}}'"  # Remove quotes entirely
+        default_value = default_zg_agb if 'zg_agb' in var_name.lower() else ""
+        return f'\'{{{{var("{var_name}","{default_value}")}}}}\''
     sql = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, sql)
     
-    # Then replace any remaining unquoted ${varname} - add quotes if it's a datum variable
+    # Then replace any remaining unquoted ${varname} - always wrap in single quotes
     def replace_unquoted_var(m):
         var_name = m.group(1)
-        if 'datum' in var_name.lower():
-            return f"'{{{{ {var_name} }}}}'"  # Add quotes for dates
-        return f"'{{{{ {var_name} }}}}'"
+        default_value = default_zg_agb if 'zg_agb' in var_name.lower() else ""
+        return f'\'{{{{var("{var_name}","{default_value}")}}}}\''
     sql = re.sub(r'\$\{([a-zA-Z_][\w]*)\}', replace_unquoted_var, sql)
     
     return sql, external_vars
@@ -314,10 +320,18 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
                 quoted_args = []
                 for arg in arg_list:
                     arg_strip = arg.strip()
-                    # Replace ${varname} or '${varname}' with {{ varname }}
-                    # Remove quotes around ${varname} if present
-                    arg_strip = re.sub(r"(['\"])?\$\{([a-zA-Z_][\w]*)\}(['\"])?", lambda m: f"{{{{ {m.group(2)} }}}}", arg_strip)
-                    # Quote the argument (single quotes)
+                    # Replace ${varname} with {{ varname }}, preserving surrounding quotes if they exist
+                    # First handle quoted variables: '${var}' or "${var}"
+                    def replace_quoted_var(m):
+                        quote = m.group(1)
+                        var_name = m.group(2)
+                        return f"{quote}{{{{ {var_name} }}}}{quote}"
+                    arg_strip = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, arg_strip)
+                    # Then handle unquoted variables: ${var}
+                    arg_strip = re.sub(r"\$\{([a-zA-Z_][\w]*)\}", lambda m: f"{{{{ {m.group(1)} }}}}", arg_strip)
+                    # Escape single quotes with backslash (for Jinja string literals)
+                    arg_strip = arg_strip.replace("'", "\\'")
+                    # Quote the argument (single quotes) - Jinja will still evaluate {{ }} inside quotes
                     quoted_args.append(f"'{arg_strip}'")
                 replacement = f"{{{{ {macro_name}({', '.join(quoted_args)}) }}}}"
             sql = sql[:start] + replacement + sql[end:]
@@ -392,33 +406,32 @@ def generate_dbt_model(
             "{%- set report_name = '" + report_name + "' %}",
             "{%- set report_type = '" + report_type + "' %}",
             "{%- set view_name = '" + view_name + "' %}",
-            "{%- set agb = var(\"agb\", none) %}",
         ]
         # Extract all external variables like ${varname} in the SQL and replace them
-        converted_sql, external_vars = replace_template_variables(converted_sql)
+        converted_sql, external_vars = replace_template_variables(converted_sql, config)
         # Exclude agb (already set)
         external_vars.discard('agb')
-        # Add each as a dbt variable
-        for var in sorted(external_vars):
-            variables.append(f"{{%- set {var} = var(\"{var}\", \" 0 \") %}}")
-        if 'type' in view_metadata:
-            variables.append("{%- set view_type = '" + view_metadata['type'] + "' %}")
-        if 'displayname' in view_metadata:
-            variables.append("{%- set display_name = '" + view_metadata['displayname'] + "' %}")
-        if 'displayorder' in view_metadata:
-            variables.append("{%- set display_order = " + str(view_metadata['displayorder']) + " %}")
-        if 'queryorder' in view_metadata:
-            variables.append("{%- set query_order = " + str(view_metadata['queryorder']) + " %}")
         # Build dbt config block
         # Check if report should be materialized as table
         materialized_view_reports = config.get('materialized_view_reports', [])
-        materialization = 'table' if report_name.lower() in materialized_view_reports else 'view'
+        materialization = 'table' #if report_name.lower() in materialized_view_reports else 'view'
         
+        # Build vars part
+        vars_part = ', '.join(f"'{var}': \"\"" for var in sorted(external_vars))
+        
+        # Build tags list, only add view_metadata['type'] if it exists
+        tags = [f"'{report_type}'"]
+        if view_metadata.get('type'):
+            tags.append(f"'{view_metadata['type']}'")
+        tags.append("'report'")
+        tags.append(f"'{report_name.replace(' ', '_').lower()}'")
+        tags_str = ', '.join(tags)
         config_lines = [
             "{{",
             "  config(",
             f"    materialized='{materialization}',",
-            f"    tags=['{report_type}', 'report', '{report_name.replace(' ', '_').lower()}']"
+            f"    tags=[{tags_str}],",
+            f"    vars={{ 'agb': none, {vars_part} }}"
         ]
         # Add schema if needed
         if view_metadata.get('type') == 'supportview':
@@ -473,7 +486,7 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
         'allergie', 'bepaling', 'contact', 'contraindicatie', 'episode', 'journaal',
         'journaalregel', 'medewerker', 'medicatie', 'metadata', 'origineel',
         'patient', 'praktijk', 'ruiter', 'verrichting', 'verwijzing', 
-        'override_patientenlijst', 'functie', 'medewerker_hisnaam', 
+        'override_patientenlijst', 'functie', 'medewerker_hisnaam', 'medewerker_manual', 
     ]
     external_tables_lower = [t.lower() for t in external_tables]
     seed_table_lookup = {k.lower(): v for k, v in (seed_tables or {}).items()}
@@ -595,10 +608,10 @@ def _replace_unqualified_tables(sql: str, cte_names: set, model_refs_lower: list
             logging.debug(f"Model ref: {table} at {match.start()} -> ref('{table_lower}')")
             return f"{keyword} {{{{ ref('{table_lower}') }}}}"
         
-        # Priority 4: External tables -> STG.P{{agb}}.table
+        # Priority 4: External tables -> {{ source('STG', 'table') }}
         if table_lower in external_tables_lower:
-            logging.debug(f"External: {table} at {match.start()} -> STG.P{{{{agb}}}}.{table}")
-            return f"{keyword} STG.P{{{{agb}}}}.{table}"
+            logging.debug(f"External: {table} at {match.start()} -> source('STG', '{table}')")
+            return f"{keyword} {{{{ source('DWH', '{table}') }}}}"
         
         # Priority 5: Block mode - leave all non-external tables unchanged
         if is_block:

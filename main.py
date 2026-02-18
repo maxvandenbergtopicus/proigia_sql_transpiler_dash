@@ -10,7 +10,8 @@ from code.functions.functions import setup_logging, find_pry_files
 def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tables: list):
     """Process all PRY files in a directory (blocks first, then regular files)."""
     ignored_keywords = config.get("ignored_keywords", [])
-    pry_files = find_pry_files(input_path, ignored_keywords)
+    skip_files = config.get("skip_files", [])
+    pry_files = find_pry_files(input_path, ignored_keywords, skip_files)
     
     logging.info(f"Searching for PRY files in: {input_path}")
     logging.info(f"\nFound {len(pry_files)} PRY files to process\n")

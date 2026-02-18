@@ -19,6 +19,10 @@ function_macros:
   - translate_labcode_answers
   - override_kwartaal
   - get_number
+  - patient_kwartaal
+  - hvz_risico_rh24
+  - qrisk3_male
+  - qrisk3_female
 
 # Model references: Tables/views that should be replaced with {{ ref('model_name') }}
 # These are typically materialized views or other dbt models that need to be referenced
@@ -29,9 +33,18 @@ model_refs:
 # Format: "source_schema.source_table": "target_schema.target_table"
 # Supports {{agb}} placeholder in target
 table_mapping:
-  public.medewerker: "STG.P{{agb}}.medewerker_manual"
+  public.medewerker: "{{ source('DWH', 'medewerker_manual') }}"
+  public.patient_hashes: "{{ source('DWH', 'intercity_delivery') }}"
+  public.refuse: "{{ source('DWH', 'refuse') }}"
+  public.get_hist_kwartaalindicatoren(CURRENT_DATE, 'kwartaal_ind_dm_pop_v3_0_indicatoren_tb' , 9): "{{ref('kwartaal_indicatoren')}}"
+  public.key_value_store: "{{ source('DWH', 'key_value_store') }}"
 
 # List of report folders that should be materialized as materialized_view in dbt
 materialized_view_reports:
   - proigia_zorggroep_criteria_v4_0
   - proigia_basisrapportage
+
+skip_files:
+- osteoporose_53530008_ind.pry
+
+default_zg_agb: 53530000
