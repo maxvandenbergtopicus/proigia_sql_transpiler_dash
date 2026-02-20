@@ -39,6 +39,9 @@ class FixedSnowflake(Snowflake):
             exp.DPipe: lambda self, e: self.dpipe_sql(e),
             exp.Substring: lambda self, e: self.substring_sql(e),
             exp.AtTimeZone: lambda self, e: self.attimezone_sql(e),
+            exp.GenerateSeries: lambda self, e: self.generateseries_sql(e),
+            exp.GenerateDateArray: lambda self, e: self.generateseries_sql(e),
+            exp.GenerateTimestampArray: lambda self, e: self.generateseries_sql(e),
         }
         
         def substring_sql(self, expression: exp.Substring) -> str:
@@ -90,29 +93,6 @@ class FixedSnowflake(Snowflake):
             
             # No zone specified - fallback
             return f"CONVERT_TIMEZONE('UTC', {timestamp_expr})"
-        
-        def cast_sql(self, expression: exp.Cast) -> str:
-            """Handle PostgreSQL interval casts for Snowflake compatibility"""
-            # Check if this is an interval cast
-            to_type = expression.to
-            if to_type and to_type.this == exp.DataType.Type.INTERVAL:
-                # Get the string value being cast
-                if isinstance(expression.this, exp.Literal) and expression.this.is_string:
-                    value = expression.this.name.strip("'\"")
-                    parts = value.split()
-                    
-                    # Parse "5 days" -> INTERVAL '5 days'
-                    if len(parts) >= 2:
-                        # Reconstruct as Snowflake INTERVAL syntax
-                        # Convert plural to singular (days -> day, months -> month, years -> year)
-                        unit = parts[1].upper().rstrip('S')
-                        return f"INTERVAL '{parts[0]}' {unit}"
-                    elif len(parts) == 1:
-                        # If only number, assume days
-                        return f"INTERVAL '{parts[0]}' DAY"
-            
-            # For all other casts, use default behavior
-            return super().cast_sql(expression)
           
         def array_sql(self, expression: exp.Array) -> str:
             """Convert ARRAY[] syntax to ARRAY_CONSTRUCT() for Snowflake"""
@@ -167,6 +147,67 @@ class FixedSnowflake(Snowflake):
             # Use the parent Snowflake dialect's default behavior
             return f"{self.sql(left)} || {self.sql(right)}"
 
+        def generateseries_sql(self, expression: exp.GenerateSeries) -> str:
+            """Convert PostgreSQL generate_series to Snowflake TABLE(GENERATOR(...))
+            
+            Note: This replaces the old duplicate implementation in function_sql().
+            Sqlglot parses generate_series as exp.GenerateSeries/GenerateDateArray, handled via TRANSFORMS.
+            """
+            # Get arguments - try multiple access patterns depending on expression type
+            # Different expression types store args differently
+            expressions_list = getattr(expression, 'expressions', [])
+            
+            start_expr = (expression.this or 
+                         expression.args.get('start') or
+                         (expressions_list[0] if len(expressions_list) > 0 else None))
+            end_expr = (expression.args.get('end') or 
+                       (expressions_list[1] if len(expressions_list) > 1 else None))
+            step_expr = (expression.args.get('step') or
+                        (expressions_list[2] if len(expressions_list) > 2 else None))
+            
+            # Render start and end as SQL strings (post-processing will handle date arithmetic conversion)
+            start = self.sql(start_expr) if start_expr else "0"
+            end = self.sql(end_expr) if end_expr else "0"
+            
+            # Determine if this is a date/interval series
+            is_interval_step = False
+            step_value = "1"
+            step_unit = None
+            step_sql = None
+            
+            if step_expr:
+                step_sql = self.sql(step_expr)
+                # Check if step is an Interval type OR if rendered SQL contains INTERVAL/CAST patterns
+                if isinstance(step_expr, exp.Interval) or 'INTERVAL' in step_sql.upper() or 'year' in step_sql.lower() or 'month' in step_sql.lower() or 'day' in step_sql.lower():
+                    is_interval_step = True
+                    # Try to extract interval info from rendered step
+                    interval_match = re.search(r"INTERVAL\s+'?(\d+)'?\s+(\w+)|CAST\s*\(\s*'(\d+)\s+(\w+)'|'(\d+)\s+(year|month|week|day|hour|minute|second)", step_sql, re.IGNORECASE)
+                    if interval_match:
+                        step_value = interval_match.group(1) or interval_match.group(3) or interval_match.group(5) or "1"
+                        step_unit = (interval_match.group(2) or interval_match.group(4) or interval_match.group(6) or "DAY").upper().rstrip('S')
+                    elif isinstance(step_expr, exp.Interval):
+                        # Extract from Interval expression object
+                        if step_expr.this and isinstance(step_expr.this, exp.Literal):
+                            step_value = step_expr.this.this.strip("'\"")
+                        if step_expr.unit:
+                            step_unit = step_expr.unit.this if hasattr(step_expr.unit, 'this') else str(step_expr.unit)
+                            step_unit = step_unit.upper().rstrip('S')
+            
+            if is_interval_step and step_unit:
+                # ---- DATE SERIES ----
+                # For date/time sequences, use TABLE(GENERATOR(...)) with DATEADD
+                rowcount = f"DATEDIFF({step_unit}, {start}, {end}) / {step_value} + 1"
+                return (
+                    f"TABLE(GENERATOR(ROWCOUNT => {rowcount})), "
+                    f"LATERAL (SELECT DATEADD({step_unit}, SEQ4() * {step_value}, {start}) AS VALUE)"
+                )
+            else:
+                # ---- NUMERIC SERIES ----
+                # For numeric sequences, generate ARRAY_GENERATE_RANGE
+                # Post-processing will convert this to TABLE(FLATTEN(...)) for proper row generation
+                step_sql = step_sql if step_sql else "1"
+                # ARRAY_GENERATE_RANGE(start, stop, step) - stop is exclusive, so add step to end
+                return f"ARRAY_GENERATE_RANGE({start}, ({end}) + ({step_sql}), {step_sql})"
         
         def anonymous_sql(self, expression: exp.Anonymous) -> str:
             """Handle AGE function conversion to DATEDIFF"""
@@ -217,21 +258,6 @@ class FixedSnowflake(Snowflake):
                 # Fallback for non-literal patterns
                 return f"{self.sql(expression.this)} RLIKE {self.sql(expression.expression)}"
 
-        def interval_sql(self, expression: exp.Interval) -> str:
-            """Convert PostgreSQL INTERVAL to Snowflake format"""
-            # Get the value and unit
-            value = self.sql(expression.this)
-            unit = expression.unit
-            
-            if unit:
-                # Snowflake format: INTERVAL '6' MONTH
-                # Remove any plural 's' from unit (MONTHS -> MONTH)
-                unit_str = str(unit).upper().rstrip('S')
-                return f"INTERVAL {value} {unit_str}"
-            
-            # Fallback to default behavior
-            return super().interval_sql(expression)
-
         def not_sql(self, expression: exp.Not) -> str:
             """Handle NOT expressions, specifically NOT IN -> ... NOT IN ..."""
             # Check if this is NOT (expression IN (...))
@@ -250,51 +276,103 @@ class FixedSnowflake(Snowflake):
             # Default behavior for other NOT expressions
             return f"NOT {self.sql(expression.this)}"
 
-        def function_sql(self, expression: exp.Func) -> str:
-            """Translate PostgreSQL functions into Snowflake equivalents"""
+
+def convert_array_indices_postgres_to_snowflake(sql: str) -> str:
+    """
+    Convert PostgreSQL array indices (1-based) to Snowflake array indices (0-based).
+    PostgreSQL uses 1-based indexing, Snowflake uses 0-based indexing.
+    This function finds all array[index] patterns and subtracts 1 from the index.
+    
+    Examples:
+        array[1] -> array[0]
+        column[3] -> column[2]
+        array_col[variable] -> array_col[variable - 1]
+    """
+    result = []
+    i = 0
+    
+    while i < len(sql):
+        # Look for array access pattern: identifier[
+        # Match identifiers (including qualified names like table.column)
+        match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s*\[', sql[i:])
+        if not match:
+            result.append(sql[i])
+            i += 1
+            continue
+        
+        # Found potential array access
+        identifier = match.group(1)
+        bracket_start = i + match.end() - 1  # Position of '['
+        
+        # Find matching closing bracket
+        bracket_depth = 1
+        paren_depth = 0
+        in_string = False
+        string_char = None
+        j = bracket_start + 1
+        
+        while j < len(sql) and bracket_depth > 0:
+            char = sql[j]
             
-            if expression.name.lower() == "generate_series":
-                args = expression.expressions
-                arg_count = len(args)
-
-                # Parse all args as SQL strings
-                start = self.sql(args[0])
-                end = self.sql(args[1]) if arg_count > 1 else None
-                step = self.sql(args[2]) if arg_count > 2 else None
-
-                # Default step for numeric sequences
-                if step is None:
-                    step = "1"
-
-                # Detect INTERVAL steps
-                interval_match = re.search(r"INTERVAL\s+'(\d+)\s+(\w+)'", step, re.IGNORECASE)
-
-                if interval_match:
-                    # ---- DATE SERIES ----
-                    step_value = interval_match.group(1)       # e.g. 1
-                    step_unit = interval_match.group(2).upper()  # e.g. YEAR
-
-                    # Snowflake rowcount = number of increments
-                    rowcount = (
-                        f"DATEDIFF({step_unit}, {start}, {end}) / {step_value} + 1"
-                    )
-
-                    return (
-                        f"TABLE(GENERATOR(ROWCOUNT => {rowcount})) AS g, "
-                        f"LATERAL (SELECT DATEADD({step_unit}, SEQ4() * {step_value}, {start}) AS a) AS s"
-                    )
-
-                else:
-                    # ---- NUMERIC SERIES ----
-                    rowcount = f"(({end}) - ({start})) / ({step}) + 1"
-
-                    return (
-                        f"TABLE(GENERATOR(ROWCOUNT => {rowcount})) AS g, "
-                        f"LATERAL (SELECT ({start}) + SEQ4() * ({step}) AS a) AS s"
-                    )
-
-            # Fallback to default behavior
-            return super().function_sql(expression)
+            # Handle strings
+            if char in ('"', "'") and (j == 0 or sql[j-1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+            
+            # Count brackets and parens outside strings
+            if not in_string:
+                if char == '[':
+                    bracket_depth += 1
+                elif char == ']':
+                    bracket_depth -= 1
+                elif char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+            
+            j += 1
+        
+        if bracket_depth != 0:
+            # Malformed bracket, skip
+            result.append(sql[i])
+            i += 1
+            continue
+        
+        # Extract the index expression
+        index_expr = sql[bracket_start + 1:j - 1].strip()
+        
+        # Check if it's a simple numeric literal
+        if index_expr.isdigit():
+            # Simple numeric index - subtract 1
+            new_index = max(0, int(index_expr) - 1)
+            result.append(sql[i:bracket_start + 1])
+            result.append(str(new_index))
+            result.append(']')
+            i = j
+        elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', index_expr):
+            # Simple variable name - subtract 1
+            result.append(sql[i:bracket_start + 1])
+            result.append(f"({index_expr}) - 1")
+            result.append(']')
+            i = j
+        elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+$', index_expr):
+            # Qualified column name (e.g., table.column) - subtract 1
+            result.append(sql[i:bracket_start + 1])
+            result.append(f"({index_expr}) - 1")
+            result.append(']')
+            i = j
+        else:
+            # Complex expression - wrap in parens and subtract 1
+            result.append(sql[i:bracket_start + 1])
+            result.append(f"({index_expr}) - 1")
+            result.append(']')
+            i = j
+    
+    return ''.join(result)
 
 
 def convert_array_remove_to_variant(sql: str) -> str:
@@ -420,7 +498,8 @@ def convert_cast_to_try_cast(sql: str) -> str:
     type_to_function = {
         'DATE': 'TRY_TO_DATE',
         'DECIMAL': 'TRY_TO_DECIMAL',
-        'NUMBER': 'TRY_TO_NUMBER'
+        'NUMBER': 'TRY_TO_NUMBER',
+        'NUMERIC': 'TRY_TO_NUMERIC'
     }
     
     # Process each target type
@@ -919,6 +998,640 @@ def fix_flatten_column_qualifiers(sql: str) -> str:
     
     return sql
 
+def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) -> str:
+    """
+    Post-process date arithmetic after SQLglot conversion.
+    SQLglot converts PostgreSQL date arithmetic to patterns like:
+    - CAST(expr AS DATE) - CAST('N unit' AS INTERVAL) 
+    - CAST(expr AS DATE) + CAST('N unit' AS INTERVAL)
+    - expr - INTERVAL 'N' UNIT
+    - expr + INTERVAL 'N' UNIT
+    
+    These need to be converted to Snowflake DATEADD:
+    - DATEADD(UNIT, -N, CAST(expr AS DATE))
+    - DATEADD(UNIT, N, CAST(expr AS DATE))
+    
+    Args:
+        sql: SQL string to process
+        month_columns: List of column names (unqualified) that represent months
+                       and should be converted to DATEADD(month, ...) when used
+                       in date arithmetic. Example: ['validtime', 'retention_months']
+    
+    This handles:
+    - Simple date arithmetic
+    - Nested cases (e.g., within DATE_TRUNC, DATE_PART, etc.)
+    - Chained DATEADD expressions
+    - Complex expressions with arithmetic operations
+    - Dynamic intervals: concat(expr, ' unit')::interval or (expr || ' unit')::interval
+    - Month-based columns: date +/- month_column (when month_columns specified)
+    """
+    
+    # Default month columns if none specified
+    if month_columns is None:
+        month_columns = ['validtime']  # Default list
+    
+    # ============================================================================
+    # STEP 1: Handle dynamic interval patterns (concat/|| with ::interval)
+    # ============================================================================
+    # Pattern: concat(expr, ' unit')::interval or (expr || ' unit')::interval
+    # Convert to INTERVAL patterns that can be handled by subsequent processing
+    
+    dynamic_interval_pattern = re.compile(
+        r"concat\s*\(\s*([^,]+?)\s*,\s*'([^']+)'\s*\)\s*::\s*interval|"
+        r"\(\s*([^)]+?)\s*\|\|\s*'([^']+)'\s*\)\s*::\s*interval",
+        re.IGNORECASE
+    )
+    
+    max_dynamic_iterations = 5
+    for iteration in range(max_dynamic_iterations):
+        original_sql = sql
+        matches = list(dynamic_interval_pattern.finditer(sql))
+        
+        if not matches:
+            break
+        
+        # Process matches in reverse order to preserve positions
+        for match in reversed(matches):
+            # Extract the expression and unit from either concat or || pattern
+            if match.group(1):  # concat pattern
+                expr = match.group(1).strip()
+                unit_str = match.group(2).strip()
+            else:  # || pattern
+                expr = match.group(3).strip()
+                unit_str = match.group(4).strip()
+            
+            # Parse the unit string (e.g., "5 day" -> fixed amount, or "day" -> dynamic amount from expr)
+            # For concat(expr, ' day')::interval, the expr IS the amount variable
+            unit_match = re.match(r'^\s*(\d+)\s+(year|month|week|day|hour|minute|second)s?\s*$', unit_str, re.IGNORECASE)
+            unit_only_match = re.match(r'^\s*(year|month|week|day|hour|minute|second)s?\s*$', unit_str, re.IGNORECASE)
+            
+            if unit_match:
+                # Fixed interval (e.g., concat(something, '5 day')) - rare but possible
+                amount = unit_match.group(1)
+                unit = unit_match.group(2).upper()
+                replacement = f"INTERVAL '{amount}' {unit}"
+            elif unit_only_match:
+                # Dynamic interval: concat(expr, ' day') means expr days
+                unit = unit_only_match.group(1).upper()
+                # Mark it specially so we can handle it in date arithmetic
+                replacement = f"__DYNAMIC_INTERVAL__({expr}, {unit})"
+            else:
+                # Can't parse the unit string, skip
+                continue
+            
+            # Replace in SQL
+            sql = sql[:match.start()] + replacement + sql[match.end():]
+        
+        if sql == original_sql:
+            break
+    
+    # ============================================================================
+    # STEP 1b: Handle dynamic intervals in date arithmetic
+    # ============================================================================
+    # Now handle __DYNAMIC_INTERVAL__(expr, UNIT) when used in date arithmetic
+    # Pattern: date_expr +/- __DYNAMIC_INTERVAL__(amount_expr, UNIT)
+    
+    def find_date_expression_start(text, end_pos):
+        """Find start of date expression, handling quotes, parens, casts"""
+        if end_pos <= 0:
+            return 0
+        
+        pos = end_pos - 1
+        
+        # Handle closing paren
+        if text[pos] == ')':
+            paren_count = 1
+            pos -= 1
+            while pos >= 0 and paren_count > 0:
+                if text[pos] == ')':
+                    paren_count += 1
+                elif text[pos] == '(':
+                    paren_count -= 1
+                pos -= 1
+            pos += 1
+            
+            # Check for keyword/function before paren
+            temp = pos - 1
+            while temp > 0 and text[temp].isspace():
+                temp -= 1
+            if temp >= 0 and (text[temp].isalnum() or text[temp] == '_'):
+                while temp >= 0 and (text[temp].isalnum() or text[temp] == '_'):
+                    temp -= 1
+                return temp + 1
+            return pos
+        
+        # Handle quoted string with optional ::cast
+        if text[pos] == "'":
+            # Find opening quote
+            pos -= 1
+            while pos >= 0:
+                if text[pos] == "'" and (pos == 0 or text[pos-1] != '\\'):
+                    break
+                pos -= 1
+            return pos if pos >= 0 else 0
+        
+        # Handle simple identifiers, keeping :: for casts
+        # Work backwards through alphanumeric, _, ., ::, quotes
+        while pos >= 0:
+            if text[pos] == "'":
+                # Hit a quote going backwards, find its start
+                pos -= 1
+                while pos >= 0:
+                    if text[pos] == "'" and (pos == 0 or text[pos-1] != '\\'):
+                        break
+                    pos -= 1
+                pos -= 1  # Move before the opening quote
+            elif text[pos] in (' ', '\t', '\n'):
+                # Whitespace - check if we should continue (for :: patterns)
+                temp = pos - 1
+                while temp >= 0 and text[temp] in (' ', '\t', '\n'):
+                    temp -= 1
+                if temp >= 1 and text[temp] == ':' and text[temp-1] == ':':
+                    pos = temp - 1
+                else:
+                    break
+            elif text[pos].isalnum() or text[pos] in ('_', '.', ':', '-'):
+                pos -= 1
+            else:
+                break
+        
+        return pos + 1
+    
+    for iteration in range(5):
+        original_sql = sql
+        
+        # Find all __DYNAMIC_INTERVAL__ markers
+        marker_pattern = re.compile(r'__DYNAMIC_INTERVAL__\(\s*([^,]+?)\s*,\s*(\w+)\s*\)')
+        matches = []
+        
+        for match in marker_pattern.finditer(sql):
+            matches.append((match.start(), match.end(), match.group(1), match.group(2)))
+        
+        if not matches:
+            break
+        
+        # Process matches in reverse order to preserve positions
+        for match_start, match_end, amount_expr, unit in reversed(matches):
+            # Search backwards from match_start to find the operator (+/-)
+            search_pos = match_start - 1
+            while search_pos >= 0 and sql[search_pos].isspace():
+                search_pos -= 1
+            
+            if search_pos < 0 or sql[search_pos] not in ('+', '-'):
+                # No operator found, skip
+                continue
+            
+            operator = sql[search_pos]
+            
+            # Now find the date expression before the operator
+            # Need to handle quoted strings, parentheses, casts, etc.
+            expr_end = search_pos
+            
+            # Skip whitespace before operator
+            while expr_end > 0 and sql[expr_end - 1].isspace():
+                expr_end -= 1
+            
+            # Find the start of the expression
+            expr_start = find_date_expression_start(sql, expr_end)
+            
+            if expr_start is None or expr_start >= expr_end:
+                continue
+            
+            date_expr = sql[expr_start:expr_end].strip()
+            
+            if not date_expr:
+                continue
+            
+            # Build DATEADD
+            if operator == '-':
+                dateadd_expr = f"DATEADD({unit}, -({amount_expr}), {date_expr})"
+            else:
+                dateadd_expr = f"DATEADD({unit}, {amount_expr}, {date_expr})"
+            
+            # Replace in SQL
+            sql = sql[:expr_start] + dateadd_expr + sql[match_end:]
+        
+        if sql == original_sql:
+            break
+    
+    # ============================================================================
+    # STEP 2: Standard interval processing
+    # ============================================================================
+    
+    def find_matching_paren(text, start):
+        """Find the closing parenthesis for an opening paren at start position"""
+        count = 1
+        i = start + 1
+        while i < len(text) and count > 0:
+            if text[i] == '(':
+                count += 1
+            elif text[i] == ')':
+                count -= 1
+            i += 1
+        return i if count == 0 else -1
+    
+    def extract_balanced_parens(text, start_pos):
+        """Extract content between balanced parentheses starting at start_pos"""
+        if start_pos >= len(text) or text[start_pos] != '(':
+            return None, start_pos
+        
+        end_pos = find_matching_paren(text, start_pos)
+        if end_pos == -1:
+            return None, start_pos
+        
+        return text[start_pos:end_pos], end_pos
+    
+    # Pattern for INTERVAL formats that may appear:
+    # 1. INTERVAL 'N' UNIT or INTERVAL N UNIT (SQLglot clean format)
+    # 2. CAST('N unit' AS INTERVAL) (SQLglot fallback format)
+    # 3. 'N unit'::interval (Original PostgreSQL format when SQLglot fails)
+    interval_pattern = re.compile(
+        r"(?:INTERVAL\s+'?([0-9.]+)'?\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?|"
+        r"CAST\s*\(\s*'([0-9.]+)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?'\s+AS\s+INTERVAL\s*\)|"
+        r"'([0-9.]+)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?'::\s*interval)",
+        re.IGNORECASE
+    )
+    
+    # Main conversion loop - process the SQL iteratively
+    max_iterations = 10  # Prevent infinite loops
+    for iteration in range(max_iterations):
+        original_sql = sql
+        result = []
+        i = 0
+        
+        while i < len(sql):
+            # Look for interval pattern
+            interval_match = interval_pattern.search(sql, i)
+            
+            if not interval_match:
+                # No more intervals found
+                result.append(sql[i:])
+                break
+            
+            # Found an interval - need to find what comes before it
+            interval_start = interval_match.start()
+            interval_end = interval_match.end()
+            
+            # Extract amount and unit from whichever pattern matched
+            if interval_match.group(1):  # INTERVAL 'N' UNIT format
+                amount = interval_match.group(1)
+                unit = interval_match.group(2).upper()
+            elif interval_match.group(3):  # CAST('N unit' AS INTERVAL) format
+                amount = interval_match.group(3)
+                unit = interval_match.group(4).upper()
+            else:  # 'N unit'::interval format (PostgreSQL original)
+                amount = interval_match.group(5)
+                unit = interval_match.group(6).upper()
+            
+            # Find the operator before the interval (+ or -)
+            # Walk backward from interval_start to find the operator
+            search_pos = interval_start - 1
+            while search_pos >= i and sql[search_pos].isspace():
+                search_pos -= 1
+            
+            if search_pos < i or sql[search_pos] not in ('+', '-'):
+                # No valid operator found, skip this interval
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            operator = sql[search_pos]
+            operator_pos = search_pos
+            
+            # Now find the left expression before the operator
+            # This could be:
+            # - CAST(...) 
+            # - A column name
+            # - DATE_TRUNC(...)
+            # - Any function call
+            # - A parenthesized expression
+            
+            expr_end = operator_pos
+            expr_start = expr_end - 1
+            
+            # Skip whitespace before operator
+            while expr_start >= i and sql[expr_start].isspace():
+                expr_start -= 1
+            
+            if expr_start < i:
+                # Can't find expression
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            # Check what type of expression we have
+            if sql[expr_start] == ')':
+                # Ends with ) - could be CAST(...), function(...), or (...)
+                # Find the matching opening paren
+                paren_count = 1
+                expr_start -= 1
+                while expr_start >= i and paren_count > 0:
+                    if sql[expr_start] == ')':
+                        paren_count += 1
+                    elif sql[expr_start] == '(':
+                        paren_count -= 1
+                    expr_start -= 1
+                expr_start += 1
+                
+                # Check if there's a function/keyword before the opening paren
+                temp = expr_start - 1
+                while temp >= i and sql[temp].isspace():
+                    temp -= 1
+                
+                if temp >= i and (sql[temp].isalnum() or sql[temp] == '_'):
+                    # There's a function name, include it
+                    while temp >= i and (sql[temp].isalnum() or sql[temp] == '_'):
+                        temp -= 1
+                    expr_start = temp + 1
+            else:
+                # Simple column or literal
+                # Go back to find the start (alphanumeric, underscore, dot, quotes, dollar, curly braces)
+                while expr_start >= i and (sql[expr_start].isalnum() or sql[expr_start] in ('_', '.', "'", '"', '$', '{', '}', ':')):
+                    expr_start -= 1
+                expr_start += 1
+            
+            # Extract the base expression
+            base_expr = sql[expr_start:expr_end].strip()
+            
+            if not base_expr:
+                # Couldn't find base expression
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            # Build the DATEADD expression
+            amount_val = f"-{amount}" if operator == '-' else amount
+            dateadd_expr = f"DATEADD({unit}, {amount_val}, {base_expr})"
+            
+            # Add everything before the base expression to result
+            result.append(sql[i:expr_start])
+            # Add the DATEADD replacement
+            result.append(dateadd_expr)
+            i = interval_end
+        
+        sql = ''.join(result)
+        
+        # If no changes were made, we're done
+        if sql == original_sql:
+            break
+    
+    # Second pass: Handle expr * interval'N unit' patterns  
+    # Find all occurrences of "* interval'" and work backwards to get the expression
+    max_mult_iterations = 10
+    for mult_iter in range(max_mult_iterations):
+        original_sql = sql
+        
+        # Find "* interval'"
+        mult_marker = re.compile(r"\*\s*interval\s*'", re.IGNORECASE)
+        
+        result = []
+        i = 0
+        
+        while i < len(sql):
+            match = mult_marker.search(sql, i)
+            if not match:
+                result.append(sql[i:])
+                break
+            
+            marker_start = match.start()
+            marker_end = match.end()
+            
+            # Extract the interval part: 'N unit'
+            interval_part_match = re.match(r"([0-9.]+)\s+(year|month|week|day|hour|minute|second)s?'", sql[marker_end:], re.IGNORECASE)
+            if not interval_part_match:
+                result.append(sql[i:marker_end])
+                i = marker_end
+                continue
+            
+            amount = interval_part_match.group(1)
+            unit = interval_part_match.group(2).upper()
+            interval_end = marker_end + interval_part_match.end()
+            
+            # Work backwards from marker_start to find the expression being multiplied
+            # Skip whitespace before *
+            expr_end = marker_start
+            while expr_end > i and sql[expr_end - 1].isspace():
+                expr_end -= 1
+            
+            # Find the start of the expression
+            expr_start = expr_end - 1
+            
+            if expr_start < i:
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            if sql[expr_start] == ')':
+                # Balanced parentheses
+                paren_count = 1
+                expr_start -= 1
+                while expr_start >= i and paren_count > 0:
+                    if sql[expr_start] == ')':
+                        paren_count += 1
+                    elif sql[expr_start] == '(':
+                        paren_count -= 1
+                    expr_start -= 1
+                expr_start += 1
+                
+                # Check for function name before the paren
+                temp = expr_start - 1
+                while temp >= i and sql[temp].isspace():
+                    temp -= 1
+                    
+                if temp >= i and (sql[temp].isalnum() or sql[temp] == '_'):
+                    # There's a function name
+                    while temp >= i and (sql[temp].isalnum() or sql[temp] == '_'):
+                        temp -= 1
+                    expr_start = temp + 1
+            else:
+                # Simple identifier
+                while expr_start >= i and (sql[expr_start].isalnum() or sql[expr_start] in ('_', '.')):
+                    expr_start -= 1
+                expr_start += 1
+            
+            expr = sql[expr_start:expr_end].strip()
+            
+            if not expr or expr[0] in ('+', '-', '*', '/', ','):
+                # Invalid expression start (but allow parentheses)
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            # Build the amount expression
+            if amount == '1' or amount == '1.0':
+                amount_expr = expr
+            else:
+                amount_expr = f"{amount} * ({expr})"
+            
+            # Replace with INTERVAL 'expr' UNIT format for the next pass
+            result.append(sql[i:expr_start])
+            result.append(f"INTERVAL '{amount_expr}' {unit}")
+            i = interval_end
+        
+        sql = ''.join(result)
+        
+        if sql == original_sql:
+            break
+    
+    # Then run another iteration of the main loop to convert these to DATEADD
+    # if they're part of addition/subtraction
+    for iteration in range(3):  # A few more iterations for the new patterns
+        original_sql = sql
+        result = []
+        i = 0
+        
+        while i < len(sql):
+            # Look for interval pattern (now including our generated patterns with expressions)
+            # Updated pattern to match INTERVAL 'expr' UNIT
+            dynamic_interval_pattern = re.compile(
+                r"INTERVAL\s+'([^']+)'\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?",
+                re.IGNORECASE
+            )
+            interval_match = dynamic_interval_pattern.search(sql, i)
+            
+            if not interval_match:
+                result.append(sql[i:])
+                break
+            
+            interval_start = interval_match.start()
+            interval_end = interval_match.end()
+            amount_expr = interval_match.group(1)  # Could be numeric or expression
+            unit = interval_match.group(2).upper()
+            
+            # Find operator before interval
+            search_pos = interval_start - 1
+            while search_pos >= i and sql[search_pos].isspace():
+                search_pos -= 1
+            
+            if search_pos < i or sql[search_pos] not in ('+', '-'):
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            operator = sql[search_pos]
+            operator_pos = search_pos
+            
+            # Find base expression before operator
+            expr_end = operator_pos
+            expr_start = expr_end - 1
+            
+            while expr_start >= i and sql[expr_start].isspace():
+                expr_start -= 1
+            
+            if expr_start < i:
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            # Find start of expression
+            if sql[expr_start] == ')':
+                paren_count = 1
+                expr_start -= 1
+                while expr_start >= i and paren_count > 0:
+                    if sql[expr_start] == ')':
+                        paren_count += 1
+                    elif sql[expr_start] == '(':
+                        paren_count -= 1
+                    expr_start -= 1
+                expr_start += 1
+                
+                temp = expr_start - 1
+                while temp >= i and sql[temp].isspace():
+                    temp -= 1
+                
+                if temp >= i and (sql[temp].isalnum() or sql[temp] == '_'):
+                    while temp >= i and (sql[temp].isalnum() or sql[temp] == '_'):
+                        temp -= 1
+                    expr_start = temp + 1
+            else:
+                while expr_start >= i and (sql[expr_start].isalnum() or sql[expr_start] in ('_', '.', "'", '"', '$', '{', '}', ':')):
+                    expr_start -= 1
+                expr_start += 1
+            
+            base_expr = sql[expr_start:expr_end].strip()
+            
+            if not base_expr:
+                result.append(sql[i:interval_end])
+                i = interval_end
+                continue
+            
+            # Build DATEADD
+            amount_val = f"-({amount_expr})" if operator == '-' else amount_expr
+            dateadd_expr = f"DATEADD({unit}, {amount_val}, {base_expr})"
+            
+            result.append(sql[i:expr_start])
+            result.append(dateadd_expr)
+            i = interval_end
+        
+        sql = ''.join(result)
+        
+        if sql == original_sql:
+            break
+    
+    # ============================================================================
+    # STEP 3: Handle simple column-based date arithmetic (for month columns)
+    # ============================================================================
+    # Pattern: CAST(date_expr AS DATE) +/- column_name
+    # This handles cases where interval columns are represented as numeric months
+    # Convert to: DATEADD(month, +/-column_name, CAST(date_expr AS DATE))
+    
+    max_simple_iterations = 10
+    for iteration in range(max_simple_iterations):
+        original_sql = sql
+        
+        # Build a regex pattern to match date_expr +/- column_name patterns
+        # Match: (date expression) (+/-) (column name)
+        # Where column name is one of the configured month columns
+        
+        # Create pattern for matching month columns (escape special regex chars)
+        column_patterns = []
+        for col in month_columns:
+            # Match qualified (table.column) or unqualified (column) names
+            # Use word boundaries to avoid partial matches
+            escaped_col = re.escape(col)
+            column_patterns.append(rf'\w+\.{escaped_col}\b|{escaped_col}\b')
+        
+        column_pattern = '|'.join(column_patterns)
+        
+        # Pattern explanation:
+        # 1. Date expression: ends with AS DATE) or AS TIMESTAMP) or is a date literal/column
+        # 2. Operator: + or - (with optional whitespace)
+        # 3. Column: one of the configured month columns
+        pattern = re.compile(
+            rf'(\b(?:CAST|TRY_TO_DATE|TO_DATE|DATE_TRUNC|DATE_PART)\s*\([^)]+\)|'  # Function with parens
+            rf"'\d{{4}}-\d{{2}}-\d{{2}}'(?:\s*::\s*(?:DATE|TIMESTAMP))?|"  # Date literal with optional cast
+            rf'\bCURRENT_DATE\b|'  # CURRENT_DATE
+            rf'\bCURRENT_TIMESTAMP\b)'  # CURRENT_TIMESTAMP
+            rf'\s*([+\-])\s*'  # Operator
+            rf'({column_pattern})',  # One of the month columns
+            re.IGNORECASE
+        )
+        
+        matches = list(pattern.finditer(sql))
+        
+        if not matches:
+            break
+        
+        # Process matches in reverse order to preserve positions
+        for match in reversed(matches):
+            date_expr = match.group(1).strip()
+            operator = match.group(2)
+            column_expr = match.group(3).strip()
+            
+            # Build the DATEADD expression
+            if operator == '-':
+                dateadd_expr = f"DATEADD(month, -({column_expr}), {date_expr})"
+            else:
+                dateadd_expr = f"DATEADD(month, {column_expr}, {date_expr})"
+            
+            # Replace in SQL
+            sql = sql[:match.start()] + dateadd_expr + sql[match.end():]
+        
+        if sql == original_sql:
+            break
+    
+    return sql
+
 def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str:
     """
     Convert SQL from PostgreSQL to Snowflake dialect using sqlglot.
@@ -989,9 +1702,6 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         logging.info("Removing PostgreSQL array type casts")
         sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
     
-    # Pre-process: Convert PostgreSQL date arithmetic to Snowflake DATEADD
-    sql = convert_date_arithmetic_to_snowflake(sql) # 600 filers affected
-    
     # Pre-process: Handle crosstab function (not supported in Snowflake)
     if re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE):
         sql = handle_crosstab(sql)
@@ -1007,18 +1717,30 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     # ============================================================================
     
     converted = sql
+    sqlglot_succeeded = False
     try:
         # Parse with PostgreSQL dialect
         parsed = sqlglot.parse_one(sql, read="postgres")
         # Generate with custom Snowflake dialect
         converted = parsed.sql(dialect=FixedSnowflake, pretty=True)
+        sqlglot_succeeded = True
     except Exception as e:
         logging.info(f"[Error] Failed to convert SQL with sqlglot: {e}\n")
         logging.info("Continuing with pre-processed SQL and applying post-processing steps")
+        # When sqlglot fails, manually convert array indices (PostgreSQL 1-based to Snowflake 0-based)
+        logging.info("Applying array index offset (-1) for Snowflake 0-based indexing")
+        converted = convert_array_indices_postgres_to_snowflake(converted)
     
     # ============================================================================
     # POST-PROCESSING: Fix patterns that sqlglot doesn't handle correctly
     # ============================================================================
+    
+    # Post-process: Convert date arithmetic from SQLglot output to DATEADD
+    # This handles patterns like: CAST(expr AS DATE) +/- CAST('N unit' AS INTERVAL)
+    # Also converts month-based columns (like validtime) to DATEADD(month, ...)
+    logging.info("Post-processing date arithmetic to DATEADD")
+    month_columns = ['validtime']  # Configure which columns represent months
+    converted = postprocess_date_arithmetic_snowflake(converted, month_columns=month_columns)
     
     # Post-process: Fix incorrect FLATTEN column qualifiers
     if 'TABLE(FLATTEN(INPUT =>' in converted.upper():
@@ -1139,6 +1861,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     if 'SIMILAR TO' in converted.upper():
         logging.info("Converting SIMILAR TO to RLIKE (post-processing)")
         converted = convert_similar_to_to_rlike(converted)
+
+    # Post-process: Convert remaining ::type casts to CAST(expression AS type) (handles cases when sqlglot fails)
+    if '::' in converted:
+        logging.info("Converting remaining ::type casts to CAST(expression AS type)")
+        converted = convert_postgres_cast_to_standard_cast(converted)
 
     # Post-process: Convert LIKE/ILIKE ANY(ARRAY_CONSTRUCT(...)) to LIKE/ILIKE ANY('...', ...)
     def like_any_array_construct_repl(match):
@@ -1273,6 +2000,233 @@ def convert_similar_to_to_rlike(sql: str) -> str:
     )
     
     return sql
+
+
+def convert_postgres_cast_to_standard_cast(sql: str) -> str:
+    """
+    Convert PostgreSQL-style ::type casts to standard CAST(expression AS type) syntax.
+    This is a post-processing step that handles cases when sqlglot fails to convert these.
+    
+    Handles patterns like:
+        'value'::date → CAST('value' AS DATE)
+        column[3]::numeric → CAST(column[3] AS NUMERIC)
+        (expression)::type → CAST((expression) AS type)
+        '3 months'::interval → CAST('3 months' AS INTERVAL)
+    
+    The function walks backwards from :: to find the start of the expression, handling:
+    - String literals: 'value'
+    - Parenthesized expressions: (...)
+    - Array access: column[index]
+    - Function calls: func(...)
+    - Column names: column_name
+    """
+    result = []
+    i = 0
+    
+    while i < len(sql):
+        # Look for :: cast operator
+        if i < len(sql) - 1 and sql[i:i+2] == '::':
+            # Find the expression before ::
+            expr_end = i
+            expr_start = find_expression_start(sql, expr_end)
+            
+            # Find the type after ::
+            type_start = i + 2
+            type_end = find_type_end(sql, type_start)
+            
+            if expr_start >= 0 and type_end > type_start:
+                # Extract expression and type
+                expression = sql[expr_start:expr_end].strip()
+                data_type = sql[type_start:type_end].strip()
+                
+                # Remove any already processed part from result up to expr_start
+                # Add the CAST(...) replacement
+                cast_expr = f"CAST({expression} AS {data_type.upper()})"
+                result.append(cast_expr)
+                
+                # Skip to the end of the type
+                i = type_end
+                continue
+        
+        result.append(sql[i])
+        i += 1
+    
+    return ''.join(result)
+
+
+def find_expression_start(sql: str, end_pos: int) -> int:
+    """
+    Find the start of the expression before a :: cast operator.
+    Walks backwards from end_pos to find where the expression begins.
+    
+    Handles:
+    - String literals: 'value' or "value"
+    - Parenthesized expressions: (...)
+    - Array access: column[index]
+    - Function calls: func(args)
+    - Column/table names: schema.table.column or column
+    """
+    if end_pos <= 0:
+        return 0
+    
+    pos = end_pos - 1
+    
+    # Skip trailing whitespace
+    while pos >= 0 and sql[pos].isspace():
+        pos -= 1
+    
+    if pos < 0:
+        return 0
+    
+    # Check what type of expression we have
+    last_char = sql[pos]
+    
+    # Case 1: Closing parenthesis - could be (expr) or func() or array[index]
+    if last_char == ')':
+        # Find matching opening parenthesis
+        paren_count = 1
+        pos -= 1
+        while pos >= 0 and paren_count > 0:
+            if sql[pos] == ')':
+                paren_count += 1
+            elif sql[pos] == '(':
+                paren_count -= 1
+            pos -= 1
+        pos += 1  # Adjust back to the opening paren
+        
+        # Check if there's a function name or column name before the (
+        start = pos
+        while pos > 0 and (sql[pos-1].isalnum() or sql[pos-1] in '_$.'):
+            pos -= 1
+        
+        return pos
+    
+    # Case 2: Closing bracket - array access column[index]
+    elif last_char == ']':
+        # Find matching opening bracket
+        bracket_count = 1
+        pos -= 1
+        while pos >= 0 and bracket_count > 0:
+            if sql[pos] == ']':
+                bracket_count += 1
+            elif sql[pos] == '[':
+                bracket_count -= 1
+            pos -= 1
+        pos += 1  # Adjust back to the opening bracket
+        
+        # Find the column name before [
+        while pos > 0 and (sql[pos-1].isalnum() or sql[pos-1] in '_.'):
+            pos -= 1
+        
+        return pos
+    
+    # Case 3: String literal with single quotes
+    elif last_char == "'":
+        pos -= 1
+        # Walk backwards to find opening quote, handling escaped quotes
+        while pos >= 0:
+            if sql[pos] == "'" and (pos == 0 or sql[pos-1] != '\\'):
+                return pos
+            pos -= 1
+        return 0
+    
+    # Case 4: String literal with double quotes
+    elif last_char == '"':
+        pos -= 1
+        # Walk backwards to find opening quote, handling escaped quotes
+        while pos >= 0:
+            if sql[pos] == '"' and (pos == 0 or sql[pos-1] != '\\'):
+                return pos
+            pos -= 1
+        return 0
+    
+    # Case 5: Identifier (column name, possibly qualified)
+    elif last_char.isalnum() or last_char == '_':
+        # Walk backwards while we have valid identifier characters
+        # Include . for qualified names (schema.table.column)
+        while pos > 0 and (sql[pos-1].isalnum() or sql[pos-1] in '_.'):
+            pos -= 1
+        # Also handle $ in identifiers (like ${variable})
+        if pos > 0 and sql[pos-1] == '$':
+            pos -= 1
+            # Check for { before $
+            if pos > 0 and sql[pos-1] == '{':
+                pos -= 1
+        
+        return pos
+    
+    # Default: return current position
+    return pos
+
+
+def find_type_end(sql: str, start_pos: int) -> int:
+    """
+    Find the end of the type name after :: operator.
+    Type names can include spaces (e.g., 'double precision', 'character varying')
+    and parentheses for precision (e.g., 'numeric(10,2)', 'varchar(100)').
+    """
+    pos = start_pos
+    
+    # Skip leading whitespace
+    while pos < len(sql) and sql[pos].isspace():
+        pos += 1
+    
+    if pos >= len(sql):
+        return start_pos
+    
+    # Read the type name
+    # Type can be alphanumeric with underscores, and may contain spaces for multi-word types
+    type_chars = []
+    
+    while pos < len(sql):
+        char = sql[pos]
+        
+        # Type names can have letters, numbers, underscores
+        if char.isalnum() or char == '_':
+            type_chars.append(char)
+            pos += 1
+        # Spaces are allowed in type names like "double precision"
+        elif char.isspace():
+            # Look ahead to see if there's more type name coming
+            next_pos = pos + 1
+            while next_pos < len(sql) and sql[next_pos].isspace():
+                next_pos += 1
+            
+            # If next character is alphanumeric, include the space
+            if next_pos < len(sql) and (sql[next_pos].isalnum() or sql[next_pos] == '_'):
+                type_chars.append(char)
+                pos += 1
+            else:
+                break
+        # Parentheses for precision/scale like numeric(10,2)
+        elif char == '(':
+            type_chars.append(char)
+            pos += 1
+            # Read until closing paren
+            paren_count = 1
+            while pos < len(sql) and paren_count > 0:
+                if sql[pos] == '(':
+                    paren_count += 1
+                elif sql[pos] == ')':
+                    paren_count -= 1
+                type_chars.append(sql[pos])
+                pos += 1
+        # Brackets for array types like integer[]
+        elif char == '[':
+            type_chars.append(char)
+            pos += 1
+            # Read until closing bracket
+            while pos < len(sql) and sql[pos] != ']':
+                type_chars.append(sql[pos])
+                pos += 1
+            if pos < len(sql) and sql[pos] == ']':
+                type_chars.append(sql[pos])
+                pos += 1
+        else:
+            # End of type name
+            break
+    
+    return pos
 
 def convert_array_overlap_to_snowflake(sql: str) -> str:
     """
@@ -1646,21 +2600,54 @@ def convert_array_generate_range_to_flatten(sql: str) -> str:
     This handles the case when sqlglot converts generate_series to ARRAY_GENERATE_RANGE,
     which creates a single row with an array instead of multiple rows.
     """
-    # Pattern to match SELECT with ARRAY_GENERATE_RANGE
-    # Match: SELECT ARRAY_GENERATE_RANGE(start, end[, step]) AS alias
-    pattern = re.compile(
-        r'SELECT\s+(ARRAY_GENERATE_RANGE\s*\([^)]+\))\s+AS\s+(\w+)',
-        re.IGNORECASE
-    )
+    # Use a more sophisticated approach to handle nested parentheses
+    result = []
+    i = 0
+    last_pos = 0  # Track the last position we've added to result
     
-    def repl(match):
-        array_expr = match.group(1)
-        alias = match.group(2)
+    while i < len(sql):
+        # Look for SELECT followed by ARRAY_GENERATE_RANGE
+        if sql[i:i+6].upper() == 'SELECT':
+            # Find start of ARRAY_GENERATE_RANGE
+            match = re.match(r'\s+(ARRAY_GENERATE_RANGE\s*\()', sql[i+6:], re.IGNORECASE)
+            if match:
+                select_start = i
+                array_start = i + 6 + match.start(1)
+                paren_start = array_start + len(match.group(1)) - 1
+                
+                # Find matching closing parenthesis
+                paren_count = 1
+                j = paren_start + 1
+                while j < len(sql) and paren_count > 0:
+                    if sql[j] == '(':
+                        paren_count += 1
+                    elif sql[j] == ')':
+                        paren_count -= 1
+                    j += 1
+                
+                if paren_count == 0:
+                    # Found complete ARRAY_GENERATE_RANGE expression
+                    array_expr = sql[array_start:j]
+                    
+                    # Look for AS alias after the expression
+                    after_expr = sql[j:]
+                    alias_match = re.match(r'\s+AS\s+(\w+)', after_expr, re.IGNORECASE)
+                    
+                    if alias_match:
+                        alias = alias_match.group(1)
+                        # Add everything from last_pos to select_start
+                        result.append(sql[last_pos:select_start])
+                        # Build replacement
+                        result.append(f"SELECT f.VALUE AS {alias} FROM TABLE(FLATTEN(INPUT => {array_expr})) AS f")
+                        i = j + alias_match.end()
+                        last_pos = i
+                        continue
         
-        # Convert to FLATTEN to generate rows
-        return f"SELECT f.VALUE AS {alias} FROM TABLE(FLATTEN(INPUT => {array_expr})) AS f"
+        i += 1
     
-    return pattern.sub(repl, sql)
+    # Add any remaining content
+    result.append(sql[last_pos:])
+    return ''.join(result)
 
 
 def convert_max_array_to_array_agg(sql: str) -> str:
@@ -1715,510 +2702,6 @@ def fix_aggregate_distinct_iff(sql: str) -> str:
         sql,
         flags=re.IGNORECASE | re.DOTALL
     )
-    
-    return sql
-
-def convert_date_arithmetic_to_snowflake(sql: str) -> str:
-    """
-    Convert PostgreSQL date arithmetic to Snowflake DATEADD syntax.
-    Handles patterns like:
-    - '${peildatum}'::date-'1 year'::interval -> DATEADD(YEAR, -1, '${peildatum}'::date)
-    - column::date-'3 months'::interval -> DATEADD(MONTH, -3, column::date)
-    - date_col-'2 days'::interval -> DATEADD(DAY, -2, date_col)
-    - voorschrijfdatum+round(hoeveelheid/0.5)*interval'1 day' -> DATEADD(DAY, round(hoeveelheid/0.5), voorschrijfdatum)
-    - date::date - validtime (where validtime is integer months) -> DATEADD(MONTH, -validtime, date::date)
-    """
-    
-    # Pattern 1: column + expression * interval 'N unit' or column - expression * interval 'N unit'
-    # Also handles: column + interval 'N unit' * expression
-    pattern1 = re.compile(
-        r"""
-        (\w+(?:\.\w+)?(?:::\w+)?)  # base column (with optional table.column qualification and ::type cast)
-        \s*([-+])\s*  # operator (+ or -)
-        (?:  # non-capturing group for two variations
-        (.*?)\s*\*\s*interval\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'  # expr * interval 'N unit'
-        |  # OR
-        interval\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'\s*\*\s*(.*?)  # interval 'N unit' * expr
-        )
-        """,
-        re.IGNORECASE | re.VERBOSE
-    )
-    
-    def repl1(match):
-        base = match.group(1)
-        operator = match.group(2)
-        
-        # Check which pattern matched (expr * interval or interval * expr)
-        if match.group(3) is not None:  # expr * interval 'N unit'
-            expr = match.group(3).strip()
-            amount_literal = match.group(4)
-            unit = match.group(5).upper()
-        else:  # interval 'N unit' * expr
-            amount_literal = match.group(6)
-            unit = match.group(7).upper()
-            expr = match.group(8).strip()
-        
-        # Build the expression: if amount is not 1, multiply it with the expression
-        if amount_literal == '1':
-            amount_expr = expr
-        else:
-            amount_expr = f"{amount_literal} * ({expr})"
-        
-        # Apply operator
-        if operator == '-':
-            amount_expr = f"-({amount_expr})"
-        
-        # Snowflake DATEADD syntax: DATEADD(unit, amount, base)
-        return f"DATEADD({unit}, {amount_expr}, {base})"
-    
-    sql = pattern1.sub(repl1, sql)
-    
-    # Pattern 1b: Handle (function(...) +/- 'N unit'::interval)::cast
-    # Example: (max(voorschrijfdatum) + '1 year'::interval)::date
-    pattern1b = re.compile(
-        r'\((\w+)\(([^)]+)\)\s*([-+])\s*\'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?\'::interval\)::\s*(\w+)',
-        re.IGNORECASE
-    )
-    
-    def repl1b(match):
-        func_name = match.group(1)
-        func_args = match.group(2)
-        operator = match.group(3)
-        amount = match.group(4)
-        unit = match.group(5).upper()
-        cast_type = match.group(6).upper()
-        
-        # Build DATEADD - wrap the arguments in TRY_TO_DATE/TO_VARCHAR if cast is DATE
-        amount_val = f"-{amount}" if operator == '-' else amount
-        if cast_type == 'DATE':
-            # Wrap the function arguments to ensure they're properly cast to date
-            wrapped_args = f"TRY_TO_DATE(TO_VARCHAR({func_args}))"
-            return f"DATEADD({unit}, {amount_val}, {func_name}({wrapped_args}))"
-        else:
-            return f"DATEADD({unit}, {amount_val}, {func_name}({func_args}))"
-    
-    sql = pattern1b.sub(repl1b, sql)
-    
-    # Pattern 2a: Function calls or parenthesized expressions + 'N unit'::interval
-    # Example: COALESCE(col1, col2) + '1 day'::interval
-    # This needs to handle nested parentheses properly
-    def find_matching_paren(text, start):
-        """Find the closing parenthesis for an opening paren at start position"""
-        count = 1
-        i = start + 1
-        while i < len(text) and count > 0:
-            if text[i] == '(':
-                count += 1
-            elif text[i] == ')':
-                count -= 1
-            i += 1
-        return i if count == 0 else -1
-    
-    # Pattern 2a_pre: Specifically handle FUNCTION(...)::cast +/- interval
-    # This pattern uses recursion - we apply it multiple times until no more matches
-    # This way it handles nested functions from innermost to outermost
-    def convert_func_cast_interval(sql_text):
-        """Convert FUNCTION(args)::cast +/- 'N unit'::interval to DATEADD"""
-        # Match: word(anything)::word-'number unit'::interval
-        # We use a non-greedy match for the function arguments and apply recursively
-        pattern = re.compile(
-            r'\b(\w+)\(([^()]*)\)::\s*(\w+)\s*([-+])\s*\'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?\'::interval',
-            re.IGNORECASE | re.DOTALL
-        )
-        
-        # Apply the pattern recursively until no more matches
-        max_iterations = 10
-        for iteration in range(max_iterations):
-            new_sql = pattern.sub(
-                lambda m: f"DATEADD({m.group(6).upper()}, {'-' + m.group(5) if m.group(4) == '-' else m.group(5)}, {m.group(1)}({m.group(2)}))",
-                sql_text
-            )
-            if new_sql == sql_text:
-                break
-            sql_text = new_sql
-        
-        return sql_text
-    
-    # Apply the conversion for function(...)::cast +/- interval
-    sql = convert_func_cast_interval(sql)
-    
-    # Pattern 2a: Match function_name(...) + 'N unit'::interval
-    pattern2a = re.compile(
-        r"\b(\w+)\s*\("  # function name + opening paren
-        r"|"  # OR
-        r"\("  # just an opening paren for grouped expressions
-    )
-    
-    def repl2a(sql_text):
-        """Process function calls and parenthesized expressions with interval arithmetic"""
-        result = []
-        i = 0
-        while i < len(sql_text):
-            # Look for function call or parenthesized expression
-            match = pattern2a.search(sql_text, i)
-            if not match:
-                result.append(sql_text[i:])
-                break
-            
-            # Add everything before the match
-            result.append(sql_text[i:match.start()])
-            
-            # Find the closing paren
-            paren_start = match.end() - 1
-            paren_end = find_matching_paren(sql_text, paren_start)
-            
-            if paren_end == -1:
-                # Couldn't find matching paren, just add the match and continue
-                result.append(match.group(0))
-                i = match.end()
-                continue
-            
-            # Extract the full expression (function call or grouped expr)
-            if match.group(1):  # Function call
-                base_expr = sql_text[match.start():paren_end]
-            else:  # Just parentheses
-                base_expr = sql_text[match.start():paren_end]
-            
-            # Check if there's a type cast after the closing paren (e.g., ::date, allowing whitespace)
-            cast_match = re.match(r'::\s*\w+', sql_text[paren_end:], re.DOTALL)
-            check_start = paren_end
-            if cast_match:
-                base_expr += cast_match.group(0)
-                check_start = paren_end + cast_match.end()
-            
-            # Check if followed by +/- interval
-            interval_match = re.match(
-                r"\s*([-+])\s*'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'::interval",
-                sql_text[check_start:],
-                re.IGNORECASE
-            )
-            
-            if interval_match:
-                operator = interval_match.group(1)
-                amount = interval_match.group(2)
-                unit = interval_match.group(3).upper()
-                
-                # Convert to DATEADD
-                amount_val = f"-{amount}" if operator == '-' else amount
-                result.append(f"DATEADD({unit}, {amount_val}, {base_expr})")
-                i = check_start + interval_match.end()
-            else:
-                result.append(base_expr)
-                i = check_start
-        
-        return ''.join(result)
-    
-    sql = repl2a(sql)
-    
-    # Pattern 2b: Simple column or literal + 'N unit'::interval
-    # Capture: base expression, operator (+ or -), number, unit
-    pattern2b = re.compile(
-        r"(\w+(?:\.\w+)?(?:::\w+)?|'[^']+'::\w+)"  # simple column or literal with cast (supports table.column)
-        r"\s*([-+])\s*"  # operator (+ or -)
-        r"'([\d\.]+)\s+(year|month|week|day|hour|minute|second)s?'::interval",  # interval
-        re.IGNORECASE
-    )
-    
-    def repl2b(match):
-        base = match.group(1)
-        operator = match.group(2)
-        amount = match.group(3)
-        unit = match.group(4).upper()
-        
-        # Convert operator and amount
-        if operator == '-':
-            amount_val = f"-{amount}"
-        else:
-            amount_val = amount
-        
-        # Create DATEADD
-        return f"DATEADD({unit}, {amount_val}, {base})"
-    
-    # Apply the pattern
-    sql = pattern2b.sub(repl2b, sql)
-    
-    # Pattern 3: date + concat(..., ' unit')::interval (dynamic interval from string concat)
-    # Example: '1900-01-01'::date + concat(cast(value as varchar), ' day')::interval
-    pattern3 = re.compile(
-        r"(\([^)]+\)(?:::\w+)?|'[^']+'::\w+|\w+(?:\.\w+)?(?:::\w+)?)"  # base: parenthesized expr, string literal, or column (with optional table.column and cast)
-        r"\s*([-+])\s*"  # operator
-        r"concat\s*\(([^)]+),\s*'[^']*\s*(year|month|week|day|hour|minute|second)s?[^']*'\s*\)::interval",
-        re.IGNORECASE
-    )
-    
-    def repl3(match):
-        base = match.group(1).strip()
-        operator = match.group(2)
-        amount_expr = match.group(3).strip()
-        unit = match.group(4).upper()
-        
-        # Apply operator to amount
-        if operator == '-':
-            amount_expr = f"-({amount_expr})"
-        
-        return f"DATEADD({unit}, {amount_expr}, {base})"
-    
-    sql = pattern3.sub(repl3, sql)
-    
-    # Helper function to match balanced parentheses from a position
-    def extract_balanced_expression(text, start_pos):
-        """Extract a balanced parenthesized expression starting at start_pos."""
-        if start_pos >= len(text) or text[start_pos] != '(':
-            return None, start_pos
-        
-        depth = 0
-        i = start_pos
-        while i < len(text):
-            if text[i] == '(':
-                depth += 1
-            elif text[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    return text[start_pos:i+1], i+1
-            i += 1
-        return None, start_pos
-    
-    # Pattern for base_expr [+|-] 'N unit'::interval with proper DATEADD handling
-    # Process this iteratively to handle nested DATEADD expressions
-    def process_chained_intervals(sql_text):
-        """Process chained interval arithmetic, handling DATEADD expressions correctly."""
-        result = []
-        i = 0
-        
-        while i < len(sql_text):
-            # Look for DATEADD or other expressions followed by interval arithmetic
-            # Match: DATEADD(...) +/- 'N unit'::interval
-            dateadd_match = re.match(r'DATEADD\s*\(', sql_text[i:], re.IGNORECASE)
-            
-            if dateadd_match:
-                # Extract the full DATEADD expression with balanced parens
-                dateadd_start = i
-                expr, end_pos = extract_balanced_expression(sql_text, i + dateadd_match.end() - 1)
-                if expr:
-                    full_dateadd = sql_text[i:end_pos]
-                    
-                    # Check if followed by +/- interval
-                    interval_match = re.match(
-                        r"\s*([-+])\s*'([\d\.]+)\s*(year|month|week|day|hour|minute|second)s?'::interval",
-                        sql_text[end_pos:],
-                        re.IGNORECASE
-                    )
-                    
-                    if interval_match:
-                        operator = interval_match.group(1)
-                        amount = interval_match.group(2)
-                        unit = interval_match.group(3).upper()
-                        amount_val = f"-{amount}" if operator == '-' else amount
-                        result.append(f"DATEADD({unit}, {amount_val}, {full_dateadd})")
-                        i = end_pos + interval_match.end()
-                    else:
-                        result.append(full_dateadd)
-                        i = end_pos
-                else:
-                    result.append(sql_text[i])
-                    i += 1
-            else:
-                # Look for other patterns: column/literal +/- interval
-                other_match = re.match(
-                    r"([\w'\"]+(?:\.[\w'\"]+)?(?:::\w+)?)"  # simple base (column with optional table.column, literal with cast)
-                    r"\s*([-+])\s*"
-                    r"'([\d\.]+)\s*(year|month|week|day|hour|minute|second)s?'::interval",
-                    sql_text[i:],
-                    re.IGNORECASE
-                )
-                
-                if other_match:
-                    base = other_match.group(1)
-                    operator = other_match.group(2)
-                    amount = other_match.group(3)
-                    unit = other_match.group(4).upper()
-                    amount_val = f"-{amount}" if operator == '-' else amount
-                    result.append(f"DATEADD({unit}, {amount_val}, {base})")
-                    i += other_match.end()
-                else:
-                    result.append(sql_text[i])
-                    i += 1
-        
-        return ''.join(result)
-    
-    sql = process_chained_intervals(sql)
-    
-    # Pattern 4a: Simple date expressions +/- month columns (validtime, loopduur, etc.)
-    # Handles: date_expr - table.column or date_expr + table.column
-    # where column is validtime, loopduur, looptijd (integer months)
-    # This must run BEFORE process_month_columns which handles chained DATEADD cases
-    pattern4a = re.compile(
-        r"""
-        (                                           # Group 1: base date expression
-            (?:                                     # Non-capturing group for date expression alternatives
-                '[^']*'::\s*date                    # String literal cast to date: '${peildatum}'::date
-                |                                   # OR
-                \w+(?:\.\w+)?::\s*date              # Column cast to date: column::date or table.column::date
-                |                                   # OR
-                \([^()]+\)::\s*date                 # Parenthesized expression cast to date
-                |                                   # OR
-                COALESCE\s*\([^)]+\)                # COALESCE function call
-                |                                   # OR
-                \w+(?:\.\w+)?                       # Simple column or table.column
-            )
-        )
-        \s*([-+])\s*                                # Group 2: operator (+ or -)
-        (\w+\.)?                                    # Group 3: optional table prefix
-        (validtime|loopduur|looptijd)               # Group 4: column name
-        \b                                          # Word boundary
-        """,
-        re.IGNORECASE | re.VERBOSE
-    )
-    
-    def repl4a(match):
-        base_expr = match.group(1).strip()
-        operator = match.group(2)
-        table_prefix = match.group(3) if match.group(3) else ''
-        column_name = match.group(4)
-        full_column = f"{table_prefix}{column_name}"
-        
-        # Apply operator (subtract means negative value)
-        amount_expr = f"-{full_column}" if operator == '-' else full_column
-        
-        return f"DATEADD(MONTH, {amount_expr}, {base_expr})"
-    
-    sql = pattern4a.sub(repl4a, sql)
-    
-    # Pattern 4b (run LAST): Edge case for integer columns representing months (validtime, loopduur, etc.)
-    # Handles: DATEADD(...) - table.column or DATEADD(...) + table.column
-    # where column is validtime, loopduur, looptijd (integer months)
-    # This pattern runs after all interval conversions so it can handle DATEADD results
-    def process_month_columns(sql_text):
-        """Process DATEADD expressions followed by month column arithmetic."""
-        result = []
-        i = 0
-        
-        while i < len(sql_text):
-            dateadd_match = re.match(r'DATEADD\s*\(', sql_text[i:], re.IGNORECASE)
-            
-            if dateadd_match:
-                expr, end_pos = extract_balanced_expression(sql_text, i + dateadd_match.end() - 1)
-                if expr:
-                    full_dateadd = sql_text[i:end_pos]
-                    
-                    # Check if followed by +/- month column
-                    month_match = re.match(
-                        r"\s*([-+])\s*(\w+\.)?(validtime|loopduur|looptijd)\b",
-                        sql_text[end_pos:],
-                        re.IGNORECASE
-                    )
-                    
-                    if month_match:
-                        operator = month_match.group(1)
-                        table_prefix = month_match.group(2) if month_match.group(2) else ''
-                        column_name = month_match.group(3)
-                        full_column = f"{table_prefix}{column_name}"
-                        amount_expr = f"-{full_column}" if operator == '-' else full_column
-                        result.append(f"DATEADD(MONTH, {amount_expr}, {full_dateadd})")
-                        i = end_pos + month_match.end()
-                    else:
-                        result.append(full_dateadd)
-                        i = end_pos
-                else:
-                    result.append(sql_text[i])
-                    i += 1
-            else:
-                result.append(sql_text[i])
-                i += 1
-        
-        return ''.join(result)
-    
-    sql = process_month_columns(sql)
-    
-    # Pattern 5: Handle remaining INTERVAL expressions (from sqlglot conversion)
-    # Matches patterns like: function(...) + INTERVAL 'N' UNIT or column + INTERVAL 'N' UNIT
-    # This needs to handle function calls properly
-    def process_remaining_intervals(sql_text):
-        """Process INTERVAL expressions that sqlglot partially converted."""
-        result = []
-        i = 0
-        
-        interval_pattern = re.compile(
-            r"\s*([-+])\s*INTERVAL\s+'([0-9.]+)'\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?",
-            re.IGNORECASE
-        )
-        
-        while i < len(sql_text):
-            # Search for INTERVAL starting from position i
-            match = interval_pattern.search(sql_text, i)
-            if not match:
-                result.append(sql_text[i:])
-                break
-            
-            # Found an interval - need to find the base expression before it
-            interval_start = match.start()
-            operator = match.group(1)
-            amount = match.group(2)
-            unit = match.group(3).upper()
-            
-            # Look backward from interval_start to find the base expression
-            # Skip whitespace before the operator
-            expr_end = interval_start
-            while expr_end > i and sql_text[expr_end - 1].isspace():
-                expr_end -= 1
-            
-            # Now find the start of the base expression
-            expr_start = expr_end - 1
-            if expr_start < i:
-                # Can't find base expression, skip this interval
-                result.append(sql_text[i:match.end()])
-                i = match.end()
-                continue
-            
-            # If it ends with ), find the matching opening paren (could be a function)
-            if sql_text[expr_end - 1] == ')':
-                paren_count = 1
-                expr_start = expr_end - 2
-                while expr_start >= i and paren_count > 0:
-                    if sql_text[expr_start] == ')':
-                        paren_count += 1
-                    elif sql_text[expr_start] == '(':
-                        paren_count -= 1
-                    expr_start -= 1
-                expr_start += 1
-                
-                # Check if there's a function name before the opening paren
-                temp = expr_start - 1
-                while temp >= i and sql_text[temp].isspace():
-                    temp -= 1
-                
-                if temp >= i and (sql_text[temp].isalnum() or sql_text[temp] == '_'):
-                    # There's a function name, go back to include it
-                    while temp >= i and (sql_text[temp].isalnum() or sql_text[temp] == '_'):
-                        temp -= 1
-                    expr_start = temp + 1
-            else:
-                # Simple identifier or literal - go back to find its start
-                while expr_start >= i and (sql_text[expr_start].isalnum() or sql_text[expr_start] in ('_', '.', "'", '"')):
-                    expr_start -= 1
-                expr_start += 1
-            
-            # Extract the base expression
-            base_expr = sql_text[expr_start:expr_end].strip()
-            
-            if not base_expr:
-                # Couldn't find base expression, skip
-                result.append(sql_text[i:match.end()])
-                i = match.end()
-                continue
-            
-            # Apply operator to amount
-            amount_val = f"-{amount}" if operator == '-' else amount
-            
-            # Add everything before the base expression
-            result.append(sql_text[i:expr_start])
-            # Add the DATEADD replacement
-            result.append(f"DATEADD({unit}, {amount_val}, {base_expr})")
-            i = match.end()
-        
-        return ''.join(result)
-    
-    sql = process_remaining_intervals(sql)
     
     return sql
 

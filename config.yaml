@@ -48,6 +48,6 @@ skip_files:
 - osteoporose_53530008_ind.pry
 
 skip_folders:
-- proigia_zg_criteria_v3
+#- proigia_zg_criteria_v3
 
 default_zg_agb: 53530000
