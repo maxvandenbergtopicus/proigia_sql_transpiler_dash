@@ -7,6 +7,23 @@ from sqlglot.dialects.snowflake import Snowflake
 
 from crosstabs.crosstabs_new import parse_crosstab_sql
 
+# ---- Timezone Abbreviation to IANA Timezone Mapping ----
+# Snowflake requires IANA timezone names, not abbreviations
+TIMEZONE_ABBREVIATION_MAP = {
+    'CEST': 'Europe/Amsterdam',  # Central European Summer Time
+    'CET': 'Europe/Amsterdam',    # Central European Time
+    'EST': 'America/New_York',    # Eastern Standard Time
+    'EDT': 'America/New_York',    # Eastern Daylight Time
+    'PST': 'America/Los_Angeles', # Pacific Standard Time
+    'PDT': 'America/Los_Angeles', # Pacific Daylight Time
+    'MST': 'America/Denver',      # Mountain Standard Time
+    'MDT': 'America/Denver',      # Mountain Daylight Time
+    'CST': 'America/Chicago',     # Central Standard Time (North America)
+    'CDT': 'America/Chicago',     # Central Daylight Time
+    'UTC': 'UTC',                 # Coordinated Universal Time
+    'GMT': 'UTC',                 # Greenwich Mean Time
+}
+
 # ---- Custom Dialect Definition ----
 class FixedSnowflake(Snowflake):
     class Generator(Snowflake.Generator):
@@ -21,6 +38,7 @@ class FixedSnowflake(Snowflake):
             exp.ArrayOverlaps: lambda self, e: self.arrayoverlaps_sql(e),
             exp.DPipe: lambda self, e: self.dpipe_sql(e),
             exp.Substring: lambda self, e: self.substring_sql(e),
+            exp.AtTimeZone: lambda self, e: self.attimezone_sql(e),
         }
         
         def substring_sql(self, expression: exp.Substring) -> str:
@@ -49,6 +67,29 @@ class FixedSnowflake(Snowflake):
             
             # No start argument - just return value
             return f"SUBSTRING({value})"
+        
+        def attimezone_sql(self, expression: exp.AtTimeZone) -> str:
+            """
+            Convert PostgreSQL AT TIME ZONE to Snowflake CONVERT_TIMEZONE.
+            Maps timezone abbreviations to IANA timezone names.
+            """
+            # Get the timestamp expression and timezone
+            timestamp_expr = self.sql(expression.this)
+            zone = expression.args.get('zone')
+            
+            if zone:
+                # Get the timezone string
+                if isinstance(zone, exp.Literal):
+                    tz_value = zone.this.strip("'\"").upper()
+                    # Map abbreviation to IANA timezone if available
+                    iana_tz = TIMEZONE_ABBREVIATION_MAP.get(tz_value, tz_value)
+                    return f"CONVERT_TIMEZONE('{iana_tz}', {timestamp_expr})"
+                else:
+                    zone_sql = self.sql(zone)
+                    return f"CONVERT_TIMEZONE({zone_sql}, {timestamp_expr})"
+            
+            # No zone specified - fallback
+            return f"CONVERT_TIMEZONE('UTC', {timestamp_expr})"
         
         def cast_sql(self, expression: exp.Cast) -> str:
             """Handle PostgreSQL interval casts for Snowflake compatibility"""
@@ -2002,8 +2043,49 @@ def convert_date_arithmetic_to_snowflake(sql: str) -> str:
     
     sql = process_chained_intervals(sql)
     
-    # Pattern 4 (run LAST): Edge case for integer columns representing months (validtime, loopduur, etc.)
+    # Pattern 4a: Simple date expressions +/- month columns (validtime, loopduur, etc.)
     # Handles: date_expr - table.column or date_expr + table.column
+    # where column is validtime, loopduur, looptijd (integer months)
+    # This must run BEFORE process_month_columns which handles chained DATEADD cases
+    pattern4a = re.compile(
+        r"""
+        (                                           # Group 1: base date expression
+            (?:                                     # Non-capturing group for date expression alternatives
+                '[^']*'::\s*date                    # String literal cast to date: '${peildatum}'::date
+                |                                   # OR
+                \w+(?:\.\w+)?::\s*date              # Column cast to date: column::date or table.column::date
+                |                                   # OR
+                \([^()]+\)::\s*date                 # Parenthesized expression cast to date
+                |                                   # OR
+                COALESCE\s*\([^)]+\)                # COALESCE function call
+                |                                   # OR
+                \w+(?:\.\w+)?                       # Simple column or table.column
+            )
+        )
+        \s*([-+])\s*                                # Group 2: operator (+ or -)
+        (\w+\.)?                                    # Group 3: optional table prefix
+        (validtime|loopduur|looptijd)               # Group 4: column name
+        \b                                          # Word boundary
+        """,
+        re.IGNORECASE | re.VERBOSE
+    )
+    
+    def repl4a(match):
+        base_expr = match.group(1).strip()
+        operator = match.group(2)
+        table_prefix = match.group(3) if match.group(3) else ''
+        column_name = match.group(4)
+        full_column = f"{table_prefix}{column_name}"
+        
+        # Apply operator (subtract means negative value)
+        amount_expr = f"-{full_column}" if operator == '-' else full_column
+        
+        return f"DATEADD(MONTH, {amount_expr}, {base_expr})"
+    
+    sql = pattern4a.sub(repl4a, sql)
+    
+    # Pattern 4b (run LAST): Edge case for integer columns representing months (validtime, loopduur, etc.)
+    # Handles: DATEADD(...) - table.column or DATEADD(...) + table.column
     # where column is validtime, loopduur, looptijd (integer months)
     # This pattern runs after all interval conversions so it can handle DATEADD results
     def process_month_columns(sql_text):

@@ -242,7 +242,7 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
     Example: indelingen.translate_labcode_answers(col::int, val) -> {{ translate_labcode_answers('col::int', 'val') }}
     """
-    logging.info(f"Replacing functions with macros: {function_names}")
+    logging.info(f"Replacing functions with macros")
     def smart_split_args(argstr):
         args = []
         current = ''
