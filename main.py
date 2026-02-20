@@ -11,7 +11,8 @@ def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tab
     """Process all PRY files in a directory (blocks first, then regular files)."""
     ignored_keywords = config.get("ignored_keywords", [])
     skip_files = config.get("skip_files", [])
-    pry_files = find_pry_files(input_path, ignored_keywords, skip_files)
+    skip_folders = config.get("skip_folders", [])
+    pry_files = find_pry_files(input_path, ignored_keywords, skip_files, skip_folders)
     
     logging.info(f"Searching for PRY files in: {input_path}")
     logging.info(f"\nFound {len(pry_files)} PRY files to process\n")
