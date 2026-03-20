@@ -178,6 +178,25 @@ def parse_crosstab_to_macro(sql: str) -> str:
     
     output_section = output_match.group(2).strip()
     
+    # Extract any trailing SELECT after the crosstab column definitions
+    # e.g. "SELECT unique_field[1]::bigint AS patient_id, * FROM pre;"
+    trailing_text = sql[output_match.end():].strip().rstrip(';').strip()
+    if re.match(r'SELECT\b', trailing_text, re.IGNORECASE):
+        # Find the outer CTE name (e.g. "WITH pre AS (") so we can replace it with draaitabel_ct
+        outer_cte_match = re.match(r'^\s*WITH\s+(\w+)\s+AS\s*\(', sql, re.IGNORECASE)
+        if outer_cte_match:
+            outer_cte_name = outer_cte_match.group(1)
+            trailing_text = re.sub(
+                r'\bFROM\s+' + re.escape(outer_cte_name) + r'\b',
+                'FROM draaitabel_ct',
+                trailing_text,
+                flags=re.IGNORECASE
+            )
+        final_select = trailing_text
+        logging.info(f"Detected trailing SELECT after crosstab, using it as final query (replaced CTE ref with draaitabel_ct)")
+    else:
+        final_select = "SELECT * FROM draaitabel_ct"
+
     logging.debug(f"Output section before processing: {output_section[:200]}...")
     
     # Check for Jinja include, macro call, or preserved macro placeholder
@@ -401,17 +420,27 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # Define nested paren pattern to handle expressions with parentheses
     nested_paren = r'((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)'
     
-    # Always wrap the ARRAY_CONSTRUCT with array_to_string
-    pattern = r'ARRAY_CONSTRUCT\s*\(' + nested_paren + r'\)(\s+as\s+(\w+))?'
-    match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
+    # Wrap the ARRAY_CONSTRUCT that corresponds to the values column (array_name) with array_to_string.
+    # Specifically target the one aliased as array_name to avoid wrapping ID-column arrays.
+    pattern_named = r'ARRAY_CONSTRUCT\s*\(' + nested_paren + r'\)\s+as\s+' + re.escape(array_name)
+    match = re.search(pattern_named, modified_query1, re.IGNORECASE | re.DOTALL)
     if match:
         content = match.group(1)
-        alias_part = match.group(2) if match.group(2) else f' as {array_name}'
-        replacement = f"array_to_string(ARRAY_CONSTRUCT({content}), ';'){alias_part}"
+        replacement = f"array_to_string(ARRAY_CONSTRUCT({content}), ';') as {array_name}"
         modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
-        logging.info("Wrapped ARRAY_CONSTRUCT with array_to_string")
+        logging.info(f"Wrapped ARRAY_CONSTRUCT (alias '{array_name}') with array_to_string")
     else:
-        logging.warning("Could not find ARRAY_CONSTRUCT to wrap")
+        # Fallback: wrap the first ARRAY_CONSTRUCT found (single-array queries)
+        pattern = r'ARRAY_CONSTRUCT\s*\(' + nested_paren + r'\)(\s+as\s+(\w+))?'
+        match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
+        if match:
+            content = match.group(1)
+            alias_part = match.group(2) if match.group(2) else f' as {array_name}'
+            replacement = f"array_to_string(ARRAY_CONSTRUCT({content}), ';'){alias_part}"
+            modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
+            logging.info("Wrapped ARRAY_CONSTRUCT with array_to_string (fallback to first match)")
+        else:
+            logging.warning("Could not find ARRAY_CONSTRUCT to wrap")
     
     # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
     if "'" in pivot_key:
@@ -471,7 +500,7 @@ prepare AS (
 -- Call snowflake pivot macro
 {{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}')}}}}
 
-SELECT * FROM draaitabel_ct"""
+{final_select}"""
     else:
         result = f"""-- Prepare CTE from original query
 {macro_variable_declaration}WITH prepare AS (
@@ -480,7 +509,7 @@ SELECT * FROM draaitabel_ct"""
 -- Call snowflake pivot macro
 {{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}')}}}}
 
-SELECT * FROM draaitabel_ct"""
+{final_select}"""
     
     logging.debug("="*80)
     logging.debug("RESULT:")

@@ -27,12 +27,12 @@ TIMEZONE_ABBREVIATION_MAP = {
 # ---- Custom Dialect Definition ----
 class FixedSnowflake(Snowflake):
     class Generator(Snowflake.Generator):
-        # Override TRANSFORMS to handle EXTRACT(YEAR FROM AGE(...)) pattern and ArrayOverlaps
+        # Override TRANSFORMS to handle EXTRACT(YEAR/MONTH FROM AGE(...)) pattern and ArrayOverlaps
         TRANSFORMS = {
             **Snowflake.Generator.TRANSFORMS,
             exp.Extract: lambda self, e: (
-                self.anonymous_sql(e.expression)
-                if e.this and e.this.this == "YEAR" and isinstance(e.expression, exp.Anonymous) and e.expression.this.upper() == "AGE"
+                self.extract_from_age_sql(e)
+                if e.this and e.this.this in ("YEAR", "MONTH", "DAY") and isinstance(e.expression, exp.Anonymous) and e.expression.this.upper() == "AGE"
                 else Snowflake.Generator.TRANSFORMS[exp.Extract](self, e)
             ),
             exp.ArrayOverlaps: lambda self, e: self.arrayoverlaps_sql(e),
@@ -42,7 +42,41 @@ class FixedSnowflake(Snowflake):
             exp.GenerateSeries: lambda self, e: self.generateseries_sql(e),
             exp.GenerateDateArray: lambda self, e: self.generateseries_sql(e),
             exp.GenerateTimestampArray: lambda self, e: self.generateseries_sql(e),
+            # Override CONCAT to avoid sqlglot wrapping args with COALESCE(arg, ''),
+            # which breaks numeric columns. PostgreSQL CONCAT ignores NULLs natively;
+            # in Snowflake we accept the slight NULL behaviour difference.
+            exp.Concat: lambda self, e: f"CONCAT({', '.join(self.sql(arg) for arg in e.expressions)})",
+            # Convert GREATEST to GREATEST_IGNORE_NULLS for Snowflake
+            exp.Greatest: lambda self, e: f"GREATEST_IGNORE_NULLS({', '.join(self.sql(arg) for arg in ([e.this] if e.this else []) + (e.expressions or []))})",
         }
+        
+        def extract_from_age_sql(self, expression: exp.Extract) -> str:
+            """Handle EXTRACT(YEAR/MONTH FROM AGE(...)) conversions"""
+            unit = expression.this.this.upper()
+            age_expr = expression.expression
+            args = age_expr.expressions
+            
+            if unit == "YEAR":
+                # EXTRACT(YEAR FROM AGE(end, start)) -> DATEDIFF(year, start, end)
+                if len(args) == 2:
+                    return f"DATEDIFF(year, {self.sql(args[1])}, {self.sql(args[0])})"
+                elif len(args) == 1:
+                    return f"DATEDIFF(year, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
+            elif unit == "MONTH":
+                # EXTRACT(MONTH FROM AGE(end, start)) -> MOD(DATEDIFF(month, start, end), 12)
+                if len(args) == 2:
+                    return f"DATEDIFF(month, {self.sql(args[1])}, {self.sql(args[0])})"
+                elif len(args) == 1:
+                    return f"DATEDIFF(month, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
+            elif unit == "DAY":
+                # EXTRACT(DAY FROM AGE(end, start)) -> DATEDIFF(day, start, end)
+                if len(args) == 2:
+                    return f"DATEDIFF(day, {self.sql(args[1])}, {self.sql(args[0])})"
+                elif len(args) == 1:
+                    return f"DATEDIFF(day, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
+            
+            # Fallback to default AGE conversion
+            return f"DATEDIFF(month, {self.sql(args[1]) if len(args) == 2 else self.sql(args[0])}, {self.sql(args[0]) if len(args) == 2 else 'CURRENT_TIMESTAMP()'})"
         
         def substring_sql(self, expression: exp.Substring) -> str:
             """Convert PostgreSQL SUBSTRING(value FROM pattern) to Snowflake REGEXP_SUBSTR(value, pattern)"""
@@ -165,64 +199,118 @@ class FixedSnowflake(Snowflake):
             step_expr = (expression.args.get('step') or
                         (expressions_list[2] if len(expressions_list) > 2 else None))
             
-            # Render start and end as SQL strings (post-processing will handle date arithmetic conversion)
-            start = self.sql(start_expr) if start_expr else "0"
-            end = self.sql(end_expr) if end_expr else "0"
+            # Helper function to extract interval value from Cast or Interval expression
+            def extract_interval_info(expr):
+                """Extract (value, unit) from interval expression"""
+                # Check if it's a Cast to INTERVAL type
+                if isinstance(expr, exp.Cast):
+                    if expr.to and expr.to.this == exp.DataType.Type.INTERVAL:
+                        # Extract from the literal: e.g., '2 years' or '1 year'
+                        if isinstance(expr.this, exp.Literal):
+                            literal_value = expr.this.this.strip("'\"")
+                            # Parse "N unit" pattern
+                            match = re.match(r'(\d+)\s+(year|month|week|day|hour|minute|second)s?', literal_value, re.IGNORECASE)
+                            if match:
+                                return (match.group(1), match.group(2).upper())
+                # Check if it's a direct Interval type
+                elif isinstance(expr, exp.Interval):
+                    if expr.this and isinstance(expr.this, exp.Literal):
+                        value = expr.this.this.strip("'\"")
+                        unit = None
+                        if expr.unit:
+                            unit = expr.unit.this if hasattr(expr.unit, 'this') else str(expr.unit)
+                            unit = unit.upper().rstrip('S')
+                        return (value, unit)
+                return (None, None)
             
             # Determine if this is a date/interval series
-            is_interval_step = False
-            step_value = "1"
-            step_unit = None
-            step_sql = None
-            
-            if step_expr:
-                step_sql = self.sql(step_expr)
-                # Check if step is an Interval type OR if rendered SQL contains INTERVAL/CAST patterns
-                if isinstance(step_expr, exp.Interval) or 'INTERVAL' in step_sql.upper() or 'year' in step_sql.lower() or 'month' in step_sql.lower() or 'day' in step_sql.lower():
-                    is_interval_step = True
-                    # Try to extract interval info from rendered step
-                    interval_match = re.search(r"INTERVAL\s+'?(\d+)'?\s+(\w+)|CAST\s*\(\s*'(\d+)\s+(\w+)'|'(\d+)\s+(year|month|week|day|hour|minute|second)", step_sql, re.IGNORECASE)
-                    if interval_match:
-                        step_value = interval_match.group(1) or interval_match.group(3) or interval_match.group(5) or "1"
-                        step_unit = (interval_match.group(2) or interval_match.group(4) or interval_match.group(6) or "DAY").upper().rstrip('S')
-                    elif isinstance(step_expr, exp.Interval):
-                        # Extract from Interval expression object
-                        if step_expr.this and isinstance(step_expr.this, exp.Literal):
-                            step_value = step_expr.this.this.strip("'\"")
-                        if step_expr.unit:
-                            step_unit = step_expr.unit.this if hasattr(step_expr.unit, 'this') else str(step_expr.unit)
-                            step_unit = step_unit.upper().rstrip('S')
+            step_value, step_unit = extract_interval_info(step_expr) if step_expr else (None, None)
+            is_interval_step = step_unit is not None
             
             if is_interval_step and step_unit:
                 # ---- DATE SERIES ----
-                # For date/time sequences, use TABLE(GENERATOR(...)) with DATEADD
-                rowcount = f"DATEDIFF({step_unit}, {start}, {end}) / {step_value} + 1"
-                return (
-                    f"TABLE(GENERATOR(ROWCOUNT => {rowcount})), "
-                    f"LATERAL (SELECT DATEADD({step_unit}, SEQ4() * {step_value}, {start}) AS VALUE)"
-                )
+                # Try to extract static row count from start/end expressions
+                # Pattern: start = base_date - N interval, end = base_date, step = M interval
+                # Result: ROWCOUNT = (N / M) + 1
+                
+                rowcount = None
+                base_start_expr = None
+                offset_value_int = None
+                
+                # Check if start_expr is a subtraction with an interval
+                if isinstance(start_expr, exp.Sub):
+                    base_start_expr = start_expr.this
+                    offset_expr = start_expr.expression
+                    
+                    # Extract interval info from the offset
+                    offset_value, offset_unit = extract_interval_info(offset_expr)
+                    
+                    # Check if the interval unit matches the step unit
+                    if offset_value and offset_unit == step_unit:
+                        try:
+                            offset_value_int = int(offset_value)
+                            step_int = int(step_value)
+                            # Calculate row count: (offset / step) + 1
+                            rowcount = (offset_value_int // step_int) + 1
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                
+                # If we successfully calculated a static rowcount, use it
+                if rowcount is not None and base_start_expr is not None and offset_value_int is not None:
+                    # Use the base expression (without the offset) as the actual start
+                    # and adjust using SEQ4() starting from negative offset
+                    base_start = self.sql(base_start_expr)
+                    
+                    return (
+                        f"TABLE(GENERATOR(ROWCOUNT => {rowcount})), "
+                        f"LATERAL (SELECT DATEADD({step_unit}, -{offset_value_int} + (SEQ4() * {step_value}), {base_start}) AS VALUE)"
+                    )
+                else:
+                    # Fallback: Use dynamic DATEDIFF (may fail if not constant in Snowflake)
+                    # Render start and end as SQL strings
+                    start = self.sql(start_expr) if start_expr else "0"
+                    end = self.sql(end_expr) if end_expr else "0"
+                    rowcount_expr = f"DATEDIFF({step_unit}, {start}, {end}) / {step_value} + 1"
+                    return (
+                        f"TABLE(GENERATOR(ROWCOUNT => {rowcount_expr})), "
+                        f"LATERAL (SELECT DATEADD({step_unit}, SEQ4() * {step_value}, {start}) AS VALUE)"
+                    )
             else:
                 # ---- NUMERIC SERIES ----
                 # For numeric sequences, generate ARRAY_GENERATE_RANGE
                 # Post-processing will convert this to TABLE(FLATTEN(...)) for proper row generation
-                step_sql = step_sql if step_sql else "1"
+                start = self.sql(start_expr) if start_expr else "0"
+                end = self.sql(end_expr) if end_expr else "0"
+                step_sql = self.sql(step_expr) if step_expr else "1"
                 # ARRAY_GENERATE_RANGE(start, stop, step) - stop is exclusive, so add step to end
                 return f"ARRAY_GENERATE_RANGE({start}, ({end}) + ({step_sql}), {step_sql})"
         
         def anonymous_sql(self, expression: exp.Anonymous) -> str:
-            """Handle AGE function conversion to DATEDIFF"""
+            """Handle function conversions (AGE, ARRAYS_OVERLAP, ARRAY_POSITION, CHAR_LENGTH)"""
             if expression.this.upper() == "AGE":
                 args = expression.expressions
                 if len(args) == 2:
-                    # AGE(end, start) -> DATEDIFF(year, start, end)
+                    # AGE(end, start) -> DATEDIFF(month, start, end) for better precision
                     return f"DATEDIFF(year, {self.sql(args[1])}, {self.sql(args[0])})"
                 elif len(args) == 1:
-                    # AGE(timestamp) -> DATEDIFF(year, timestamp, CURRENT_TIMESTAMP())
+                    # AGE(timestamp) -> DATEDIFF(month, timestamp, CURRENT_TIMESTAMP())
                     return f"DATEDIFF(year, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
             
             if expression.this.upper() == "ARRAYS_OVERLAP":
                 args = expression.expressions
                 return f"ARRAYS_OVERLAP({self.sql(args[0])}, {self.sql(args[1])})"
+            
+            if expression.this.upper() == "ARRAY_POSITION":
+                args = expression.expressions
+                if len(args) == 2:
+                    # PostgreSQL: ARRAY_POSITION(array, value) -> Snowflake: ARRAY_POSITION(value, array)
+                    return f"ARRAY_POSITION({self.sql(args[1])}, {self.sql(args[0])})"
+            
+            if expression.this.upper() == "CHAR_LENGTH":
+                args = expression.expressions
+                if len(args) == 1:
+                    # PostgreSQL: CHAR_LENGTH(string) -> Snowflake: LENGTH(string)
+                    return f"LENGTH({self.sql(args[0])})"
             
             # For other anonymous functions, use default behavior
             return super().anonymous_sql(expression)
@@ -703,7 +791,7 @@ def convert_any_to_snowflake_post(sql: str) -> str:
         ('!=', lambda l, a: f"EXISTS (SELECT 1 FROM TABLE(FLATTEN(input => {a})) f WHERE {l} != f.value)"),
         ('>', lambda l, a: f"COALESCE(ARRAY_MIN({a}) < {l}, FALSE)"),
         ('<', lambda l, a: f"COALESCE(ARRAY_MAX({a}) > {l}, FALSE)"),
-        ('=', lambda l, a: f"ARRAY_CONTAINS({l}, {a})"),
+        ('=', lambda l, a: f"ARRAY_CONTAINS(TO_VARIANT({l}), {a})"),
     ]
     
     for op, replacement_func in operators:
@@ -811,118 +899,32 @@ def convert_postgres_escape_strings(sql: str) -> str:
     
     return ''.join(result)
 
-def convert_join_like_any_to_lateral_flatten(sql: str) -> str:
-    """Convert JOIN table ON col LIKE ANY(array) to Snowflake LATERAL FLATTEN syntax.
+def convert_join_like_any_to_array_to_string(sql: str) -> str:
+    """Convert JOIN table ON col LIKE ANY(array) to use ARRAY_TO_STRING.
     
-    Snowflake doesn't support ON clause with LATERAL FLATTEN, so we convert:
-    JOIN table ON col LIKE ANY(array) AND other_conditions
+    Snowflake supports LIKE ANY with ARRAY_TO_STRING:
+    JOIN table ON col LIKE ANY(array_column)
     
-    To:
-    CROSS JOIN table, LATERAL FLATTEN(input => array) AS f
-    WHERE col LIKE f.value AND other_conditions
+    Becomes:
+    JOIN table ON col LIKE ANY ARRAY_TO_STRING(array_column, ',')
     
-    Handles LEFT/RIGHT/INNER JOIN types as well.
+    Handles LEFT/RIGHT/INNER JOIN types and AND conditions.
     """
     # Pattern to match [LEFT|RIGHT|INNER] JOIN ... ON ... LIKE ANY (...)
-    # Captures the join type (if any) separately
     pattern = re.compile(
-        r'(LEFT|RIGHT|INNER)?\s*JOIN\s+([\w\{\}\.\'\']+(?:\s+(?:AS\s+)?\w+)?)\s+ON\s+([\w\.]+)\s+(LIKE|ILIKE)\s+ANY\s*\(\s*([^\)]+?)\s*\)(.*?)(?=\s*(?:UNION|FROM|WHERE|GROUP|ORDER|JOIN|$))',
-        re.IGNORECASE | re.DOTALL
+        r'(\b(?:LEFT|RIGHT|INNER)?\s*JOIN\s+[\w\{\}\.\'\']+(?:\s+(?:AS\s+)?\w+)?\s+ON\s+[\w\.]+\s+(?:LIKE|ILIKE)\s+ANY\s*\(\s*)([^\)]+?)(\s*\))',
+        re.IGNORECASE
     )
     
     def replace_join(match):
-        join_type = match.group(1)  # LEFT, RIGHT, INNER, or None
-        table_ref = match.group(2).strip()
-        column_ref = match.group(3).strip()
-        like_op = match.group(4).upper()
-        array_ref = match.group(5).strip()
-        trailing = match.group(6) if match.group(6) else ""
+        prefix = match.group(1)  # Everything up to and including "ANY("
+        array_ref = match.group(2).strip()
+        suffix = match.group(3)  # Closing paren
         
-        # Extract AND conditions from trailing text
-        and_conditions = ""
-        if trailing.strip():
-            # Look for AND at the start of trailing text
-            and_match = re.match(r'\s*AND\s+(.+)', trailing, re.DOTALL | re.IGNORECASE)
-            if and_match:
-                and_conditions = and_match.group(1).strip()
-                trailing = ""  # Consumed the AND part
-        
-        # Build replacement based on join type
-        if join_type:
-            # For LEFT/RIGHT/INNER JOIN, preserve the join type
-            join_prefix = join_type.upper()
-            result = f" {join_prefix} JOIN {table_ref}, LATERAL FLATTEN(input => {array_ref}) AS f{trailing}"
-        else:
-            # For simple JOIN, use CROSS JOIN
-            result = f" CROSS JOIN {table_ref}, LATERAL FLATTEN(input => {array_ref}) AS f{trailing}"
-        
-        # Mark WHERE condition for injection
-        where_cond = f"{column_ref} {like_op} f.value"
-        if and_conditions:
-            where_cond += f"\n    AND {and_conditions}"
-        result += f" /*WHERE:{where_cond}*/"
-        
-        return result
+        # Wrap the array reference with ARRAY_TO_STRING
+        return f"{prefix}ARRAY_TO_STRING({array_ref}, ','){suffix}"
     
-    # Replace all JOIN patterns
-    sql = pattern.sub(replace_join, sql)
-    
-    # Now inject WHERE clauses - find each /*WHERE:...*/ and inject before next clause keyword
-    while True:
-        marker_match = re.search(r'/\*WHERE:(.*?)\*/', sql, re.DOTALL)
-        if not marker_match:
-            break
-            
-        where_condition = marker_match.group(1).strip()
-        marker_start = marker_match.start()
-        marker_end = marker_match.end()
-        
-        # Find the insertion point: before closing paren (subquery), UNION, JOIN, GROUP, ORDER, etc.
-        after_marker = sql[marker_end:]
-        
-        # Check for closing parenthesis (end of subquery) - this is highest priority
-        next_close_paren = re.search(r'\s*\)', after_marker)
-        # Check for JOIN
-        next_join = re.search(r'\s+((?:LEFT|RIGHT|INNER|CROSS)?\s*JOIN)\s+', after_marker, re.IGNORECASE)
-        # Check for other clause keywords
-        next_clause = re.search(r'\s+(\bUNION\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b)', after_marker, re.IGNORECASE)
-        
-        # Determine insertion point (use the nearest one)
-        candidates = []
-        if next_close_paren:
-            candidates.append(next_close_paren.start())
-        if next_join:
-            candidates.append(next_join.start())
-        if next_clause:
-            candidates.append(next_clause.start())
-        
-        if candidates:
-            insert_pos = marker_end + min(candidates)
-        else:
-            # No keywords found, insert at end of line or before semicolon
-            eol = re.search(r'(;|\n\s*$|$)', after_marker)
-            if eol:
-                insert_pos = marker_end + eol.start()
-            else:
-                insert_pos = len(sql)
-        
-        if insert_pos:
-            section_to_check = sql[marker_end:insert_pos]
-            
-            # Check if there's already a WHERE clause in this section
-            existing_where = re.search(r'\bWHERE\b', section_to_check, re.IGNORECASE)
-            
-            if existing_where:
-                # There's already a WHERE, append with AND instead
-                sql = sql[:marker_start] + sql[marker_end:insert_pos] + f"\n  AND {where_condition}" + sql[insert_pos:]
-            else:
-                # No WHERE yet, add new WHERE clause
-                sql = sql[:marker_start] + sql[marker_end:insert_pos] + f"\n  WHERE {where_condition}" + sql[insert_pos:]
-        else:
-            # Just remove marker
-            sql = sql[:marker_start] + sql[marker_end:]
-    
-    return sql
+    return pattern.sub(replace_join, sql)
 
 
 def remove_date_part_day(sql: str) -> str:
@@ -1215,6 +1217,80 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
             break
     
     # ============================================================================
+    # STEP 1c: Handle compound intervals (e.g., '3 months 1 day')
+    # ============================================================================
+    # Pattern: CAST('N unit1 M unit2 ...' AS INTERVAL) or '...'::interval
+    # Convert to nested DATEADD: DATEADD(unit2, -M, DATEADD(unit1, -N, date))
+    # NOTE: Only match intervals with 2+ units (compound intervals)
+    
+    compound_interval_pattern = re.compile(
+        r"CAST\s*\(\s*'(\d+\s+(?:year|month|week|day|hour|minute|second)s?(?:\s+\d+\s+(?:year|month|week|day|hour|minute|second)s?)+)'\s+AS\s+INTERVAL\s*\)|"
+        r"'(\d+\s+(?:year|month|week|day|hour|minute|second)s?(?:\s+\d+\s+(?:year|month|week|day|hour|minute|second)s?)+)'::\s*interval",
+        re.IGNORECASE
+    )
+    
+    max_compound_iterations = 10
+    for iteration in range(max_compound_iterations):
+        original_sql = sql
+        
+        matches = list(compound_interval_pattern.finditer(sql))
+        if not matches:
+            break
+        
+        # Process in reverse order to preserve positions
+        for match in reversed(matches):
+            interval_str = match.group(1) or match.group(2)
+            interval_start = match.start()
+            interval_end = match.end()
+            
+            # Parse the compound interval into components
+            # Match all "N unit" pairs
+            component_pattern = re.compile(r'(\d+)\s+(year|month|week|day|hour|minute|second)s?', re.IGNORECASE)
+            components = component_pattern.findall(interval_str)
+            
+            if not components:
+                continue
+            
+            # Find the operator before the interval (+ or -)
+            search_pos = interval_start - 1
+            while search_pos >= 0 and sql[search_pos].isspace():
+                search_pos -= 1
+            
+            if search_pos < 0 or sql[search_pos] not in ('+', '-'):
+                continue
+            
+            operator = sql[search_pos]
+            
+            # Find the date expression before the operator
+            expr_end = search_pos
+            while expr_end > 0 and sql[expr_end - 1].isspace():
+                expr_end -= 1
+            
+            expr_start = find_date_expression_start(sql, expr_end)
+            if expr_start is None or expr_start >= expr_end:
+                continue
+            
+            date_expr = sql[expr_start:expr_end].strip()
+            if not date_expr:
+                continue
+            
+            # Build nested DATEADD calls
+            # Start from innermost (first component) and work outward
+            result_expr = date_expr
+            for amount, unit in components:
+                unit = unit.upper().rstrip('S')
+                if operator == '-':
+                    result_expr = f"DATEADD({unit}, -{amount}, {result_expr})"
+                else:
+                    result_expr = f"DATEADD({unit}, {amount}, {result_expr})"
+            
+            # Replace in SQL
+            sql = sql[:expr_start] + result_expr + sql[interval_end:]
+        
+        if sql == original_sql:
+            break
+    
+    # ============================================================================
     # STEP 2: Standard interval processing
     # ============================================================================
     
@@ -1242,22 +1318,25 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
         return text[start_pos:end_pos], end_pos
     
     # Pattern for INTERVAL formats that may appear:
-    # 1. INTERVAL 'N' UNIT or INTERVAL N UNIT (SQLglot clean format)
-    # 2. CAST('N unit' AS INTERVAL) (SQLglot fallback format)
+    # 1. INTERVAL 'N UNIT' or INTERVAL N UNIT (SQLglot clean format)
+    # 2. CAST('N unit' AS INTERVAL) (SQLglot outputs '3 years' as a single string)
     # 3. 'N unit'::interval (Original PostgreSQL format when SQLglot fails)
     interval_pattern = re.compile(
-        r"(?:INTERVAL\s+'?([0-9.]+)'?\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?|"
-        r"CAST\s*\(\s*'([0-9.]+)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?'\s+AS\s+INTERVAL\s*\)|"
+        r"(?:INTERVAL\s+'([0-9.]+)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?'|"
+        r"INTERVAL\s+([0-9.]+)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?|"
+        r"CAST\s*\(\s*'([0-9.]+)\s+(years?|months?|weeks?|days?|hours?|minutes?|seconds?)'\s+AS\s+INTERVAL\s*\)|"
         r"'([0-9.]+)\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)S?'::\s*interval)",
         re.IGNORECASE
     )
+
     
     # Main conversion loop - process the SQL iteratively
-    max_iterations = 10  # Prevent infinite loops
+    max_iterations = 500  # Increased to handle very large SQL files with many intervals
     for iteration in range(max_iterations):
         original_sql = sql
         result = []
         i = 0
+
         
         while i < len(sql):
             # Look for interval pattern
@@ -1273,15 +1352,18 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
             interval_end = interval_match.end()
             
             # Extract amount and unit from whichever pattern matched
-            if interval_match.group(1):  # INTERVAL 'N' UNIT format
+            if interval_match.group(1):  # INTERVAL 'N UNIT' format (with quotes)
                 amount = interval_match.group(1)
-                unit = interval_match.group(2).upper()
-            elif interval_match.group(3):  # CAST('N unit' AS INTERVAL) format
+                unit = interval_match.group(2).upper().rstrip('S')
+            elif interval_match.group(3):  # INTERVAL N UNIT format (without quotes)
                 amount = interval_match.group(3)
-                unit = interval_match.group(4).upper()
-            else:  # 'N unit'::interval format (PostgreSQL original)
+                unit = interval_match.group(4).upper().rstrip('S')
+            elif interval_match.group(5):  # CAST('N unit' AS INTERVAL) format
                 amount = interval_match.group(5)
-                unit = interval_match.group(6).upper()
+                unit = interval_match.group(6).upper().rstrip('S')
+            else:  # 'N unit'::interval format (PostgreSQL original)
+                amount = interval_match.group(7)
+                unit = interval_match.group(8).upper().rstrip('S')
             
             # Find the operator before the interval (+ or -)
             # Walk backward from interval_start to find the operator
@@ -1367,13 +1449,21 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
             result.append(sql[i:expr_start])
             # Add the DATEADD replacement
             result.append(dateadd_expr)
-            i = interval_end
+            # Add everything after the interval
+            result.append(sql[interval_end:])
+            
+            # Break to rebuild SQL and restart
+            break
         
         sql = ''.join(result)
         
         # If no changes were made, we're done
         if sql == original_sql:
+            logging.debug(f"[Date Arithmetic] No more intervals to convert after {iteration} iterations")
             break
+    else:
+        # Loop completed without break - hit max iterations
+        logging.warning(f"[Date Arithmetic] Hit max_iterations ({max_iterations}) - some intervals may remain unconverted")
     
     # Second pass: Handle expr * interval'N unit' patterns  
     # Find all occurrences of "* interval'" and work backwards to get the expression
@@ -1742,6 +1832,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     month_columns = ['validtime']  # Configure which columns represent months
     converted = postprocess_date_arithmetic_snowflake(converted, month_columns=month_columns)
     
+    # Post-process: Convert remaining ::type casts to CAST(expression AS type) (handles cases when sqlglot fails)
+    if '::' in converted:
+        logging.info("Converting remaining ::type casts to CAST(expression AS type)")
+        converted = convert_postgres_cast_to_standard_cast(converted)
+
     # Post-process: Fix incorrect FLATTEN column qualifiers
     if 'TABLE(FLATTEN(INPUT =>' in converted.upper():
         logging.info("Fixing incorrect table alias prefixes in FLATTEN subqueries")
@@ -1766,6 +1861,16 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
     if '&&' in converted:
         logging.info("Converting remaining && to ARRAYS_OVERLAP")
         converted = convert_array_overlap_to_snowflake(converted)
+    
+    # Post-process: Convert char_length to LENGTH
+    if 'char_length(' in converted.lower():
+        logging.info("Converting CHAR_LENGTH to LENGTH")
+        converted = re.sub(
+            r'\bchar_length\s*\(',
+            r'LENGTH(',
+            converted,
+            flags=re.IGNORECASE
+        )
     
     # Post-process: Convert EXTRACT(ISODOW FROM ...) and DATE_PART(ISODOW, ...) to DAYOFWEEKISO(...)
     if 'ISODOW' in converted.upper():
@@ -1798,6 +1903,16 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         logging.info("Simplifying overly complex UNNEST/EXPLODE patterns")
         converted = simplify_unnest_flatten(converted)
     
+    # Post-process: Fix sqlglot misplacement of NOT in "col op NOT expr IS NULL".
+    # sqlglot converts "(a >= b) IS NOT NULL" to "a >= NOT b IS NULL" (missing parens).
+    # Correct form is "NOT (a >= b) IS NULL".
+    converted = re.sub(
+        r'(\w+)\s*(>=|<=|>|<|=|<>|!=)\s*NOT\s+(\w+)\s+IS\s+NULL',
+        r'(\1 \2 \3) IS NOT NULL',
+        converted,
+        flags=re.IGNORECASE
+    )
+
     # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
     converted = re.sub(
         r"ARRAY_AGG\(\s*IFF\(\s*NOT\s+([a-zA-Z0-9_]+)\s+IS\s+NULL\s*,\s*DISTINCT\s+\1\s*,\s*NULL\s*\)\s*\)",
@@ -1862,12 +1977,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         logging.info("Converting SIMILAR TO to RLIKE (post-processing)")
         converted = convert_similar_to_to_rlike(converted)
 
-    # Post-process: Convert remaining ::type casts to CAST(expression AS type) (handles cases when sqlglot fails)
-    if '::' in converted:
-        logging.info("Converting remaining ::type casts to CAST(expression AS type)")
-        converted = convert_postgres_cast_to_standard_cast(converted)
 
-    # Post-process: Convert LIKE/ILIKE ANY(ARRAY_CONSTRUCT(...)) to LIKE/ILIKE ANY('...', ...)
+
+    # Post-process: Convert LIKE/ILIKE ANY(ARRAY_CONSTRUCT(...)) to LIKE/ILIKE ANY(...)
+    # Snowflake supports ILIKE ANY with comma-separated values directly
+    # Just need to remove the ARRAY_CONSTRUCT wrapper
     def like_any_array_construct_repl(match):
         like_op = match.group(1).upper()  # LIKE or ILIKE
         args = match.group(2)
@@ -1885,6 +1999,7 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         converted,
         flags=re.IGNORECASE | re.DOTALL
     )
+
 
     # Post-process: Convert LIKE/ILIKE ANY(column1 || column2 || ...) to LIKE/ILIKE ANY(ARRAY_CONCAT(SPLIT(column1, ','), SPLIT(column2, ','), ...))
     def like_any_concat_repl(match):
@@ -1906,28 +2021,52 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         flags=re.IGNORECASE
     )
 
+    # Post-process: Convert LIKE/ILIKE ANY((SELECT column FROM ...)) to LIKE/ILIKE ANY((SELECT ARRAY_TO_STRING(column, ',')))
+    def like_any_select_repl(match):
+        like_op = match.group(1).upper()  # LIKE or ILIKE
+        column = match.group(2).strip()
+        rest_of_query = match.group(3).strip()
+        # Normalize whitespace in the rest of the query for better formatting
+        rest_of_query = ' '.join(rest_of_query.split())
+        return f"{like_op} ANY ((SELECT ARRAY_TO_STRING({column}, ',') {rest_of_query}))"
+
+    converted = re.sub(
+        r"(I?LIKE)\s+ANY\s*\(\s*\(\s*SELECT\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(FROM\s+.*?)\)\s*\)",
+        like_any_select_repl,
+        converted,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # Post-process: Convert JOIN table ON col LIKE ANY(array) to use ARRAY_TO_STRING
+    # This MUST run BEFORE like_any_column_repl to avoid double-wrapping
+    if re.search(r'JOIN\s+.*\s+ON\s+.*\s+(LIKE|ILIKE)\s+ANY\s*\(', converted, re.IGNORECASE | re.DOTALL):
+        logging.info("Converting JOIN ... ON ... LIKE ANY(array) to ARRAY_TO_STRING wrapper")
+        converted = convert_join_like_any_to_array_to_string(converted)
+
     # Post-process: Convert LIKE/ILIKE ANY(column) to LIKE/ILIKE ANY(ARRAY_TO_STRING(column, ','))
+    # Skip if already wrapped with ARRAY_TO_STRING
     def like_any_column_repl(match):
         like_op = match.group(1).upper()  # LIKE or ILIKE
         column = match.group(2)
         return f"{like_op} ANY(ARRAY_TO_STRING({column}, ','))"
 
     converted = re.sub(
-        r"(I?LIKE)\s+ANY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)",
+        r"(I?LIKE)\s+ANY\s*\(\s*(?!ARRAY_TO_STRING)([a-zA-Z_][a-zA-Z0-9_\.]*)\s*\)",
         like_any_column_repl,
         converted,
         flags=re.IGNORECASE
     )
 
-    # Post-process: Convert ARRAY_AGG(IFF(..., expr ORDER BY ..., NULL)) to ARRAY_AGG(IFF(..., expr, NULL)) WITHIN GROUP(ORDER BY ...)
+    # Post-process: Convert ARRAY_AGG([DISTINCT] IFF(..., expr ORDER BY ..., NULL)) to ARRAY_AGG([DISTINCT] IFF(..., expr, NULL)) WITHIN GROUP(ORDER BY ...)
     def array_agg_iff_orderby_repl(match):
-        condition = match.group(1)
-        expr = match.group(2)
-        orderby = match.group(3)
-        return f"ARRAY_AGG(\n  IFF(\n    {condition},\n    {expr},\n    NULL\n  )\n) WITHIN GROUP(ORDER BY {orderby})"
+        distinct = match.group(1).strip() + ' ' if match.group(1) else ''
+        condition = match.group(2).strip()
+        expr = match.group(3).strip()
+        orderby = match.group(4).strip()
+        return f"ARRAY_AGG({distinct}IFF({condition}, {expr}, NULL)) WITHIN GROUP (ORDER BY {orderby})"
 
     converted = re.sub(
-        r"ARRAY_AGG\(\s*IFF\(\s*(.*?),\s*(.*?)\s+ORDER\s+BY\s+(.*?),\s*NULL\s*\)\s*\)",
+        r"ARRAY_AGG\(\s*(DISTINCT\s+)?IFF\(\s*(.*?),\s*(.*?)\s+ORDER\s+BY\s+(.*?),\s*NULL\s*\)\s*\)",
         array_agg_iff_orderby_repl,
         converted,
         flags=re.IGNORECASE | re.DOTALL
@@ -1954,12 +2093,99 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None) -> str
         flags=re.IGNORECASE | re.DOTALL
     )
 
-    # Post-process: Convert JOIN table ON col LIKE ANY(array) to LATERAL FLATTEN
-    if re.search(r'JOIN\s+.*\s+ON\s+.*\s+(LIKE|ILIKE)\s+ANY\s*\(', converted, re.IGNORECASE | re.DOTALL):
-        logging.info("Converting JOIN ... ON ... LIKE ANY(array) to LATERAL FLATTEN")
-        converted = convert_join_like_any_to_lateral_flatten(converted)
+    # Post-process: Wrap ARRAY_AGG(...) with NULLIF(..., []) to match PostgreSQL NULL semantics.
+    # In PostgreSQL, ARRAY_AGG returns NULL for empty sets; in Snowflake it returns [].
+    if 'ARRAY_AGG(' in converted.upper():
+        logging.info("Wrapping ARRAY_AGG with NULLIF to match PostgreSQL NULL semantics")
+        converted = wrap_array_agg_with_nullif(converted)
 
     return converted
+
+def wrap_array_agg_with_nullif(sql: str) -> str:
+    """
+    Wrap ARRAY_AGG(...) with NULLIF(..., []) to match PostgreSQL NULL semantics.
+    In PostgreSQL, ARRAY_AGG returns NULL for empty input rows; in Snowflake it returns [].
+    NULLIF(ARRAY_AGG(...), []) restores that NULL-on-empty behavior.
+
+    Also handles ARRAY_AGG(...) WITHIN GROUP (ORDER BY ...) as a single unit.
+    Skips any ARRAY_AGG that is already the direct argument of NULLIF.
+    """
+    result = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        m = re.match(r'ARRAY_AGG\s*\(', sql[i:], re.IGNORECASE)
+        if not m:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        # Skip if already wrapped in NULLIF(
+        prefix = ''.join(result).rstrip()
+        if prefix.upper().endswith('NULLIF('):
+            result.append(sql[i])
+            i += 1
+            continue
+
+        # Find the closing ) of ARRAY_AGG using balanced paren matching
+        paren_start = i + m.end() - 1  # position of opening (
+        depth = 1
+        j = paren_start + 1
+        in_str = False
+        str_char = ''
+        while j < n and depth > 0:
+            ch = sql[j]
+            if in_str:
+                if ch == str_char and (j == 0 or sql[j - 1] != '\\'):
+                    in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            j += 1
+
+        if depth != 0:
+            # Unbalanced - leave as-is
+            result.append(sql[i])
+            i += 1
+            continue
+
+        # j is now one past the closing )
+        agg_expr = sql[i:j]
+
+        # Also consume WITHIN GROUP (ORDER BY ...) if present
+        within_m = re.match(r'\s+WITHIN\s+GROUP\s*\(', sql[j:], re.IGNORECASE)
+        if within_m:
+            k = j + within_m.end() - 1  # position of the opening ( of WITHIN GROUP
+            depth2 = 1
+            k2 = k + 1
+            in_str2 = False
+            str_char2 = ''
+            while k2 < n and depth2 > 0:
+                ch = sql[k2]
+                if in_str2:
+                    if ch == str_char2 and (k2 == 0 or sql[k2 - 1] != '\\'):
+                        in_str2 = False
+                elif ch in ("'", '"'):
+                    in_str2 = True
+                    str_char2 = ch
+                elif ch == '(':
+                    depth2 += 1
+                elif ch == ')':
+                    depth2 -= 1
+                k2 += 1
+            agg_expr = sql[i:k2]
+            j = k2
+
+        result.append(f"NULLIF({agg_expr}, [])")
+        i = j
+
+    return ''.join(result)
+
 
 def convert_similar_to_to_rlike(sql: str) -> str:
     """
@@ -2011,7 +2237,8 @@ def convert_postgres_cast_to_standard_cast(sql: str) -> str:
         'value'::date → CAST('value' AS DATE)
         column[3]::numeric → CAST(column[3] AS NUMERIC)
         (expression)::type → CAST((expression) AS type)
-        '3 months'::interval → CAST('3 months' AS INTERVAL)
+    
+    SKIPS ::interval casts - these are handled exclusively by postprocess_date_arithmetic_snowflake
     
     The function walks backwards from :: to find the start of the expression, handling:
     - String literals: 'value'
@@ -2020,38 +2247,33 @@ def convert_postgres_cast_to_standard_cast(sql: str) -> str:
     - Function calls: func(...)
     - Column names: column_name
     """
-    result = []
-    i = 0
+    # Use regex to replace expr::type with CAST(expr AS type)
+    # Handles nested parentheses, array access, string literals, identifiers
+    def cast_repl(match):
+        expr = match.group(1)
+        typ = match.group(2)
+        # Skip interval casts - let date arithmetic processing handle them
+        if typ.upper() == 'INTERVAL':
+            return match.group(0)  # Return original unchanged
+        return f"CAST({expr} AS {typ.upper()})"
+
+    # Pattern components:
+    # - Quoted strings: '[^']*' or "[^"]*"
+    # - Function calls: IDENTIFIER(...) - handled with balanced parentheses
+    # - Array access: identifier[...]
+    # - Simple identifiers: identifier or schema.table.column
+    # Type pattern: alphanumeric/underscore only (no spaces), optionally followed by (precision)
     
-    while i < len(sql):
-        # Look for :: cast operator
-        if i < len(sql) - 1 and sql[i:i+2] == '::':
-            # Find the expression before ::
-            expr_end = i
-            expr_start = find_expression_start(sql, expr_end)
-            
-            # Find the type after ::
-            type_start = i + 2
-            type_end = find_type_end(sql, type_start)
-            
-            if expr_start >= 0 and type_end > type_start:
-                # Extract expression and type
-                expression = sql[expr_start:expr_end].strip()
-                data_type = sql[type_start:type_end].strip()
-                
-                # Remove any already processed part from result up to expr_start
-                # Add the CAST(...) replacement
-                cast_expr = f"CAST({expression} AS {data_type.upper()})"
-                result.append(cast_expr)
-                
-                # Skip to the end of the type
-                i = type_end
-                continue
-        
-        result.append(sql[i])
-        i += 1
+    # First, match function calls with their arguments (including nested parens)
+    # Pattern: function_name(args)::type
+    pattern_func = re.compile(r"([a-zA-Z_][\w\.]*\s*\([^()]*(?:\([^()]*\)[^()]*)*\))\s*::\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\([^)]+\))?)(?=\s*(?:[,/\*\+\-<>=!]|END\b|AS\b|AND\b|OR\b|\)|$))", re.IGNORECASE)
+    sql = pattern_func.sub(cast_repl, sql)
     
-    return ''.join(result)
+    # Then, match other patterns (quoted strings, simple parenthesis, array access, identifiers)
+    pattern_other = re.compile(r"((?:'[^']*'|\"[^\"]*\"|\([^()]+\)|[a-zA-Z_][\w\.]*\[[^\]]+\]|[a-zA-Z_][\w\.]+))\s*::\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\([^)]+\))?)(?=\s*(?:[,/\*\+\-<>=!]|END\b|AS\b|AND\b|OR\b|\)|$))", re.IGNORECASE)
+    sql = pattern_other.sub(cast_repl, sql)
+    
+    return sql
 
 
 def find_expression_start(sql: str, end_pos: int) -> int:
@@ -2486,26 +2708,65 @@ def convert_lateral_unnest_to_snowflake(sql: str) -> str:
     CROSS JOIN LATERAL FLATTEN(input => column_name) AS table_alias
     And replace table_alias.column_alias with table_alias.value
     """
-    # Find all matches and collect mappings before modifying
-    pattern = re.compile(
-        r'CROSS\s+JOIN\s+LATERAL\s+unnest\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)',
+    # Helper function to extract the unnest argument handling nested parentheses
+    def extract_unnest_arg(sql_text, start_pos):
+        """Extract the argument from unnest(...) handling nested parentheses"""
+        depth = 1
+        i = start_pos
+        while i < len(sql_text) and depth > 0:
+            if sql_text[i] == '(':
+                depth += 1
+            elif sql_text[i] == ')':
+                depth -= 1
+            i += 1
+        return sql_text[start_pos:i-1].strip()
+    
+    # Find all CROSS JOIN LATERAL unnest patterns
+    mappings = []
+    result = sql
+    
+    # Pattern to find CROSS JOIN LATERAL unnest
+    simple_pattern = re.compile(
+        r'CROSS\s+JOIN\s+LATERAL\s+unnest\s*\(',
         re.IGNORECASE
     )
-    mappings = []
-    for match in pattern.finditer(sql):
-        table_alias = match.group(2)
-        column_alias = match.group(3)
-        mappings.append((table_alias, column_alias))
-
-    # Replace the unnest patterns with FLATTEN
-    sql = pattern.sub(lambda m: f"CROSS JOIN LATERAL FLATTEN(input => {m.group(1)}) AS {m.group(2)}", sql)
-
+    
+    offset = 0
+    while True:
+        match = simple_pattern.search(result, offset)
+        if not match:
+            break
+        
+        # Extract the unnest argument (handling nested parentheses)
+        unnest_arg_start = match.end()
+        unnest_arg = extract_unnest_arg(result, unnest_arg_start)
+        unnest_end = unnest_arg_start + len(unnest_arg) + 1  # +1 for closing paren
+        
+        # Now look for AS table_alias(column_alias) after the unnest
+        as_pattern = re.compile(
+            r'\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)',
+            re.IGNORECASE
+        )
+        as_match = as_pattern.match(result, unnest_end)
+        
+        if as_match:
+            table_alias = as_match.group(1)
+            column_alias = as_match.group(2)
+            mappings.append((table_alias, column_alias))
+            
+            # Replace this occurrence with FLATTEN
+            replacement = f"CROSS JOIN LATERAL FLATTEN(INPUT => {unnest_arg}) AS {table_alias}"
+            result = result[:match.start()] + replacement + result[as_match.end():]
+            offset = match.start() + len(replacement)
+        else:
+            offset = match.end()
+    
     # Replace all table_alias.column_alias with table_alias.value
     for table_alias, column_alias in mappings:
         # Use regex to avoid partial matches
-        sql = re.sub(rf'\b{re.escape(table_alias)}\.{re.escape(column_alias)}\b', f'{table_alias}.value', sql)
+        result = re.sub(rf'\b{re.escape(table_alias)}\.{re.escape(column_alias)}\b', f'{table_alias}.value', result)
 
-    return sql
+    return result
 
 def convert_array_to_array_construct(sql: str) -> str:
     """
@@ -2652,44 +2913,74 @@ def convert_array_generate_range_to_flatten(sql: str) -> str:
 
 def convert_max_array_to_array_agg(sql: str) -> str:
     """
-    Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ELSE NULL END) to ARRAY_AGG with WITHIN GROUP.
-    Snowflake doesn't support MAX() on arrays, so we need to use ARRAY_AGG with ordering.
-    
+    Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ELSE NULL END) to ARRAY_AGG(...)[0].
+    Snowflake doesn't support MAX() on arrays. We use ARRAY_AGG which ignores NULLs by
+    default, and [0] to retrieve the single element.
+
+    Array structure is preserved so downstream array index access (col[0], col[1], etc.)
+    continues to work. ARRAY_TO_STRING wrapping is handled separately in the crosstab path.
+
     Transforms:
-      MAX(CASE WHEN condition THEN ARRAY_CONSTRUCT(col1, col2, col3) ELSE NULL END)
+      MAX(CASE WHEN condition THEN ARRAY_CONSTRUCT(...) [ELSE NULL] END)
     To:
-      ARRAY_AGG(CASE WHEN condition THEN ARRAY_CONSTRUCT(col1, col2, col3) ELSE NULL END) 
-        WITHIN GROUP (ORDER BY col1 DESC)[0]
-    
-    The ORDER BY uses the first column in ARRAY_CONSTRUCT to determine which row to pick.
+      ARRAY_AGG(CASE WHEN condition THEN ARRAY_CONSTRUCT(...) [ELSE NULL] END)[0]
     """
-    # Pattern to match MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ...)
-    # We need to extract the CASE expression and the first column from ARRAY_CONSTRUCT
-    pattern = re.compile(
-        r'\bMAX\s*\(\s*'  # MAX(
-        r'(CASE\s+WHEN\s+.*?'  # CASE WHEN ... (capture group 1 - start of case)
-        r'THEN\s+'  # THEN
-        r'ARRAY_CONSTRUCT\s*\(\s*'  # ARRAY_CONSTRUCT(
-        r'(?:CAST\s*\(\s*)?'  # Optional CAST(
-        r'(\w+(?:\.\w+)?)'  # First column name (capture group 2) - may have table prefix
-        r'(?:\s+AS\s+\w+\s*\))?'  # Optional AS type) for CAST
-        r'[^)]*'  # Rest of array construct args
-        r'\)'  # Close ARRAY_CONSTRUCT
-        r'.*?'  # Rest of CASE (ELSE clause, etc.)
-        r'END)'  # END of CASE (capture group 1 - end)
-        r'\s*\)',  # Close MAX
-        re.IGNORECASE | re.DOTALL
-    )
-    
-    def repl(match):
-        case_expr = match.group(1).strip()
-        order_by_col = match.group(2).strip()
-        
-        # Build the ARRAY_AGG replacement
-        return (f"ARRAY_AGG({case_expr}) "
-                f"WITHIN GROUP (ORDER BY {order_by_col} DESC)[0]")
-    
-    return pattern.sub(repl, sql)
+    result = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        # Look for MAX( (case-insensitive)
+        max_match = re.match(r'MAX\s*\(', sql[i:], re.IGNORECASE)
+        if not max_match:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        # Check that what follows the opening paren starts with CASE WHEN
+        inner_start = i + max_match.end()
+        inner_preview = sql[inner_start:inner_start + 200].lstrip()
+        if not re.match(r'CASE\s+WHEN\b', inner_preview, re.IGNORECASE):
+            result.append(sql[i])
+            i += 1
+            continue
+
+        # Use bracket matching to find the closing ) of MAX(
+        depth = 1
+        j = inner_start
+        in_str = False
+        str_char = ''
+        while j < n and depth > 0:
+            ch = sql[j]
+            if in_str:
+                if ch == str_char and (j == 0 or sql[j-1] != '\\'):
+                    in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            j += 1
+
+        if depth != 0:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        inner_content = sql[inner_start:j - 1]
+
+        # Only transform if ARRAY_CONSTRUCT is inside
+        if not re.search(r'ARRAY_CONSTRUCT\b', inner_content, re.IGNORECASE):
+            result.append(sql[i])
+            i += 1
+            continue
+
+        result.append(f"ARRAY_AGG({inner_content})[0]")
+        i = j
+
+    return ''.join(result)
 
 def fix_aggregate_distinct_iff(sql: str) -> str:
     """

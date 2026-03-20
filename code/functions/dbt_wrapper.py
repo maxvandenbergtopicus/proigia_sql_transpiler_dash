@@ -279,7 +279,7 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     def find_function_calls(s, func_name):
         # Returns list of (start, end, args_str) for each function call
         results = []
-        pattern = re.compile(rf'(?:indelingen\.)?{re.escape(func_name)}\s*\(', re.IGNORECASE)
+        pattern = re.compile(rf'(?:(?:indelingen|public)\.)?{re.escape(func_name)}\s*\(', re.IGNORECASE)
         for m in pattern.finditer(s):
             start = m.start()
             i = m.end()
