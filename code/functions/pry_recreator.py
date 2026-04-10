@@ -29,6 +29,9 @@ def sql_to_pry_query_block(
     """
     # find compiled SQL
     sql_file = f"{SF_SQL_FOLDER}/{report}/{view[0]}.sql"
+    if not os.path.exists(sql_file):
+        logger.error(f"SQL file not found: {sql_file}")
+        return ""
     with open(sql_file, "r") as f:
         sql_text = f.read()
     sql = sql_text.strip()
@@ -87,13 +90,12 @@ def pry_from_pry(
     Returns:
         str: The new pry formatted string.
     """
-    if report_folder == 'blocks':
-        return pry_template
-
     # get everything up until 'queries:' from the template pry. If there is no 'queries:' section, we will 
     # output the entire template (assumign it lives in blocks etc)
     with open(f"{PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}", "r") as f:
         pry_template = f.read()
+        if report_folder == 'blocks':
+            return pry_template
         if re.search(r"^queries:\s*$", pry_template, re.MULTILINE):
             header = pry_template.split("queries:")[0]
         else:
@@ -123,9 +125,13 @@ def process_proigia_definition():
         if len(template_pry_files) == 0:
             logger.warning(f"No .pry file found in {report_folder}, skipping.")
             continue
+        # create output folder if it doesn't exist yet and write new pry files
+        output_folder = f"{SF_PROIGIA_DEFINITION}/{report_folder}"
+        os.makedirs(output_folder, exist_ok=True) 
         for template_pry_file in template_pry_files:
-            new_pry_content = pry_from_pry(report_folder, template_pry_file)
-            output_path = f"{SF_PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}.pry"
+            template_pry_filename = Path(template_pry_file).name
+            new_pry_content = pry_from_pry(report_folder, template_pry_filename)
+            output_path = f"{SF_PROIGIA_DEFINITION}/{report_folder}/{template_pry_filename}"
             with open(output_path, "w") as f:
                 f.write(new_pry_content)
             logger.info(f"Generated new PRY file at: {output_path}")
