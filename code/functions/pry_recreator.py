@@ -1,10 +1,13 @@
 # contains code that creates a pry from dbt models
 
 import functions
+from pathlib import Path
 import re
+import os
 
 SF_SQL_FOLDER = "/home/coder/proigia_sql_transpiler_dash/dm_dash_new" #TODO change this to whatever it is in actuality
 PROIGIA_DEFINITION = "/home/coder/proigia_definition" #TODO change this to whatever it is in actuality
+SF_PROIGIA_DEFINITION = "/home/coder/proigia_sql_transpiler_dash/proigia_definition" #TODO change this to whatever it is in actuality
 logger = functions.setup_logging("/home/coder/pry_recreator.log", log_level="debug")
 
 def sql_to_pry_query_block(
@@ -74,8 +77,7 @@ def format_queries_from_sf(sf_views: list, reportname: str) -> str:
 
 def pry_from_pry(
     report_folder: str,
-    template_pry_file: str,
-    block = True) -> str:
+    template_pry_file: str) -> str:
     """
     Creates a pry format string based on the original pry and the dbt models.
     Note: this can only be used in the current conversion
@@ -85,8 +87,8 @@ def pry_from_pry(
     Returns:
         str: The new pry formatted string.
     """
-    if block:
-        raise NotImplementedError("Blocks cannot be recreated yet")
+    if report_folder == 'blocks':
+        return pry_template
 
     # get everything up until 'queries:' from the template pry. If there is no 'queries:' section, we will 
     # output the entire template (assumign it lives in blocks etc)
@@ -107,3 +109,29 @@ def pry_from_pry(
     new_pry = "\n".join([header, "queries:", queryblock])
     # create pry
     return new_pry
+
+def process_proigia_definition():
+    """
+    Process the entire Proigia definition folder, creating new PRY files for each report.
+    """
+    for report_folder in os.listdir(PROIGIA_DEFINITION):
+        if not os.path.isdir(os.path.join(PROIGIA_DEFINITION, report_folder)):
+            continue
+        logger.info(f"Processing report folder: {report_folder}")
+        # find all .pry files in the folder
+        template_pry_files = functions.find_pry_files(Path(os.path.join(PROIGIA_DEFINITION, report_folder)), ignored_keywords=[])
+        if len(template_pry_files) == 0:
+            logger.warning(f"No .pry file found in {report_folder}, skipping.")
+            continue
+        for template_pry_file in template_pry_files:
+            new_pry_content = pry_from_pry(report_folder, template_pry_file)
+            output_path = f"{SF_PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}.pry"
+            with open(output_path, "w") as f:
+                f.write(new_pry_content)
+            logger.info(f"Generated new PRY file at: {output_path}")
+
+def main():
+    process_proigia_definition()
+
+if __name__ == "__main__":
+    main()
