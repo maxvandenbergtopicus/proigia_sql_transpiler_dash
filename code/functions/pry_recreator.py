@@ -7,7 +7,7 @@ import os
 
 SF_SQL_FOLDER = "/home/coder/proigia_sql_transpiler_dash/dm_dash_new" #TODO change this to whatever it is in actuality
 PROIGIA_DEFINITION = "/home/coder/proigia_definition" #TODO change this to whatever it is in actuality
-SF_PROIGIA_DEFINITION = "/home/coder/proigia_sql_transpiler_dash/proigia_definition" #TODO change this to whatever it is in actuality
+#SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
 logger = functions.setup_logging("/home/coder/pry_recreator.log", log_level="debug")
 
 def sql_to_pry_query_block(
@@ -78,35 +78,92 @@ def format_queries_from_sf(sf_views: list, reportname: str) -> str:
     pry_queries = [sql_to_pry_query_block(query, reportname) for query in sf_views]
     return "\n".join(pry_queries)
 
+def suffix_name_in_pry(pry_template: str, suffix_name: str) -> str:
+    """
+    Add a suffix to the report name in the PRY template.
+
+    This function looks for a line in the PRY template that starts with `name:`
+    and appends the provided suffix to the report name.
+
+    Args:
+        pry_template: The original PRY template as a string.
+        suffix_name: The suffix to append to the report name (e.g., " (SF)").
+
+    Returns:
+        The modified PRY template with the suffixed report name.
+    """
+    lines = pry_template.splitlines()
+    first_line = lines[0]
+    if not first_line.startswith("name:"):
+        logger.error(f"First line must start with 'name:' in pry template")
+        raise ValueError(f"First line must start with 'name:' in pry template")
+
+    rest = first_line[len("name:"):] # TODO something to do with whitespace. 
+    rest_lstripped = rest.lstrip()
+    leading_ws = rest[:len(rest) - len(rest_lstripped)]
+    trimmed = rest_lstripped.rstrip()
+    trailing_ws = rest_lstripped[len(trimmed):]
+
+    if trimmed.startswith('"'):
+        report_name = trimmed[1:-1]
+        new_trimmed = f'"{report_name}{suffix_name}"'
+    else:
+        new_trimmed = f"{trimmed}{suffix_name}"
+
+    lines[0] = f"name:{leading_ws}{new_trimmed}{trailing_ws}"
+    pry_template = "\n".join(lines)
+    return pry_template
+
 def pry_from_pry(
     report_folder: str,
-    template_pry_file: str) -> str:
+    template_pry_file: str,
+    suffix_name: str = "",
+    db_type: str = None) -> str:
     """
     Creates a pry format string based on the original pry and the dbt models.
     Note: this can only be used in the current conversion
     Args:
         report_folder (str): The folder containing the report.
         template_pry_file (str): The original or template pry file
+        suffix_name (str): Suffix to append to the report name in the new pry (e.g. " (SF)"). This is optional and can be left empty if no suffix is desired. Useful if you want a separate report in the portal.
     Returns:
         str: The new pry formatted string.
     """
     # get everything up until 'queries:' from the template pry. If there is no 'queries:' section, we will 
     # output the entire template (assumign it lives in blocks etc)
-    with open(f"{PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}", "r") as f:
+    with open(f"{PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}.pry", "r") as f:
         pry_template = f.read()
+        
+        if suffix_name:
+            pry_template = suffix_name_in_pry(pry_template, suffix_name)
+        if db_type:
+            lines = pry_template.split("\n")
+            lines.insert(2, f"db_type: {db_type}")
+            pry_template = "\n".join(lines)
         if report_folder == 'blocks':
             return pry_template
         if re.search(r"^queries:\s*$", pry_template, re.MULTILINE):
             header = pry_template.split("queries:")[0]
         else:
             return pry_template
+    
+    # TODO: put database type in header
+    
     # get the query names from the original pry    
     reportviews = get_views_from_pry(pry_template)
     logger.debug(f"Reportviews extracted from original pry:")
     for rv in reportviews:
         logger.debug(rv)
     # get the queries from the dbt models
-    queryblock = format_queries_from_sf(reportviews, report_folder)
+    # TODO: once dbt folder has the original folder names, take the next few lines out (or explicitly use the original)
+    metadata = functions.parse_pry_file(pry_template) 
+    report_name = metadata.get('name', 'Unknown Report')
+    # strip off the suffix_name from report_name
+    if suffix_name and report_name.endswith(suffix_name):
+        report_name = report_name[:-len(suffix_name)]
+    report_name = re.sub(r'[^a-zA-Z0-9_]+', '_', report_name)
+    folder_name = functions.sanitize_folder_name(report_name)
+    queryblock = format_queries_from_sf(reportviews, folder_name)
     # join header & querys
     new_pry = "\n".join([header, "queries:", queryblock])
     # create pry
@@ -126,12 +183,12 @@ def process_proigia_definition():
             logger.warning(f"No .pry file found in {report_folder}, skipping.")
             continue
         # create output folder if it doesn't exist yet and write new pry files
-        output_folder = f"{SF_PROIGIA_DEFINITION}/{report_folder}"
+        output_folder = f"{PROIGIA_DEFINITION}/{report_folder}_sf"
         os.makedirs(output_folder, exist_ok=True) 
         for template_pry_file in template_pry_files:
-            template_pry_filename = Path(template_pry_file).name
-            new_pry_content = pry_from_pry(report_folder, template_pry_filename)
-            output_path = f"{SF_PROIGIA_DEFINITION}/{report_folder}/{template_pry_filename}"
+            template_pry_filename = Path(template_pry_file).stem
+            new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" (SF)")
+            output_path = f"{output_folder}/{template_pry_filename}_sf.pry"
             with open(output_path, "w") as f:
                 f.write(new_pry_content)
             logger.info(f"Generated new PRY file at: {output_path}")
