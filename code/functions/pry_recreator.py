@@ -4,11 +4,52 @@ import functions
 from pathlib import Path
 import re
 import os
+from functools import lru_cache
 
-SF_SQL_FOLDER = "/home/coder/proigia_sql_transpiler_dash/dm_dash_new" #TODO change this to whatever it is in actuality
+SF_SQL_FOLDER = "/home/coder/proigia_sql_transpiler_dash/code/functions/dm_dash_new" #TODO change this to whatever it is in actuality
 PROIGIA_DEFINITION = "/home/coder/proigia_definition" #TODO change this to whatever it is in actuality
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_CANDIDATES = [PROJECT_ROOT / "config.yml", PROJECT_ROOT / "config.yaml"]
 #SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
 logger = functions.setup_logging("/home/coder/pry_recreator.log", log_level="debug")
+
+@lru_cache(maxsize=1)
+def get_database_prefixes() -> tuple[str, ...]:
+    """Read database prefixes from `databases:` in config.yml/config.yaml without YAML parsing."""
+    for config_path in CONFIG_CANDIDATES:
+        if not config_path.exists():
+            continue
+
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+        in_databases_block = False
+        database_names: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            if not in_databases_block:
+                if re.match(r"^\s*databases\s*:\s*$", line):
+                    in_databases_block = True
+                continue
+
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            if re.match(r"^[A-Za-z_][\w-]*\s*:", line):
+                break
+
+            match_name = re.match(r"^\s*-\s*name\s*:\s*(.+?)\s*$", line)
+            if match_name:
+                value = match_name.group(1).split("#", 1)[0].strip()
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                if value:
+                    database_names.append(value)
+
+        if database_names:
+            return tuple(database_names)
+
+    return tuple()
 
 def sql_to_pry_query_block(
     view: tuple,
@@ -37,7 +78,10 @@ def sql_to_pry_query_block(
     sql = sql_text.strip()
 
     if strip_schema_from_from_clause:
-        sql = sql.replace("FROM DM_DASH.P77775027.", "FROM ") #TODO either remove this or make it generic, depending on whether we have schema names inn the generated SQL or not
+        schema_names = get_database_prefixes()
+        schema_pattern = "|".join(re.escape(name) for name in schema_names if name)
+        if schema_pattern:
+            sql = re.sub(rf"\b(?:{schema_pattern})\.P\d{{8}}\.", "", sql, flags=re.IGNORECASE)
 
     lines = ["- |"]
     # add the original CREATE statement (can be C REATE MATERIALIZED or whatever, we just take whatever is in the original SQL)
@@ -93,26 +137,66 @@ def suffix_name_in_pry(pry_template: str, suffix_name: str) -> str:
         The modified PRY template with the suffixed report name.
     """
     lines = pry_template.splitlines()
-    first_line = lines[0]
-    if not first_line.startswith("name:"):
-        logger.error(f"First line must start with 'name:' in pry template")
-        raise ValueError(f"First line must start with 'name:' in pry template")
+    if not lines:
+        logger.error("PRY template is empty")
+        raise ValueError("PRY template is empty")
 
-    rest = first_line[len("name:"):] # TODO something to do with whitespace. 
-    rest_lstripped = rest.lstrip()
-    leading_ws = rest[:len(rest) - len(rest_lstripped)]
-    trimmed = rest_lstripped.rstrip()
-    trailing_ws = rest_lstripped[len(trimmed):]
+    name_line_index = None
+    bom_prefix = ""
+    for idx, line in enumerate(lines):
+        normalized = line.lstrip("\ufeff")
+        if normalized.startswith("name:"):
+            name_line_index = idx
+            if line.startswith("\ufeff"):
+                bom_prefix = "\ufeff"
+            break
 
-    if trimmed.startswith('"'):
-        report_name = trimmed[1:-1]
-        new_trimmed = f'"{report_name}{suffix_name}"'
-    else:
-        new_trimmed = f"{trimmed}{suffix_name}"
+    if name_line_index is None:
+        logger.error("No top-level 'name:' found in pry template")
+        raise ValueError("No top-level 'name:' found in pry template")
 
-    lines[0] = f"name:{leading_ws}{new_trimmed}{trailing_ws}"
+    def append_suffix_to_key(line: str, key: str, keep_bom: bool = False) -> str:
+        source_line = line.lstrip("\ufeff") if keep_bom else line
+        rest = source_line[len(key):]
+        rest_lstripped = rest.lstrip()
+        leading_ws = rest[:len(rest) - len(rest_lstripped)]
+        trimmed = rest_lstripped.rstrip()
+        trailing_ws = rest_lstripped[len(trimmed):]
+
+        if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
+            current_value = trimmed[1:-1]
+            if current_value.endswith(suffix_name):
+                new_trimmed = trimmed
+            else:
+                new_trimmed = f'"{current_value}{suffix_name}"'
+        else:
+            if trimmed.endswith(suffix_name):
+                new_trimmed = trimmed
+            else:
+                new_trimmed = f"{trimmed}{suffix_name}"
+
+        prefix = bom_prefix if keep_bom else ""
+        return f"{prefix}{key}{leading_ws}{new_trimmed}{trailing_ws}"
+
+    lines[name_line_index] = append_suffix_to_key(lines[name_line_index], "name:", keep_bom=True)
+
+    for idx, line in enumerate(lines):
+        if line.startswith("referencedreportname:"):
+            lines[idx] = append_suffix_to_key(line, "referencedreportname:")
+
     pry_template = "\n".join(lines)
     return pry_template
+
+def extract_report_name_from_pry(pry_template: str) -> str:
+    """Extract report name from top-level `name:` metadata line."""
+    for line in pry_template.splitlines():
+        normalized = line.lstrip("\ufeff")
+        if normalized.startswith("name:"):
+            value = normalized[len("name:"):].strip()
+            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+                return value[1:-1]
+            return value
+    return "Unknown Report"
 
 def pry_from_pry(
     report_folder: str,
@@ -133,15 +217,20 @@ def pry_from_pry(
     # output the entire template (assumign it lives in blocks etc)
     with open(f"{PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}.pry", "r") as f:
         pry_template = f.read()
-        
+        if report_folder == 'blocks':
+            return pry_template
         if suffix_name:
             pry_template = suffix_name_in_pry(pry_template, suffix_name)
         if db_type:
             lines = pry_template.split("\n")
-            lines.insert(2, f"db_type: {db_type}")
+            if not any(line.strip().startswith("db_type:") for line in lines):
+                insertion_index = 1 if len(lines) > 1 else len(lines)
+                for idx, line in enumerate(lines):
+                    if re.match(r"^\s*(reportviews|queries):\s*$", line):
+                        insertion_index = idx
+                        break
+                lines.insert(insertion_index, f"db_type: {db_type}")
             pry_template = "\n".join(lines)
-        if report_folder == 'blocks':
-            return pry_template
         if re.search(r"^queries:\s*$", pry_template, re.MULTILINE):
             header = pry_template.split("queries:")[0]
         else:
@@ -154,10 +243,8 @@ def pry_from_pry(
     logger.debug(f"Reportviews extracted from original pry:")
     for rv in reportviews:
         logger.debug(rv)
-    # get the queries from the dbt models
-    # TODO: once dbt folder has the original folder names, take the next few lines out (or explicitly use the original)
-    metadata = functions.parse_pry_file(pry_template) 
-    report_name = metadata.get('name', 'Unknown Report')
+    # get the report name from top-level metadata using string parsing only
+    report_name = extract_report_name_from_pry(pry_template)
     # strip off the suffix_name from report_name
     if suffix_name and report_name.endswith(suffix_name):
         report_name = report_name[:-len(suffix_name)]
@@ -166,7 +253,6 @@ def pry_from_pry(
     queryblock = format_queries_from_sf(reportviews, folder_name)
     # join header & querys
     new_pry = "\n".join([header, "queries:", queryblock])
-    # create pry
     return new_pry
 
 def process_proigia_definition():
@@ -175,6 +261,10 @@ def process_proigia_definition():
     """
     for report_folder in os.listdir(PROIGIA_DEFINITION):
         if not os.path.isdir(os.path.join(PROIGIA_DEFINITION, report_folder)):
+            continue
+        if report_folder.endswith("_sf"):
+            continue
+        if report_folder in ("blocks", "scripts"):
             continue
         logger.info(f"Processing report folder: {report_folder}")
         # find all .pry files in the folder
@@ -186,8 +276,12 @@ def process_proigia_definition():
         output_folder = f"{PROIGIA_DEFINITION}/{report_folder}_sf"
         os.makedirs(output_folder, exist_ok=True) 
         for template_pry_file in template_pry_files:
+            logger.info(f"Processing template PRY file: {template_pry_file}")
             template_pry_filename = Path(template_pry_file).stem
-            new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" (SF)")
+            if template_pry_filename.endswith("aggregate.pry"):
+                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" (SF)")
+            else:
+                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" (SF)", db_type="snowflake")
             output_path = f"{output_folder}/{template_pry_filename}_sf.pry"
             with open(output_path, "w") as f:
                 f.write(new_pry_content)
