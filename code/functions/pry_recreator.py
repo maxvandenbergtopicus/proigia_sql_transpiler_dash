@@ -84,8 +84,7 @@ def sql_to_pry_query_block(
             sql = re.sub(rf"\b(?:{schema_pattern})\.P\d{{8}}\.", "", sql, flags=re.IGNORECASE)
 
     lines = ["- |"]
-    # add the original CREATE statement (can be C REATE MATERIALIZED or whatever, we just take whatever is in the original SQL)
-    lines.append(f"    {view[1]}")
+    lines.append(f"    {view[1].strip()}")
     # add indentation to each line of the SQL
     lines.extend(f"    {line}" for line in sql.splitlines())
 
@@ -131,7 +130,7 @@ def suffix_name_in_pry(pry_template: str, suffix_name: str) -> str:
 
     Args:
         pry_template: The original PRY template as a string.
-        suffix_name: The suffix to append to the report name (e.g., " (SF)").
+        suffix_name: The suffix to append to the report name (e.g., " SF").
 
     Returns:
         The modified PRY template with the suffixed report name.
@@ -209,7 +208,7 @@ def pry_from_pry(
     Args:
         report_folder (str): The folder containing the report.
         template_pry_file (str): The original or template pry file
-        suffix_name (str): Suffix to append to the report name in the new pry (e.g. " (SF)"). This is optional and can be left empty if no suffix is desired. Useful if you want a separate report in the portal.
+        suffix_name (str): Suffix to append to the report name in the new pry (e.g. " SF"). This is optional and can be left empty if no suffix is desired. Useful if you want a separate report in the portal.
     Returns:
         str: The new pry formatted string.
     """
@@ -249,10 +248,9 @@ def pry_from_pry(
     if suffix_name and report_name.endswith(suffix_name):
         report_name = report_name[:-len(suffix_name)]
     report_name = re.sub(r'[^a-zA-Z0-9_]+', '_', report_name)
-    folder_name = functions.sanitize_folder_name(report_name)
-    queryblock = format_queries_from_sf(reportviews, folder_name)
+    queryblock = format_queries_from_sf(reportviews, report_folder)
     # join header & querys
-    new_pry = "\n".join([header, "queries:", queryblock])
+    new_pry = "\n".join([header.rstrip(), "queries:", queryblock])
     return new_pry
 
 def process_proigia_definition():
@@ -278,10 +276,11 @@ def process_proigia_definition():
         for template_pry_file in template_pry_files:
             logger.info(f"Processing template PRY file: {template_pry_file}")
             template_pry_filename = Path(template_pry_file).stem
-            if template_pry_filename.endswith("aggregate.pry"):
-                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" (SF)")
+            is_aggregate_pry = Path(template_pry_file).name.lower().endswith("aggregate.pry")
+            if is_aggregate_pry:
+                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" SF")
             else:
-                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" (SF)", db_type="snowflake")
+                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" SF", db_type="snowflake")
             output_path = f"{output_folder}/{template_pry_filename}_sf.pry"
             with open(output_path, "w") as f:
                 f.write(new_pry_content)
