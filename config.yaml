@@ -57,3 +57,7 @@ skip_folders:
 #- proigia_zg_criteria_v3
 
 default_zg_agb: 53530000
+
+databases:
+- name: DM_DASH
+- name: STG
