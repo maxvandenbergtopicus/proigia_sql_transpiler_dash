@@ -51,6 +51,20 @@ def get_database_prefixes() -> tuple[str, ...]:
 
     return tuple()
 
+@lru_cache(maxsize=None)
+def resolve_report_sql_folder(report: str) -> str:
+    """Resolve report folder in SF_SQL_FOLDER with case-insensitive fallback."""
+    direct_path = Path(SF_SQL_FOLDER) / report
+    if direct_path.is_dir():
+        return report
+
+    report_lower = report.lower()
+    for entry in Path(SF_SQL_FOLDER).iterdir():
+        if entry.is_dir() and entry.name.lower() == report_lower:
+            return entry.name
+
+    return report
+
 def sql_to_pry_query_block(
     view: tuple,
     report: str, # report name is needed to find the compiled SQL
@@ -69,7 +83,8 @@ def sql_to_pry_query_block(
         PRY-formatted query block as a string.
     """
     # find compiled SQL
-    sql_file = f"{SF_SQL_FOLDER}/{report}/{view[0]}.sql"
+    resolved_report = resolve_report_sql_folder(report)
+    sql_file = f"{SF_SQL_FOLDER}/{resolved_report}/{view[0]}.sql"
     if not os.path.exists(sql_file):
         logger.error(f"SQL file not found: {sql_file}")
         return ""
@@ -84,7 +99,10 @@ def sql_to_pry_query_block(
             sql = re.sub(rf"\b(?:{schema_pattern})\.P\d{{8}}\.", "", sql, flags=re.IGNORECASE)
 
     lines = ["- |"]
-    lines.append(f"    {view[1].strip()}")
+    # Replace CREATE MATERIALIZED VIEW with CREATE TABLE
+    create_statement = view[1].strip()
+    create_statement = re.sub(r"\bCREATE\s+MATERIALIZED\s+VIEW\b", "CREATE TABLE", create_statement, flags=re.IGNORECASE)
+    lines.append(f"    {create_statement}")
     # add indentation to each line of the SQL
     lines.extend(f"    {line}" for line in sql.splitlines())
 
