@@ -7,6 +7,98 @@ import sqlglot
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 
+def wrap_array_constructs_with_array_to_string(sql: str, array_name: str = None) -> tuple[str, int]:
+    """
+    Wrap ARRAY_CONSTRUCT(...) call with array_to_string(..., ';') if it's aliased as array_name.
+
+    If array_name is provided, only wraps the ARRAY_CONSTRUCT that has that alias.
+    If array_name is None, wraps all unwrapped ARRAY_CONSTRUCT calls (legacy behavior).
+
+    This is needed for crosstab payload/value arrays, including ARRAY_CONSTRUCT
+    calls that appear inside CASE expressions where the enclosing alias is on the
+    CASE ... END expression rather than on ARRAY_CONSTRUCT itself.
+    """
+    result = []
+    i = 0
+    wrapped_count = 0
+    pattern = re.compile(r'ARRAY_CONSTRUCT\s*\(', re.IGNORECASE)
+
+    while i < len(sql):
+        match = pattern.match(sql, i)
+        if not match:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        func_start = i
+        paren_depth = 1
+        j = match.end()
+        in_string = False
+        string_char = None
+
+        while j < len(sql) and paren_depth > 0:
+            char = sql[j]
+
+            if char in ('"', "'") and (j == 0 or sql[j - 1] != '\\'):
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+                    string_char = None
+
+            if not in_string:
+                if char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+
+            j += 1
+
+        if paren_depth != 0:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        func_sql = sql[func_start:j]
+        
+        # Check if this ARRAY_CONSTRUCT should be wrapped
+        should_wrap = False
+        if array_name:
+            # Strategy 1: ARRAY_CONSTRUCT(...) AS array_name — alias directly follows closing paren
+            rest = sql[j:]
+            direct_alias = re.match(rf'\s*AS\s+{re.escape(array_name)}\b', rest, re.IGNORECASE)
+
+            # Strategy 2: CASE ... THEN ARRAY_CONSTRUCT(...) ... ELSE ... END AS array_name
+            # The alias is on the END keyword, not on the ARRAY_CONSTRUCT itself.
+            # Detect by checking if preceded by THEN and then scanning forward for END AS array_name.
+            preceded_by_then = re.search(r'\bTHEN\s*$', sql[:func_start], re.IGNORECASE)
+            if preceded_by_then:
+                # Look for END AS array_name in the text following this ARRAY_CONSTRUCT's close
+                in_case_alias = re.search(rf'\bEND\s+AS\s+{re.escape(array_name)}\b', rest, re.IGNORECASE)
+                should_wrap = bool(in_case_alias)
+            else:
+                should_wrap = bool(direct_alias)
+        else:
+            # Legacy: wrap all unwrapped ARRAY_CONSTRUCT calls
+            prefix = sql[:func_start].rstrip()
+            should_wrap = not prefix.lower().endswith('array_to_string(')
+        
+        if should_wrap:
+            prefix = sql[:func_start].rstrip()
+            if not prefix.lower().endswith('array_to_string('):
+                result.append(f"array_to_string({func_sql}, ';')")
+                wrapped_count += 1
+            else:
+                result.append(func_sql)
+        else:
+            result.append(func_sql)
+
+        i = j
+
+    return ''.join(result), wrapped_count
+
+
 def parse_crosstab_to_macro(sql: str) -> str:
     """
     Convert PostgreSQL crosstab to Snowflake pivot macro call.
@@ -124,12 +216,18 @@ def parse_crosstab_to_macro(sql: str) -> str:
                         i += 1
                     body_end = i - 1
                     body = ctes_sql[body_start:body_end].strip()
-                    # Transpile the body from PostgreSQL to Snowflake
+                    # Convert the body using the shared converter pipeline so CTEs
+                    # get the same post-processing (including generate_series fixes).
                     try:
-                        transpiled_body = sqlglot.transpile(body, read="postgres", write="snowflake", pretty=True)[0]
+                        from code.functions.dialect_converter import convert_postgres_to_snowflake
+                        transpiled_body = convert_postgres_to_snowflake(body)
                     except Exception as e:
-                        logging.warning(f"Failed to transpile CTE {name}: {e}")
-                        transpiled_body = body  # Fallback to original
+                        logging.warning(f"Failed full conversion for CTE {name}: {e}; falling back to sqlglot transpile")
+                        try:
+                            transpiled_body = sqlglot.transpile(body, read="postgres", write="snowflake", pretty=True)[0]
+                        except Exception as e2:
+                            logging.warning(f"Failed to transpile CTE {name}: {e2}")
+                            transpiled_body = body  # Fallback to original
                     
                     # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
                     transpiled_body = re.sub(
@@ -417,30 +515,12 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # Always convert ARRAY[] to ARRAY_CONSTRUCT() and wrap with array_to_string
     modified_query1 = re.sub(r'ARRAY\s*\[(.*?)\]', r'ARRAY_CONSTRUCT(\1)', modified_query1, flags=re.IGNORECASE | re.DOTALL)
     
-    # Define nested paren pattern to handle expressions with parentheses
-    nested_paren = r'((?:[^()]|\((?:[^()]|\([^()]*\))*\))*)'
-    
-    # Wrap the ARRAY_CONSTRUCT that corresponds to the values column (array_name) with array_to_string.
-    # Specifically target the one aliased as array_name to avoid wrapping ID-column arrays.
-    pattern_named = r'ARRAY_CONSTRUCT\s*\(' + nested_paren + r'\)\s+as\s+' + re.escape(array_name)
-    match = re.search(pattern_named, modified_query1, re.IGNORECASE | re.DOTALL)
-    if match:
-        content = match.group(1)
-        replacement = f"array_to_string(ARRAY_CONSTRUCT({content}), ';') as {array_name}"
-        modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
-        logging.info(f"Wrapped ARRAY_CONSTRUCT (alias '{array_name}') with array_to_string")
+    # Only wrap the ARRAY_CONSTRUCT that's aliased as the values column (array_name)
+    modified_query1, wrapped_count = wrap_array_constructs_with_array_to_string(modified_query1, array_name)
+    if wrapped_count:
+        logging.info(f"Wrapped {wrapped_count} ARRAY_CONSTRUCT occurrence(s) with array_to_string")
     else:
-        # Fallback: wrap the first ARRAY_CONSTRUCT found (single-array queries)
-        pattern = r'ARRAY_CONSTRUCT\s*\(' + nested_paren + r'\)(\s+as\s+(\w+))?'
-        match = re.search(pattern, modified_query1, re.IGNORECASE | re.DOTALL)
-        if match:
-            content = match.group(1)
-            alias_part = match.group(2) if match.group(2) else f' as {array_name}'
-            replacement = f"array_to_string(ARRAY_CONSTRUCT({content}), ';'){alias_part}"
-            modified_query1 = modified_query1[:match.start()] + replacement + modified_query1[match.end():]
-            logging.info("Wrapped ARRAY_CONSTRUCT with array_to_string (fallback to first match)")
-        else:
-            logging.warning("Could not find ARRAY_CONSTRUCT to wrap")
+        logging.warning("Could not find ARRAY_CONSTRUCT to wrap")
     
     # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
     if "'" in pivot_key:
@@ -457,21 +537,33 @@ def parse_crosstab_to_macro(sql: str) -> str:
     # Transpile the main query from PostgreSQL to Snowflake (after array processing)
     try:
         from code.functions.dialect_converter import convert_postgres_to_snowflake
-        modified_query1 = convert_postgres_to_snowflake(modified_query1)
-        # After transpilation, check if the pivot column has an alias
-        # Look for the pivot_key expression in the entire query (may have spaces added by sqlglot)
-        pivot_key_normalized = pivot_key.replace('||', ' || ')
-        # Find lines containing the pivot expression with AS alias
-        lines = modified_query1.split('\n')
-        for line in lines:
-            line = line.strip()
-            if pivot_key_normalized in line and ' AS ' in line.upper():
-                # Extract the alias after AS
-                as_match = re.search(r'\s+AS\s+(\w+)', line, re.IGNORECASE)
-                if as_match:
-                    pivot_key = as_match.group(1)
-                    logging.info(f"Found alias for pivot column: {pivot_key}")
-                    break
+        modified_query1 = convert_postgres_to_snowflake(modified_query1, wrap_array_to_string=False)
+        # After transpilation, optionally resolve the alias for complex pivot expressions.
+        # For simple identifiers (like fi_cat), keep the original value to avoid false
+        # positives where substring matches (fi_cat in fi_cat_ind) overwrite the key.
+        pivot_key_name = pivot_key.strip().strip('"').strip("'")
+        is_simple_identifier = bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', pivot_key_name))
+
+        if not is_simple_identifier:
+            # Look for the pivot_key expression in the transpiled query
+            # (sqlglot may add spaces around operators like ||).
+            pivot_key_normalized = pivot_key.replace('||', ' || ')
+            pivot_key_pattern = re.compile(rf'(^|\W){re.escape(pivot_key_normalized)}(\W|$)', re.IGNORECASE)
+
+            # Find lines containing the pivot expression with AS alias
+            lines = modified_query1.split('\n')
+            for line in lines:
+                line = line.strip()
+                if ' AS ' not in line.upper():
+                    continue
+
+                if pivot_key_pattern.search(line):
+                    # Extract the alias after AS
+                    as_match = re.search(r'\s+AS\s+(\w+)', line, re.IGNORECASE)
+                    if as_match:
+                        pivot_key = as_match.group(1)
+                        logging.info(f"Found alias for pivot column: {pivot_key}")
+                        break
         # Update the quoted version
         if "'" in pivot_key:
             pivot_key_quoted = f'"{pivot_key}"'
@@ -480,6 +572,13 @@ def parse_crosstab_to_macro(sql: str) -> str:
     except Exception as e:
         logging.warning(f"Failed to transpile main query: {e}")
         # modified_query1 remains as is
+
+    # Enable index ordering only for known ordinal pivot keys.
+    pivot_key_name = pivot_key.strip().strip("\"").strip("'")
+    index_ordering_keys = {"NHGNR"}
+    index_ordering_arg = ", index_ordering=true" if pivot_key_name.upper() in index_ordering_keys else ""
+    if index_ordering_arg:
+        logging.info(f"Enabling snowflake_pivot index_ordering=true (pivot key is {pivot_key_name})")
     
     # Post-process: Fix ARRAY_AGG(IFF(NOT x IS NULL, DISTINCT x, NULL)) to ARRAY_AGG(DISTINCT x)
     modified_query1 = re.sub(
@@ -498,7 +597,7 @@ prepare AS (
 {modified_query1}
 )
 -- Call snowflake pivot macro
-{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}')}}}}
+{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}'{index_ordering_arg})}}}}
 
 {final_select}"""
     else:
@@ -507,7 +606,7 @@ prepare AS (
 {modified_query1}
 )
 -- Call snowflake pivot macro
-{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}')}}}}
+{{{{snowflake_pivot({pivoted_values_str},{array_name_quoted}, {pivot_key_quoted}, {aantal_split},{eventuele_extra_split_str}, {id_cols_str}, output_type='{output_type}'{index_ordering_arg})}}}}
 
 {final_select}"""
     

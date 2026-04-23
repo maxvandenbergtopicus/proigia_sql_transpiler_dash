@@ -76,6 +76,13 @@ def test_sql_conversion():
         print("Converted SQL:")
         print("-" * 30)
         print(converted)
+        
+        # Write to file if input was from file
+        if len(sys.argv) > 1 and not sys.argv[1].startswith('-'):
+            output_file = os.path.splitext(sql_file)[0] + "_converted.sql"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(converted)
+            print(f"\nConverted SQL written to: {output_file}")
     except Exception as e:
         print(f"Error during conversion: {e}")
         import traceback

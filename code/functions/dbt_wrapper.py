@@ -112,11 +112,25 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         # Preserve, convert, and restore macros
         temp_sql, macros = preserve_dbt_macros(preprocessed)
         
-        function_macros = config.get('function_macros', [])
-        converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=function_macros)
+        function_names = config.get('functions', config.get('function_macros', []))
+        macro_names = config.get('macros', [])
+        table_functions = config.get('table_functions', [])
+        table_macros = config.get('table_macros', [])
         
-        if function_macros:
-            converted_sql = replace_functions_with_macros(converted_sql, function_macros)
+        # Combine functions with table_functions for replacement (will wrap table ones after)
+        all_function_names = list(set(function_names + table_functions))
+        all_macro_names = list(set(macro_names + table_macros))
+        preserve_function_names = list(set(all_function_names + all_macro_names))
+        converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=preserve_function_names)
+
+        if all_function_names:
+            converted_sql = replace_functions_with_macros(converted_sql, all_function_names)
+        if all_macro_names:
+            converted_sql = replace_functions_with_dbt_macros(converted_sql, all_macro_names)
+        if table_functions:
+            converted_sql = replace_functions_with_table_wrapper(converted_sql, table_functions)
+        if table_macros:
+            converted_sql = replace_macros_with_table_wrapper(converted_sql, table_macros)
         
         converted_sql = restore_dbt_macros(converted_sql, macros)        
         # For blocks: only replace external tables, leave all others unchanged
@@ -172,8 +186,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
     else:
         # Create DBT models for each query
         metadata = parse_pry_file(content)
-        report_name = metadata.get('name', 'Unknown Report')
-        report_name  = re.sub(r'[^a-zA-Z0-9_]+', '_', report_name)
+        report_name = pry_path.parent.name
         report_type = metadata.get('reporttype', 'normal')
         reportviews = metadata.get('reportviews', [])
         queries = metadata.get('parsed_queries', [])
@@ -236,29 +249,71 @@ def replace_template_variables(sql: str, config: dict = None) -> tuple[str, set[
     
     return sql, external_vars
 
-def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
-    """Replace SQL function calls with dbt macro calls.
-    
-    Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
-    Example: indelingen.translate_labcode_answers(col::int, val) -> {{ translate_labcode_answers('col::int', 'val') }}
-    """
-    logging.info(f"Replacing functions with macros")
-    def smart_split_args(argstr):
-        args = []
-        current = ''
-        depth = 0
+def _find_function_calls(s: str, func_name: str) -> List[Tuple[int, int, str]]:
+    """Return list of (start, end, args_str) for each matched SQL function call."""
+    results = []
+    pattern = re.compile(rf'(?:(?:indelingen|public)\.)?{re.escape(func_name)}\s*\(', re.IGNORECASE)
+    for m in pattern.finditer(s):
+        start = m.start()
+        i = m.end()
+        depth = 1
         in_string = False
         string_char = None
-        i = 0
-        while i < len(argstr):
-            char = argstr[i]
-            if char in ('"', "'"):
+        while i < len(s):
+            c = s[i]
+            if c in ('"', "'"):
                 if not in_string:
                     in_string = True
-                    string_char = char
-                elif char == string_char:
+                    string_char = c
+                elif c == string_char:
                     in_string = False
                     string_char = None
+            elif c == '(' and not in_string:
+                depth += 1
+            elif c == ')' and not in_string:
+                depth -= 1
+                if depth == 0:
+                    args_str = s[m.end():i]
+                    results.append((start, i + 1, args_str))
+                    break
+            i += 1
+    return results
+
+
+def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
+    """Replace SQL function calls with dbt function() call syntax.
+
+    Example: CLEAN_ICPC(jr.icpc) -> {{ function('clean_icpc') }}(jr.icpc)
+    Example: indelingen.translate_labcode_answers(col::int, val)
+             -> {{ function('translate_labcode_answers') }}(col::int, val)
+    """
+    logging.info("Replacing functions with dbt function() syntax")
+    for func_name in function_names:
+        calls = _find_function_calls(sql, func_name)
+        for start, end, args in reversed(calls):
+            function_name = func_name.lower()
+            replacement = f"{{{{ function('{function_name}') }}}}({args.strip()})"
+            sql = sql[:start] + replacement + sql[end:]
+    return sql
+
+
+def replace_functions_with_dbt_macros(sql: str, macro_names: List[str]) -> str:
+    """Replace SQL function calls with dbt macro call syntax, quoting each argument.
+
+    Example: CLEAN_ICPC(jr.icpc) -> {{ clean_icpc('jr.icpc') }}
+    Example: public.translate_labcode_answers(CAST(nhgnummer AS INT), uitslag)
+             -> {{ translate_labcode_answers('CAST(nhgnummer AS INT)', 'uitslag') }}
+    """
+    def _split_args(argstr: str) -> List[str]:
+        """Split comma-separated args respecting parentheses and string literals."""
+        args, current, depth = [], '', 0
+        in_string, string_char = False, None
+        for char in argstr:
+            if char in ('"', "'"):
+                if not in_string:
+                    in_string, string_char = True, char
+                elif char == string_char:
+                    in_string = False
                 current += char
             elif char == '(' and not in_string:
                 depth += 1
@@ -271,70 +326,101 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
                 current = ''
             else:
                 current += char
-            i += 1
         if current.strip():
             args.append(current.strip())
         return args
 
-    def find_function_calls(s, func_name):
-        # Returns list of (start, end, args_str) for each function call
-        results = []
-        pattern = re.compile(rf'(?:(?:indelingen|public)\.)?{re.escape(func_name)}\s*\(', re.IGNORECASE)
-        for m in pattern.finditer(s):
-            start = m.start()
-            i = m.end()
-            depth = 1
-            in_string = False
-            string_char = None
-            while i < len(s):
-                c = s[i]
-                if c in ('"', "'"):
-                    if not in_string:
-                        in_string = True
-                        string_char = c
-                    elif c == string_char:
-                        in_string = False
-                        string_char = None
-                elif c == '(' and not in_string:
-                    depth += 1
-                elif c == ')' and not in_string:
-                    depth -= 1
-                    if depth == 0:
-                        # Found matching close
-                        args_str = s[m.end():i]
-                        results.append((start, i+1, args_str))
-                        break
-                i += 1
-        return results
-
-    for func_name in function_names:
-        # Find all function calls with correct parenthesis matching
-        calls = find_function_calls(sql, func_name)
-        # Replace from the end to avoid messing up indices
+    logging.info("Replacing functions with dbt macro syntax")
+    for macro_name in macro_names:
+        calls = _find_function_calls(sql, macro_name)
         for start, end, args in reversed(calls):
-            macro_name = func_name.lower()
             if not args.strip():
-                replacement = f"{{{{ {macro_name}() }}}}"
+                replacement = f"{{{{ {macro_name.lower()}() }}}}"
             else:
-                arg_list = smart_split_args(args)
-                quoted_args = []
-                for arg in arg_list:
-                    arg_strip = arg.strip()
-                    # Replace ${varname} with {{ varname }}, preserving surrounding quotes if they exist
-                    # First handle quoted variables: '${var}' or "${var}"
-                    def replace_quoted_var(m):
-                        quote = m.group(1)
-                        var_name = m.group(2)
-                        return f"{quote}{{{{ {var_name} }}}}{quote}"
-                    arg_strip = re.sub(r"(['\"])\$\{([a-zA-Z_][\w]*)\}\1", replace_quoted_var, arg_strip)
-                    # Then handle unquoted variables: ${var}
-                    arg_strip = re.sub(r"\$\{([a-zA-Z_][\w]*)\}", lambda m: f"{{{{ {m.group(1)} }}}}", arg_strip)
-                    # Escape single quotes with backslash (for Jinja string literals)
-                    arg_strip = arg_strip.replace("'", "\\'")
-                    # Quote the argument (single quotes) - Jinja will still evaluate {{ }} inside quotes
-                    quoted_args.append(f"'{arg_strip}'")
-                replacement = f"{{{{ {macro_name}({', '.join(quoted_args)}) }}}}"
+                arg_list = _split_args(args)
+                quoted = [f"'{a.replace(chr(39), chr(92) + chr(39))}'" for a in arg_list]
+                replacement = f"{{{{ {macro_name.lower()}({', '.join(quoted)}) }}}}"
             sql = sql[:start] + replacement + sql[end:]
+    return sql
+
+
+def replace_functions_with_table_wrapper(sql: str, function_names: List[str]) -> str:
+    """Wrap dbt function() calls in TABLE(...).
+
+    Example: {{ function('name') }}(args) -> TABLE({{ function('name') }}(args))
+    """
+    logging.info("Wrapping functions with TABLE(...)")
+    for func_name in function_names:
+        # Match already-converted dbt function() calls: {{ function('func_name') }}(...)
+        escaped_name = re.escape(func_name.lower())
+        pattern_prefix = r"(\{\{\s*function\(['\"]?" + escaped_name + r"['\"]?\)\s*\}\})"
+        
+        # Find all occurrences and match their opening parenthesis and balanced args
+        # Process from end to start to avoid position invalidation
+        matches = list(re.finditer(pattern_prefix, sql, re.IGNORECASE))
+        for match in reversed(matches):
+            start_pos = match.end()
+            if start_pos < len(sql) and sql[start_pos] == '(':
+                # Find matching closing parenthesis
+                paren_count = 1
+                end_pos = start_pos + 1
+                while end_pos < len(sql) and paren_count > 0:
+                    if sql[end_pos] == '(':
+                        paren_count += 1
+                    elif sql[end_pos] == ')':
+                        paren_count -= 1
+                    end_pos += 1
+                
+                if paren_count == 0:
+                    # Found matching pair, wrap this call
+                    call = sql[match.start():end_pos]
+                    wrapped = f"TABLE({call})"
+                    sql = sql[:match.start()] + wrapped + sql[end_pos:]
+    return sql
+
+
+def replace_macros_with_table_wrapper(sql: str, macro_names: List[str]) -> str:
+    """Wrap dbt macro calls in TABLE(...).
+
+    Example: {{ macro_name(args) }} -> TABLE({{ macro_name(args) }})
+    """
+    logging.info("Wrapping macros with TABLE(...)")
+    for macro_name in macro_names:
+        # Match already-converted dbt macro calls: {{ macro_name(...) }}
+        escaped_name = re.escape(macro_name.lower())
+        pattern_prefix = r"(\{\{\s*" + escaped_name + r"\s*)"
+        
+        # Find all occurrences and match balanced parentheses/braces
+        matches = list(re.finditer(pattern_prefix, sql, re.IGNORECASE))
+        for match in reversed(matches):
+            # After the macro name, we need to find the opening (
+            pos = match.end()
+            # Skip whitespace
+            while pos < len(sql) and sql[pos] in ' \t':
+                pos += 1
+            
+            if pos < len(sql) and sql[pos] == '(':
+                # Find matching closing parenthesis
+                paren_count = 1
+                end_pos = pos + 1
+                while end_pos < len(sql) and paren_count > 0:
+                    if sql[end_pos] == '(':
+                        paren_count += 1
+                    elif sql[end_pos] == ')':
+                        paren_count -= 1
+                    end_pos += 1
+                
+                # Find closing }}
+                close_pos = end_pos
+                while close_pos < len(sql) - 1 and not (sql[close_pos:close_pos+2] == '}}'):
+                    close_pos += 1
+                close_pos += 2  # Include the }}
+                
+                if paren_count == 0 and close_pos <= len(sql):
+                    # Found complete macro call, wrap it
+                    call = sql[match.start():close_pos]
+                    wrapped = f"TABLE({call})"
+                    sql = sql[:match.start()] + wrapped + sql[close_pos:]
     return sql
 
 
@@ -361,13 +447,28 @@ def generate_dbt_model(
         
         # Preprocess, preserve macros, convert SQL, restore macros
         preprocessed = preprocess_sql(query)
+
         temp_sql, macros = preserve_dbt_macros(preprocessed)
         
-        function_macros = config.get('function_macros', [])
-        converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=function_macros)
+        function_names = config.get('functions', config.get('function_macros', []))
+        macro_names = config.get('macros', [])
+        table_functions = config.get('table_functions', [])
+        table_macros = config.get('table_macros', [])
         
-        if function_macros:
-            converted_sql = replace_functions_with_macros(converted_sql, function_macros)
+        # Combine functions with table_functions for replacement (will wrap table ones after)
+        all_function_names = list(set(function_names + table_functions))
+        all_macro_names = list(set(macro_names + table_macros))
+        preserve_function_names = list(set(all_function_names + all_macro_names))
+        converted_sql = convert_postgres_to_snowflake(temp_sql, function_macros=preserve_function_names)
+
+        if all_function_names:
+            converted_sql = replace_functions_with_macros(converted_sql, all_function_names)
+        if all_macro_names:
+            converted_sql = replace_functions_with_dbt_macros(converted_sql, all_macro_names)
+        if table_functions:
+            converted_sql = replace_functions_with_table_wrapper(converted_sql, table_functions)
+        if table_macros:
+            converted_sql = replace_macros_with_table_wrapper(converted_sql, table_macros)
         
         converted_sql = restore_dbt_macros(converted_sql, macros)
         
@@ -413,11 +514,8 @@ def generate_dbt_model(
         external_vars.discard('agb')
         # Build dbt config block
         # Check if report should be materialized as table
-        materialized_view_reports = config.get('materialized_view_reports', [])
         materialization = 'table' #if report_name.lower() in materialized_view_reports else 'view'
         
-        # Build vars part
-        vars_part = ', '.join(f"'{var}': \"\"" for var in sorted(external_vars))
         
         # Build tags list, only add view_metadata['type'] if it exists
         tags = [f"'{report_type}'"]
@@ -430,8 +528,7 @@ def generate_dbt_model(
             "{{",
             "  config(",
             f"    materialized='{materialization}',",
-            f"    tags=[{tags_str}],",
-            f"    vars={{ 'agb': none, {vars_part} }}"
+            f"    tags=[{tags_str}]"
         ]
         # Add schema if needed
         if view_metadata.get('type') == 'supportview':
