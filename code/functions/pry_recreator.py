@@ -4,6 +4,7 @@ import functions
 from pathlib import Path
 import re
 import os
+import shutil
 from functools import lru_cache
 
 SF_SQL_FOLDER = "/home/coder/proigia_sql_transpiler_dash/code/functions/dm_dash_new" #TODO change this to whatever it is in actuality
@@ -11,7 +12,7 @@ PROIGIA_DEFINITION = "/home/coder/proigia_definition" #TODO change this to whate
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_CANDIDATES = [PROJECT_ROOT / "config.yml", PROJECT_ROOT / "config.yaml"]
 #SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
-logger = functions.setup_logging("/home/coder/pry_recreator.log", log_level="debug")
+logger = functions.setup_logging("/home/coder/pry_recreator.log", log_level="warning")
 
 @lru_cache(maxsize=1)
 def get_database_prefixes() -> tuple[str, ...]:
@@ -273,10 +274,12 @@ def pry_from_pry(
 
 def process_proigia_definition():
     """
-    Process the entire Proigia definition folder, creating new PRY files for each report.
+    Process the entire Proigia definition folder, creating new PRY files for each report
+    and copying all other files to the _sf folders.
     """
     for report_folder in os.listdir(PROIGIA_DEFINITION):
-        if not os.path.isdir(os.path.join(PROIGIA_DEFINITION, report_folder)):
+        report_path = os.path.join(PROIGIA_DEFINITION, report_folder)
+        if not os.path.isdir(report_path):
             continue
         if report_folder.endswith("_sf"):
             continue
@@ -284,13 +287,37 @@ def process_proigia_definition():
             continue
         logger.info(f"Processing report folder: {report_folder}")
         # find all .pry files in the folder
-        template_pry_files = functions.find_pry_files(Path(os.path.join(PROIGIA_DEFINITION, report_folder)), ignored_keywords=[])
+        template_pry_files = functions.find_pry_files(Path(report_path), ignored_keywords=[])
         if len(template_pry_files) == 0:
             logger.warning(f"No .pry file found in {report_folder}, skipping.")
             continue
-        # create output folder if it doesn't exist yet and write new pry files
+        # create output folder if it doesn't exist yet
         output_folder = f"{PROIGIA_DEFINITION}/{report_folder}_sf"
-        os.makedirs(output_folder, exist_ok=True) 
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Copy all files from the source folder to the output folder (excluding .pry files)
+        logger.info(f"Copying all files from {report_folder} to {report_folder}_sf")
+        for item in os.listdir(report_path):
+            src_item = os.path.join(report_path, item)
+            dst_item = os.path.join(output_folder, item)
+            
+            # Skip .pry files - they will be generated separately with _sf suffix
+            if item.endswith('.pry'):
+                logger.debug(f"Skipping .pry file: {item}")
+                continue
+            
+            if os.path.isdir(src_item):
+                # Remove existing directory if it exists and copy the entire directory
+                if os.path.exists(dst_item):
+                    shutil.rmtree(dst_item)
+                shutil.copytree(src_item, dst_item)
+                logger.debug(f"Copied directory: {item}")
+            else:
+                # Copy individual file
+                shutil.copy2(src_item, dst_item)
+                logger.debug(f"Copied file: {item}")
+        
+        # Now write new pry files (these will overwrite copied .pry files with updated content)
         for template_pry_file in template_pry_files:
             logger.info(f"Processing template PRY file: {template_pry_file}")
             template_pry_filename = Path(template_pry_file).stem
