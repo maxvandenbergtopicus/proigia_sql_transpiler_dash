@@ -100,9 +100,14 @@ def sql_to_pry_query_block(
             sql = re.sub(rf"\b(?:{schema_pattern})\.P\d{{8}}\.", "", sql, flags=re.IGNORECASE)
 
     lines = ["- |"]
-    # Replace CREATE MATERIALIZED VIEW with CREATE TABLE
+    # Replace CREATE ... VIEW variants with CREATE TABLE
     create_statement = view[1].strip()
-    create_statement = re.sub(r"\bCREATE\s+MATERIALIZED\s+VIEW\b", "CREATE TABLE", create_statement, flags=re.IGNORECASE)
+    create_statement = re.sub(
+        r"\bCREATE\s+(?:MATERIALIZED\s+)?VIEW\b",
+        "CREATE TABLE",
+        create_statement,
+        flags=re.IGNORECASE,
+    )
     lines.append(f"    {create_statement}")
     # add indentation to each line of the SQL
     lines.extend(f"    {line}" for line in sql.splitlines())
