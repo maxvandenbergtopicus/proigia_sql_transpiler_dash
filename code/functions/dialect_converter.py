@@ -283,32 +283,49 @@ class FixedSnowflake(Snowflake):
                 return f"ARRAY_GENERATE_RANGE({start}, ({end}) + ({step_sql}), {step_sql})"
         
         def anonymous_sql(self, expression: exp.Anonymous) -> str:
-            """Handle function conversions (AGE, ARRAYS_OVERLAP, ARRAY_POSITION, CHAR_LENGTH)"""
-            if expression.this.upper() == "AGE":
-                args = expression.expressions
+            """Handle function conversions (AGE, ARRAYS_OVERLAP, ARRAY_POSITION, CHAR_LENGTH, override_kwartaal, patient_kwartaal, get_hist_kwartaalindicatoren)"""
+            func_name = expression.this.upper()
+            args = expression.expressions
+
+            if 1 == 2: #func_name == "OVERRIDE_KWARTAAL": 
+                # Custom translation for override_kwartaal(arg)
+                if len(args) == 1:
+                    arg_sql = self.sql(args[0])
+                    return f"override_patientenlijst WHERE jaar = YEAR(to_date({arg_sql})) AND kwartaal = QUARTER({arg_sql})"
+                # Fallback if wrong number of arguments
+                return "override_patientenlijst WHERE jaar = YEAR(to_date(arg)) AND kwartaal = QUARTER(arg)"
+
+            if 1==2: #func_name == "PATIENT_KWARTAAL":
+                # TODO: Implement custom translation for patient_kwartaal
+                # Example placeholder:
+                return "-- TODO: Implement custom translation for patient_kwartaal(arg)"
+
+            if 1==2: #func_name == "GET_HIST_KWARTAALINDICATOREN":
+                # TODO: Implement custom translation for get_hist_kwartaalindicatoren
+                # Example placeholder:
+                return "-- TODO: Implement custom translation for get_hist_kwartaalindicatoren(arg)"
+
+            if func_name == "AGE":
                 if len(args) == 2:
                     # AGE(end, start) -> DATEDIFF(month, start, end) for better precision
                     return f"DATEDIFF(year, {self.sql(args[1])}, {self.sql(args[0])})"
                 elif len(args) == 1:
                     # AGE(timestamp) -> DATEDIFF(month, timestamp, CURRENT_TIMESTAMP())
                     return f"DATEDIFF(year, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
-            
-            if expression.this.upper() == "ARRAYS_OVERLAP":
-                args = expression.expressions
+
+            if func_name == "ARRAYS_OVERLAP":
                 return f"ARRAYS_OVERLAP({self.sql(args[0])}, {self.sql(args[1])})"
-            
-            if expression.this.upper() == "ARRAY_POSITION":
-                args = expression.expressions
+
+            if func_name == "ARRAY_POSITION":
                 if len(args) == 2:
                     # PostgreSQL: ARRAY_POSITION(array, value) -> Snowflake: ARRAY_POSITION(value, array)
                     return f"ARRAY_POSITION({self.sql(args[1])}, {self.sql(args[0])})"
-            
-            if expression.this.upper() == "CHAR_LENGTH":
-                args = expression.expressions
+
+            if func_name == "CHAR_LENGTH":
                 if len(args) == 1:
                     # PostgreSQL: CHAR_LENGTH(string) -> Snowflake: LENGTH(string)
                     return f"LENGTH({self.sql(args[0])})"
-            
+
             # For other anonymous functions, use default behavior
             return super().anonymous_sql(expression)
         
@@ -1451,7 +1468,7 @@ def convert_like_any_to_regexp_like(sql: str) -> str:
         udf_name = "ILIKE_ANY" if like_op == 'ILIKE' else "LIKE_ANY"
         replacement = (
             f"{{{{ function('{udf_name}') }}}}({left_expr}, "
-            f"(SELECT LISTAGG({column}, '|') {rest_of_query}))"
+            f"(SELECT LISTAGG(ARRAY_TO_STRING({column}, '|'), '|') {rest_of_query}))"
         )
         sql = sql[:left_start] + replacement + sql[match.end():]
 
@@ -2799,6 +2816,54 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     if 'ROUND(' in converted.upper():
         logging.info("Wrapping ROUND(expr, n) as CAST(ROUND(expr, n) AS NUMBER(36, n))")
         converted = wrap_round_with_number_scale(converted)
+
+    # Post-process: Normalize date string literals with '/' separators inside TO_DATE / TRY_TO_DATE.
+    # PostgreSQL accepts '2026/01/01' even with a 'yyyy-mm-dd' format; Snowflake does not.
+    # Replace slashes with dashes only inside quoted string literals that are the first argument
+    # of TO_DATE or TRY_TO_DATE and match a date-like pattern (digits separated by slashes).
+    if re.search(r'\b(?:TO_DATE|TRY_TO_DATE|DATE)\s*\(', converted, re.IGNORECASE):
+        logging.info("Normalizing '/' to '-' in date literals inside TO_DATE / TRY_TO_DATE / DATE")
+
+        def _normalize_date_slashes(m: re.Match) -> str:
+            fn = m.group(1)       # TO_DATE, TRY_TO_DATE, or DATE
+            literal = m.group(2)  # quoted date string, e.g. '2026/01/01'
+            rest = m.group(3)     # everything after the first argument
+            normalized = literal.replace('/', '-')
+            return f"{fn}({normalized}{rest}"
+
+        converted = re.sub(
+            r"\b(TO_DATE|TRY_TO_DATE|DATE)\s*\(\s*('[^']*\d{1,4}/\d{1,2}/\d{1,4}[^']*')\s*((?:,|\))[^)]*\)?)",
+            _normalize_date_slashes,
+            converted,
+            flags=re.IGNORECASE,
+        )
+
+        # Wrap column reference arguments with REPLACE(..., '/', '-') so that runtime values
+        # containing slashes (e.g. '2026/01/01') are accepted by Snowflake's TO_DATE.
+        # Only applies when a format string is present (two-argument form) and the first
+        # argument is a column reference (identifier, optionally table-qualified), not a literal.
+        logging.info("Wrapping column arguments of TO_DATE / TRY_TO_DATE with REPLACE(..., '/', '-')")
+
+        def _wrap_col_with_replace(m: re.Match) -> str:
+            fn = m.group(1)     # TO_DATE or TRY_TO_DATE
+            col = m.group(2)    # column reference, e.g. uitslag or mw.uitslag
+            fmt = m.group(3)    # format string, e.g. 'MM-DD-YYYY'
+            # Skip if already wrapped
+            if col.upper().startswith('REPLACE('):
+                return m.group(0)
+            # Only wrap when the format contains a separator — formats like 'DDMMYYYY'
+            # are purely numeric so a slash can never appear in valid input.
+            fmt_inner = fmt.strip("'\"")
+            if not re.search(r'[-/. ]', fmt_inner):
+                return m.group(0)
+            return f"{fn}(REPLACE({col}, '/', '-'), {fmt})"
+
+        converted = re.sub(
+            r"\b(TO_DATE|TRY_TO_DATE|DATE)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*,\s*('[^']+')\s*\)",
+            _wrap_col_with_replace,
+            converted,
+            flags=re.IGNORECASE,
+        )
 
     return converted
 
