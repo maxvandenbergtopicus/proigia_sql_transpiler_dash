@@ -599,6 +599,34 @@ def convert_postgres_regex_to_rlike(sql: str) -> str:
     return sql
 
 
+def convert_ja_nee_ilike_to_equals(sql: str) -> str:
+        """
+        Convert boolean-like Dutch text comparisons to deterministic equality checks.
+
+        Rewrites:
+            col ILIKE 'ja'  -> col = 'ja'
+            col ILIKE 'nee' -> col = 'nee'
+
+        Also handles NOT ILIKE variants safely:
+            col NOT ILIKE 'ja'  -> col <> 'ja'
+            col NOT ILIKE 'nee' -> col <> 'nee'
+        """
+        # Handle NOT ILIKE first so it is not partially rewritten by the ILIKE rule.
+        sql = re.sub(
+                r"\bNOT\s+ILIKE\s*('(?:ja|nee)')",
+                r"<> \1",
+                sql,
+                flags=re.IGNORECASE,
+        )
+        sql = re.sub(
+                r"\bILIKE\s*('(?:ja|nee)')",
+                r"= \1",
+                sql,
+                flags=re.IGNORECASE,
+        )
+        return sql
+
+
 def add_varchar_cast_to_untyped_array_access(sql: str) -> str:
     """
     Add ::varchar cast to array subscript accesses that have no explicit type cast.
@@ -856,17 +884,85 @@ def convert_array_remove_to_variant(sql: str) -> str:
     
     return sql
 
+def remove_redundant_literal_and_null_casts(sql: str) -> str:
+    """
+    Remove unnecessary casts on numeric literals and NULL values.
+
+    Examples:
+        1::numeric            -> 1
+        -2.5::double precision -> -2.5
+        CAST(3 AS DECIMAL(10,2)) -> 3
+        NULL::varchar         -> NULL
+        CAST(NULL AS DATE)    -> NULL
+
+    This intentionally leaves casts on non-literal expressions untouched.
+    """
+    numeric_types = (
+        r'NUMERIC|DECIMAL|NUMBER|REAL|FLOAT|FLOAT4|FLOAT8|DOUBLE\s+PRECISION|'
+        r'SMALLINT|INTEGER|INT|BIGINT'
+    )
+
+    # Remove PostgreSQL-style casts on numeric literals.
+    sql = re.sub(
+        rf'(?<![\w\]])([+-]?\d+(?:\.\d+)?)\s*::\s*(?:{numeric_types})(?:\s*\([^)]*\))?\b',
+        r'\1',
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove CAST(numeric_literal AS <numeric type>).
+    sql = re.sub(
+        rf'\bCAST\s*\(\s*([+-]?\d+(?:\.\d+)?)\s+AS\s+(?:{numeric_types})(?:\s*\([^)]*\))?\s*\)',
+        r'\1',
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove PostgreSQL-style casts on NULL.
+    sql = re.sub(
+        r'\bNULL\s*::\s*[a-zA-Z_][a-zA-Z0-9_]*(?:\s+precision|\s+varying)?(?:\s*\([^)]*\))?(?:\s*\[\s*\])?',
+        'NULL',
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove CAST(NULL AS <type>). Keep nested parentheses around NULL as-is.
+    sql = re.sub(
+        r'\bCAST\s*\(\s*NULL\s+AS\s+[a-zA-Z_][a-zA-Z0-9_]*(?:\s+precision|\s+varying)?(?:\s*\([^)]*\))?(?:\s*\[\s*\])?\s*\)',
+        'NULL',
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    return sql
+
 def convert_cast_to_try_cast(sql: str) -> str:
     """
-    Convert CAST(... AS DATE) to TRY_TO_DATE, and CAST(... AS DECIMAL/NUMBER/NUMERIC)
-    to TRY_TO_DECFLOAT(TO_VARCHAR(expr)).
+    Convert CAST(... AS DATE) to TO_DATE(expr), and CAST(... AS DECIMAL/NUMBER/NUMERIC)
+    to TO_DECFLOAT(expr).
     """
-    # Numeric types → TRY_TO_DECFLOAT(TO_VARCHAR(expr))
+    # Numeric types → TO_DECFLOAT(expr)
     numeric_types = {'DECIMAL', 'NUMBER', 'NUMERIC'}
-    # Date type → TRY_TO_DATE(TO_VARCHAR(expr))
-    date_types = {'DATE': 'TRY_TO_DATE'}
+    # Date type → TO_DATE(expr)
+    date_types = {'DATE': 'TO_DATE'}
 
     target_types = numeric_types | set(date_types.keys())
+
+    def _is_array_access_expression(expr: str) -> bool:
+        """Return True for identifier[index] or identifier[index][index] style access."""
+        return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*(?:\s*\[\s*[^\]]+\s*\])+$', expr.strip()))
+
+    def _ensure_varchar_for_array_access(expr: str) -> str:
+        """TO_DECFLOAT requires array element values to be coerced to text first."""
+        stripped = expr.strip()
+        if not _is_array_access_expression(stripped):
+            return stripped
+        # Avoid double-wrapping when already string-cast.
+        if re.search(r'\bCAST\s*\(\s*.+\s+AS\s+VARCHAR\s*\)', stripped, re.IGNORECASE):
+            return stripped
+        if re.search(r'::\s*VARCHAR\b', stripped, re.IGNORECASE):
+            return stripped
+        return f'CAST({stripped} AS VARCHAR)'
 
     # Process each target type
     for dtype in target_types:
@@ -896,16 +992,17 @@ def convert_cast_to_try_cast(sql: str) -> str:
                     cast_content = sql[expr_start:i-1]
                     
                     # Check if this CAST is for our target type
-                    as_pattern = rf'\s+AS\s+{dtype}\s*$'
+                    as_pattern = rf'\s+AS\s+{dtype}(?:\s*\([^)]*\))?\s*$'
                     if re.search(as_pattern, cast_content, re.IGNORECASE):
                         as_match = re.search(as_pattern, cast_content, re.IGNORECASE)
                         expr = cast_content[:as_match.start()].strip()
                         
                         if dtype in numeric_types:
-                            result.append(f'TRY_TO_DECFLOAT(TO_VARCHAR({expr}))')
+                            expr_for_numeric = _ensure_varchar_for_array_access(expr)
+                            result.append(f'TO_DECFLOAT({expr_for_numeric})')
                         else:
                             func_name = date_types[dtype]
-                            result.append(f'{func_name}(TO_VARCHAR({expr}))')
+                            result.append(f'{func_name}({expr})')
                     else:
                         # Keep original CAST
                         result.append(sql[start:i])
@@ -1599,6 +1696,56 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
     # Default month columns if none specified
     if month_columns is None:
         month_columns = ['validtime']  # Default list
+
+    # ============================================================================
+    # STEP 0: Direct rewrite for common CAST(date + dynamic interval AS DATE)
+    # ============================================================================
+    # Restrict to simple identifier expressions to avoid accidental wide matches.
+    direct_dynamic_date_cast_pattern = re.compile(
+        r"CAST\s*\(\s*\(\s*([A-Za-z_][\w\.]*)\s*([+-])\s*CAST\s*\(\s*\(\s*([A-Za-z_][\w\.]*)\s*\|\|\s*'([^']+)'\s*\)\s*AS\s+INTERVAL\s*\)\s*\)\s*AS\s+DATE\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _rewrite_direct_dynamic_date_cast(match):
+        date_expr = match.group(1).strip()
+        operator = match.group(2)
+        amount_expr = match.group(3).strip()
+        unit_str = match.group(4).strip()
+
+        unit_only_match = re.match(r'^\s*(year|month|week|day|hour|minute|second)s?\s*$', unit_str, re.IGNORECASE)
+        if not unit_only_match:
+            return match.group(0)
+
+        unit = unit_only_match.group(1).upper()
+        if operator == '-':
+            return f"DATEADD({unit}, -({amount_expr}), {date_expr})"
+        return f"DATEADD({unit}, {amount_expr}, {date_expr})"
+
+    sql = direct_dynamic_date_cast_pattern.sub(_rewrite_direct_dynamic_date_cast, sql)
+
+    # Also handle direct arithmetic without outer CAST(... AS DATE):
+    #   date_expr +/- CAST((amount_expr || ' day') AS INTERVAL)
+    dynamic_interval_arith_pattern = re.compile(
+        r"([A-Za-z_][\w\.]*)\s*([+-])\s*CAST\s*\(\s*\(\s*(.+?)\s*\|\|\s*'([^']+)'\s*\)\s*AS\s+INTERVAL\s*\)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _rewrite_dynamic_interval_arith(match):
+        date_expr = match.group(1).strip()
+        operator = match.group(2)
+        amount_expr = match.group(3).strip()
+        unit_str = match.group(4).strip()
+
+        unit_only_match = re.match(r'^\s*(year|month|week|day|hour|minute|second)s?\s*$', unit_str, re.IGNORECASE)
+        if not unit_only_match:
+            return match.group(0)
+
+        unit = unit_only_match.group(1).upper()
+        if operator == '-':
+            return f"DATEADD({unit}, -({amount_expr}), {date_expr})"
+        return f"DATEADD({unit}, {amount_expr}, {date_expr})"
+
+    sql = dynamic_interval_arith_pattern.sub(_rewrite_dynamic_interval_arith, sql)
     
     # ============================================================================
     # STEP 1: Handle dynamic interval patterns (concat/|| with ::interval)
@@ -1608,9 +1755,7 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
     
     dynamic_interval_pattern = re.compile(
         r"concat\s*\(\s*([^,]+?)\s*,\s*'([^']+)'\s*\)\s*::\s*interval|"
-        r"\(\s*([^)]+?)\s*\|\|\s*'([^']+)'\s*\)\s*::\s*interval|"
-        # sqlglot emits (expr || ' day')::interval as CAST((expr || ' day') AS INTERVAL)
-        r"CAST\s*\(\s*\(\s*([^|]+?)\s*\|\|\s*'([^']+)'\s*\)\s*AS\s+INTERVAL\s*\)",
+        r"\(\s*([^)]+?)\s*\|\|\s*'([^']+)'\s*\)\s*::\s*interval",
         re.IGNORECASE
     )
     
@@ -1648,6 +1793,7 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
             elif unit_only_match:
                 # Dynamic interval: concat(expr, ' day') means expr days
                 unit = unit_only_match.group(1).upper()
+
                 # Mark it specially so we can handle it in date arithmetic
                 replacement = f"__DYNAMIC_INTERVAL__({expr}, {unit})"
             else:
@@ -1788,6 +1934,26 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
         
         if sql == original_sql:
             break
+
+    # ============================================================================
+    # STEP 1b2: Safeguard for malformed leaked markers
+    # ============================================================================
+    # Rare malformed output can look like:
+    # __DYNAMIC_INTERVAL__(date_expr + CAST((amount, DAY)) AS DATE)
+    # Convert it directly to DATEADD(DAY, amount, date_expr)
+    malformed_marker_pattern = re.compile(
+        r"__DYNAMIC_INTERVAL__\(\s*(.+?)\s*\+\s*CAST\s*\(\s*\(\s*([^,]+?)\s*,\s*(\w+)\s*\)\s*\)\s*AS\s+DATE\s*\)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _replace_malformed_marker(match):
+        date_expr = match.group(1).strip()
+        amount_expr = match.group(2).strip()
+        unit = match.group(3).strip().upper()
+        return f"DATEADD({unit}, {amount_expr}, {date_expr})"
+
+    if '__DYNAMIC_INTERVAL__(' in sql:
+        sql = malformed_marker_pattern.sub(_replace_malformed_marker, sql)
     
     # ============================================================================
     # STEP 1c: Handle compound intervals (e.g., '3 months 1 day')
@@ -2398,6 +2564,12 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     if "E'" in sql or 'E"' in sql:
         logging.info("Converting PostgreSQL escape strings (E'...')")
         sql = convert_postgres_escape_strings(sql)
+
+    # Pre-process: Remove redundant casts on numeric literals and NULL values.
+    # Keep expression casts intact because they can affect runtime semantics.
+    if '::' in sql or 'cast(' in sql.lower():
+        logging.info("Removing redundant numeric-literal and NULL casts")
+        sql = remove_redundant_literal_and_null_casts(sql)
     
     # Pre-process: Replace citext with varchar (case-insensitive text type)
     if 'citext' in sql.lower():
@@ -2432,10 +2604,15 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     if '~' in sql:
         logging.info("Converting PostgreSQL regex match operator ~ to RLIKE")
         sql = convert_postgres_regex_to_rlike(sql)
+
+    # Pre-process: Replace ILIKE 'ja'/'nee' with direct equality checks.
+    if 'ilike' in sql.lower() and ("'ja'" in sql.lower() or "'nee'" in sql.lower()):
+        logging.info("Converting ILIKE 'ja'/'nee' to '=' comparisons")
+        sql = convert_ja_nee_ilike_to_equals(sql)
     
     # Pre-process: Add ::varchar to array subscript accesses without an explicit cast
-    # so that identifier[N] becomes identifier[N]::varchar and is converted to
-    # CAST(identifier[N-1] AS VARCHAR) in Snowflake instead of staying as VARIANT.
+     #so that identifier[N] becomes identifier[N]::varchar and is converted to
+     #CAST(identifier[N-1] AS VARCHAR) in Snowflake instead of staying as VARIANT.
     if '[' in sql:
         logging.info("Adding ::varchar cast to untyped array subscript accesses")
         sql = add_varchar_cast_to_untyped_array_access(sql)
