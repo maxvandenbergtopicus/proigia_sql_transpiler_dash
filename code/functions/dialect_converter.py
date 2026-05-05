@@ -904,8 +904,13 @@ def convert_cast_to_try_cast(sql: str) -> str:
                         if dtype in numeric_types:
                             result.append(f'TRY_TO_DECFLOAT(TO_VARCHAR({expr}))')
                         else:
-                            func_name = date_types[dtype]
-                            result.append(f'{func_name}(TO_VARCHAR({expr}))')
+                            # For static date literals, prefer TO_DATE('...') to avoid
+                            # unnecessary TRY_TO_DATE(TO_VARCHAR(...)) wrapping.
+                            if re.match(r"^'[^']+'$", expr):
+                                result.append(f'TO_DATE({expr})')
+                            else:
+                                func_name = date_types[dtype]
+                                result.append(f'{func_name}(TO_VARCHAR({expr}))')
                     else:
                         # Keep original CAST
                         result.append(sql[start:i])
@@ -918,6 +923,30 @@ def convert_cast_to_try_cast(sql: str) -> str:
         
         sql = ''.join(result)
     
+    return sql
+
+
+def simplify_redundant_cast_artifacts(sql: str) -> str:
+    """
+    Simplify noisy cast artifacts that are semantically equivalent but less readable.
+
+    - CAST(NULL AS VARCHAR) -> NULL
+    - TRY_TO_DATE(TO_VARCHAR('YYYY-MM-DD')) -> TO_DATE('YYYY-MM-DD')
+    """
+    sql = re.sub(
+        r"\bCAST\s*\(\s*NULL\s+AS\s+VARCHAR(?:\s*\(\s*\d+\s*\))?\s*\)",
+        "NULL",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    sql = re.sub(
+        r"\bTRY_TO_DATE\s*\(\s*TO_VARCHAR\s*\(\s*('[^']+')\s*\)\s*\)",
+        r"TO_DATE(\1)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
     return sql
 
 def wrap_round_with_number_scale(sql: str) -> str:
@@ -2524,6 +2553,7 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     if 'CAST(' in converted.upper():
         logging.info("Converting CAST to TRY_TO_DATE / TRY_CAST(... AS DECFLOAT) for DATE, DECIMAL, NUMBER, NUMERIC types")
         converted = convert_cast_to_try_cast(converted)
+        converted = simplify_redundant_cast_artifacts(converted)
     
     # Post-process: Rewrite ARRAY_REMOVE to a PostgreSQL-compatible Snowflake UDF
     if 'array_remove(' in converted.lower():
