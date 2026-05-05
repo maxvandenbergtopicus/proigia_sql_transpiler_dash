@@ -5,14 +5,26 @@ from pathlib import Path
 import re
 import os
 import shutil
+import yaml
 from functools import lru_cache
 
-SF_SQL_FOLDER = "/home/coder/proigia_sql_transpiler_dash/code/functions/dm_dash_new" #TODO change this to whatever it is in actuality
-PROIGIA_DEFINITION = "/home/coder/proigia_definition" #TODO change this to whatever it is in actuality
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_CANDIDATES = [PROJECT_ROOT / "config.yml", PROJECT_ROOT / "config.yaml"]
+
+
+def load_config() -> dict:
+    for config_path in CONFIG_CANDIDATES:
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+    raise FileNotFoundError("No config.yml or config.yaml found in project root")
+
+
+config = load_config()
+SF_SQL_FOLDER = Path(config["dbt_output_path"])
+PROIGIA_DEFINITION = Path(config["proigia_defintion_path"])
 #SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
-logger = functions.setup_logging("/home/coder/pry_recreator.log", log_level="warning")
+logger = functions.setup_logging("pry_recreator.log", log_level="warning")
 
 @lru_cache(maxsize=1)
 def get_database_prefixes() -> tuple[str, ...]:
