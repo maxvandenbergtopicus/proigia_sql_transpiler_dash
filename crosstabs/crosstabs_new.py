@@ -7,12 +7,12 @@ import sqlglot
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 
-def wrap_array_constructs_with_array_to_string(sql: str, array_name: str = None) -> tuple[str, int]:
+def cast_array_constructs_to_variant(sql: str, array_name: str = None) -> tuple[str, int]:
     """
-    Wrap ARRAY_CONSTRUCT(...) call with array_to_string(..., ';') if it's aliased as array_name.
+    Cast ARRAY_CONSTRUCT(...) to VARIANT (ARRAY_CONSTRUCT(...)::variant).
 
-    If array_name is provided, only wraps the ARRAY_CONSTRUCT that has that alias.
-    If array_name is None, wraps all unwrapped ARRAY_CONSTRUCT calls (legacy behavior).
+    If array_name is provided, only casts the ARRAY_CONSTRUCT that has that alias.
+    If array_name is None, casts all matching ARRAY_CONSTRUCT calls.
 
     This is needed for crosstab payload/value arrays, including ARRAY_CONSTRUCT
     calls that appear inside CASE expressions where the enclosing alias is on the
@@ -20,7 +20,7 @@ def wrap_array_constructs_with_array_to_string(sql: str, array_name: str = None)
     """
     result = []
     i = 0
-    wrapped_count = 0
+    cast_count = 0
     pattern = re.compile(r'ARRAY_CONSTRUCT\s*\(', re.IGNORECASE)
 
     while i < len(sql):
@@ -62,8 +62,8 @@ def wrap_array_constructs_with_array_to_string(sql: str, array_name: str = None)
 
         func_sql = sql[func_start:j]
         
-        # Check if this ARRAY_CONSTRUCT should be wrapped
-        should_wrap = False
+        # Check if this ARRAY_CONSTRUCT should be casted
+        should_cast = False
         if array_name:
             # Strategy 1: ARRAY_CONSTRUCT(...) AS array_name — alias directly follows closing paren
             rest = sql[j:]
@@ -76,19 +76,19 @@ def wrap_array_constructs_with_array_to_string(sql: str, array_name: str = None)
             if preceded_by_then:
                 # Look for END AS array_name in the text following this ARRAY_CONSTRUCT's close
                 in_case_alias = re.search(rf'\bEND\s+AS\s+{re.escape(array_name)}\b', rest, re.IGNORECASE)
-                should_wrap = bool(in_case_alias)
+                should_cast = bool(in_case_alias)
             else:
-                should_wrap = bool(direct_alias)
+                should_cast = bool(direct_alias)
         else:
-            # Legacy: wrap all unwrapped ARRAY_CONSTRUCT calls
+            # Legacy: cast all ARRAY_CONSTRUCT calls, except those already inside ARRAY_TO_STRING
             prefix = sql[:func_start].rstrip()
-            should_wrap = not prefix.lower().endswith('array_to_string(')
+            should_cast = not prefix.lower().endswith('array_to_string(')
         
-        if should_wrap:
+        if should_cast:
             prefix = sql[:func_start].rstrip()
             if not prefix.lower().endswith('array_to_string('):
-                result.append(f"array_to_string({func_sql}, ';')")
-                wrapped_count += 1
+                result.append(f"{func_sql}::variant")
+                cast_count += 1
             else:
                 result.append(func_sql)
         else:
@@ -96,7 +96,7 @@ def wrap_array_constructs_with_array_to_string(sql: str, array_name: str = None)
 
         i = j
 
-    return ''.join(result), wrapped_count
+    return ''.join(result), cast_count
 
 
 def parse_crosstab_to_macro(sql: str) -> str:
@@ -506,21 +506,21 @@ def parse_crosstab_to_macro(sql: str) -> str:
         pivoted_values_str = "[" + ", ".join(f"'{c}'" for c in pivoted_values) + "]"
         logging.debug(f"Using static column list: {pivoted_values_str}")
     
-    # Convert ARRAY[] to ARRAY_CONSTRUCT and wrap with array_to_string if needed
+    # Convert ARRAY[] to ARRAY_CONSTRUCT and cast matching values to VARIANT
     # Use query1_without_ctes (the SELECT part only, not the CTEs)
     modified_query1 = query1_without_ctes
     
     logging.info(f"=== Array processing: array_column_expr={array_column_expr}")
     
-    # Always convert ARRAY[] to ARRAY_CONSTRUCT() and wrap with array_to_string
+    # Always convert ARRAY[] to ARRAY_CONSTRUCT()
     modified_query1 = re.sub(r'ARRAY\s*\[(.*?)\]', r'ARRAY_CONSTRUCT(\1)', modified_query1, flags=re.IGNORECASE | re.DOTALL)
     
-    # Only wrap the ARRAY_CONSTRUCT that's aliased as the values column (array_name)
-    modified_query1, wrapped_count = wrap_array_constructs_with_array_to_string(modified_query1, array_name)
-    if wrapped_count:
-        logging.info(f"Wrapped {wrapped_count} ARRAY_CONSTRUCT occurrence(s) with array_to_string")
+    # Only cast the ARRAY_CONSTRUCT that's aliased as the values column (array_name)
+    modified_query1, cast_count = cast_array_constructs_to_variant(modified_query1, array_name)
+    if cast_count:
+        logging.info(f"Cast {cast_count} ARRAY_CONSTRUCT occurrence(s) to ::variant")
     else:
-        logging.warning("Could not find ARRAY_CONSTRUCT to wrap")
+        logging.warning("Could not find ARRAY_CONSTRUCT to cast")
     
     # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
     if "'" in pivot_key:
