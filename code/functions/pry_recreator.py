@@ -21,7 +21,7 @@ def load_config() -> dict:
 
 
 config = load_config()
-SF_SQL_FOLDER = Path(config["dbt_output_path"])
+SF_SQL_FOLDER = "/Users/gelderloos/repos/proigia_dbt/target/compiled/proigia_dbt/models/dm_dash_new"
 PROIGIA_DEFINITION = Path(config["proigia_defintion_path"])
 #SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
 logger = functions.setup_logging("pry_recreator.log", log_level="warning")
