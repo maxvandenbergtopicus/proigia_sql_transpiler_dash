@@ -23,6 +23,7 @@ def load_config() -> dict:
 config = load_config()
 SF_SQL_FOLDER = "/Users/gelderloos/repos/proigia_dbt/target/compiled/proigia_dbt/models/dm_dash_new"
 PROIGIA_DEFINITION = Path(config["proigia_defintion_path"])
+GENERATED_AGB = "77775027"
 #SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
 logger = functions.setup_logging("pry_recreator.log", log_level="warning")
 
@@ -110,6 +111,8 @@ def sql_to_pry_query_block(
         schema_pattern = "|".join(re.escape(name) for name in schema_names if name)
         if schema_pattern:
             sql = re.sub(rf"\b(?:{schema_pattern})\.P\d{{8}}\.", "", sql, flags=re.IGNORECASE)
+
+    sql = sql.replace(GENERATED_AGB, "${agb}")
 
     lines = ["- |"]
     # Replace CREATE ... VIEW variants with CREATE TABLE
