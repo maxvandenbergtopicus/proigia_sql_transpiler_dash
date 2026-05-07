@@ -51,6 +51,154 @@ def convert_includes_to_macros(sql: str) -> str:
     """Convert {% include 'blockname.pry' %} to {{ blockname() }}."""
     return re.sub(r"{%-?\s*include\s+['\"]([\w\-]+)\.pry['\"]\s*%}", r"{{ \1() }}", sql)
 
+
+def strip_unsupported_postgres_statements(sql: str) -> str:
+    """Remove standalone PostgreSQL maintenance statements from SQL text.
+
+    These statements are valid in PRY/PostgreSQL flows but should not be emitted
+    into dbt model SQL (e.g. trailing ANALYZE table_name;).
+    """
+    # Remove single-line standalone statements.
+    sql = re.sub(r"(?im)^\s*ANALYZE\b[^\n;]*\s*;?\s*$", "", sql)
+    # Remove inlined trailing statements like: "...; ANALYZE table_name;"
+    sql = re.sub(r"(?is);\s*ANALYZE\b[^;]*;?", ";", sql)
+    return sql
+
+
+def keep_first_sql_statement(sql: str) -> str:
+    """Return only the first top-level SQL statement.
+
+    This drops any trailing statements that can appear after the main
+    CREATE VIEW ... AS SELECT query in PRY files.
+    """
+    in_string = False
+    string_char = ""
+    in_line_comment = False
+    in_block_comment = False
+    in_jinja_block = False
+    jinja_end = ""
+    depth = 0
+    statement_end = None
+
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_jinja_block:
+            if ch == jinja_end[0] and nxt == jinja_end[1]:
+                in_jinja_block = False
+                jinja_end = ""
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_string:
+            # Handle doubled quote escaping inside SQL string literals.
+            if ch == string_char:
+                if i + 1 < n and sql[i + 1] == string_char:
+                    i += 2
+                    continue
+                in_string = False
+                string_char = ""
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        if ch == "{" and nxt in ("#", "%", "{"):
+            in_jinja_block = True
+            jinja_end = {"#": "#}", "%": "%}", "{": "}}"}[nxt]
+            i += 2
+            continue
+
+        if ch in ("'", '"'):
+            in_string = True
+            string_char = ch
+            i += 1
+            continue
+
+        if ch == '(':
+            depth += 1
+            i += 1
+            continue
+
+        if ch == ')' and depth > 0:
+            depth -= 1
+            i += 1
+            continue
+
+        if ch == ';' and depth == 0:
+            statement_end = i
+            break
+
+        i += 1
+
+    if statement_end is None:
+        return sql.rstrip()
+
+    # Keep trailing comments after the statement terminator, but stop before
+    # the next real SQL statement.
+    j = statement_end + 1
+    while j < n:
+        ch = sql[j]
+        nxt = sql[j + 1] if j + 1 < n else ""
+
+        if ch.isspace():
+            j += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            j += 2
+            while j < n and sql[j] != "\n":
+                j += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            j += 2
+            while j + 1 < n and not (sql[j] == "*" and sql[j + 1] == "/"):
+                j += 1
+            if j + 1 < n:
+                j += 2
+            continue
+
+        if ch == "{" and nxt in ("#", "%", "{"):
+            end_a, end_b = {"#": ("#", "}"), "%": ("%", "}"), "{": ("}", "}")}[nxt]
+            j += 2
+            while j + 1 < n and not (sql[j] == end_a and sql[j + 1] == end_b):
+                j += 1
+            if j + 1 < n:
+                j += 2
+            continue
+
+        break
+
+    return sql[:j].rstrip()
+
 def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=None, seed_tables=None) -> set:
     """Convert PRY file to dbt models.
     
@@ -132,7 +280,8 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
         if table_macros:
             converted_sql = replace_macros_with_table_wrapper(converted_sql, table_macros)
         
-        converted_sql = restore_dbt_macros(converted_sql, macros)        
+        converted_sql = restore_dbt_macros(converted_sql, macros)
+        converted_sql = strip_unsupported_postgres_statements(converted_sql)
         # For blocks: only replace external tables, leave all others unchanged
         model_refs = config.get('model_refs', [])
         table_mapping = config.get('table_mapping', {})
@@ -471,6 +620,7 @@ def generate_dbt_model(
             converted_sql = replace_macros_with_table_wrapper(converted_sql, table_macros)
         
         converted_sql = restore_dbt_macros(converted_sql, macros)
+        converted_sql = strip_unsupported_postgres_statements(converted_sql)
         
         # Convert SQL comments to Jinja comments
         converted_sql = re.sub(r'/\*', r'{#', converted_sql)
@@ -494,13 +644,21 @@ def generate_dbt_model(
         model_refs = config.get('model_refs', [])
         table_mapping = config.get('table_mapping', {})
         converted_sql = replace_table_references(converted_sql, block_tables=block_tables, seed_tables=seed_tables, model_refs=model_refs, table_mapping=table_mapping)
+        converted_sql = keep_first_sql_statement(converted_sql)
         
-        # Ensure it starts with WITH or SELECT and remove trailing semicolon
+        # Normalize statement terminator to match existing model style.
+        if converted_sql.rstrip().endswith(';'):
+            converted_sql = re.sub(r';\s*$', '', converted_sql)
+
+        # Ensure it starts with WITH or SELECT
         converted_sql = converted_sql.strip()
-        if converted_sql.endswith(';'):
-            converted_sql = converted_sql[:-1].strip()
             
-        if not re.match(r'^(WITH|SELECT)', converted_sql, re.IGNORECASE):
+        starts_with_query = re.match(
+            r'^\s*(?:(?:--[^\n]*\n)|(?:/\*[\s\S]*?\*/\s*)|(?:\{#[\s\S]*?#\}\s*)|(?:\{%[\s\S]*?%\}\s*)|(?:\{\{[\s\S]*?\}\}\s*))*\s*(WITH|SELECT)\b',
+            converted_sql,
+            re.IGNORECASE,
+        )
+        if not starts_with_query:
             print(f"[WARNING] Query doesn't start with WITH or SELECT after removing CREATE VIEW")
         # Build dbt variable section using {% set %}
         variables = [
