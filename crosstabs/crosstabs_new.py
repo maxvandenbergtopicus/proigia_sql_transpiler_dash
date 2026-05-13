@@ -9,10 +9,10 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 def cast_array_constructs_to_variant(sql: str, array_name: str = None) -> tuple[str, int]:
     """
-    Cast ARRAY_CONSTRUCT(...) to VARIANT (ARRAY_CONSTRUCT(...)::variant).
+    Cast ARRAY_CONSTRUCT(...) call to VARIANT if it's aliased as array_name.
 
     If array_name is provided, only casts the ARRAY_CONSTRUCT that has that alias.
-    If array_name is None, casts all matching ARRAY_CONSTRUCT calls.
+    If array_name is None, casts all uncast ARRAY_CONSTRUCT calls (legacy behavior).
 
     This is needed for crosstab payload/value arrays, including ARRAY_CONSTRUCT
     calls that appear inside CASE expressions where the enclosing alias is on the
@@ -62,7 +62,7 @@ def cast_array_constructs_to_variant(sql: str, array_name: str = None) -> tuple[
 
         func_sql = sql[func_start:j]
         
-        # Check if this ARRAY_CONSTRUCT should be casted
+        # Check if this ARRAY_CONSTRUCT should be cast
         should_cast = False
         if array_name:
             # Strategy 1: ARRAY_CONSTRUCT(...) AS array_name — alias directly follows closing paren
@@ -80,15 +80,15 @@ def cast_array_constructs_to_variant(sql: str, array_name: str = None) -> tuple[
             else:
                 should_cast = bool(direct_alias)
         else:
-            # Legacy: cast all ARRAY_CONSTRUCT calls, except those already inside ARRAY_TO_STRING
+            # Legacy: cast all uncast ARRAY_CONSTRUCT calls
             prefix = sql[:func_start].rstrip()
-            should_cast = not prefix.lower().endswith('array_to_string(')
+            should_cast = not prefix.lower().endswith('cast(')
         
         if should_cast:
             prefix = sql[:func_start].rstrip()
-            if not prefix.lower().endswith('array_to_string('):
-                result.append(f"{func_sql}::variant")
-                cast_count += 1
+            if not prefix.lower().endswith('cast('):
+                result.append(f"CAST({func_sql} AS VARIANT)")
+                wrapped_count += 1
             else:
                 result.append(func_sql)
         else:
@@ -506,33 +506,21 @@ def parse_crosstab_to_macro(sql: str) -> str:
         pivoted_values_str = "[" + ", ".join(f"'{c}'" for c in pivoted_values) + "]"
         logging.debug(f"Using static column list: {pivoted_values_str}")
     
-    # Convert ARRAY[] to ARRAY_CONSTRUCT and cast matching values to VARIANT
+    # Convert ARRAY[] to ARRAY_CONSTRUCT and cast to VARIANT if needed
     # Use query1_without_ctes (the SELECT part only, not the CTEs)
     modified_query1 = query1_without_ctes
     
     logging.info(f"=== Array processing: array_column_expr={array_column_expr}")
     
-    # Always convert ARRAY[] to ARRAY_CONSTRUCT()
+    # Always convert ARRAY[] to ARRAY_CONSTRUCT() and cast to VARIANT
     modified_query1 = re.sub(r'ARRAY\s*\[(.*?)\]', r'ARRAY_CONSTRUCT(\1)', modified_query1, flags=re.IGNORECASE | re.DOTALL)
     
     # Only cast the ARRAY_CONSTRUCT that's aliased as the values column (array_name)
-    modified_query1, cast_count = cast_array_constructs_to_variant(modified_query1, array_name)
-    if cast_count:
-        logging.info(f"Cast {cast_count} ARRAY_CONSTRUCT occurrence(s) to ::variant")
+    modified_query1, wrapped_count = cast_array_constructs_to_variant(modified_query1, array_name)
+    if wrapped_count:
+        logging.info(f"Casted {wrapped_count} ARRAY_CONSTRUCT occurrence(s) to VARIANT")
     else:
         logging.warning("Could not find ARRAY_CONSTRUCT to cast")
-
-    # Special case: 'mdarray' is a native array/variant column reference (not ARRAY_CONSTRUCT syntax).
-    # Cast it to ::variant so the pivot macro receives a VARIANT value, just like an ARRAY_CONSTRUCT column.
-    if array_name.lower() == 'mdarray' and cast_count == 0:
-        # Match the column reference (optionally table-qualified) but not when already cast or used as an alias
-        modified_query1 = re.sub(
-            rf'(\b[\w]+\.)?(\b{re.escape(array_name)}\b)(?!\s*::)(?!\s+AS\b)',
-            r'\1\2::variant',
-            modified_query1,
-            flags=re.IGNORECASE,
-        )
-        logging.info("Cast 'mdarray' column reference to ::variant")
     
     # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
     if "'" in pivot_key:
