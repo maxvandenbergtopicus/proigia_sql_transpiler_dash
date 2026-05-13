@@ -13,57 +13,26 @@ CONFIG_CANDIDATES = [PROJECT_ROOT / "config.yml", PROJECT_ROOT / "config.yaml"]
 
 
 def load_config() -> dict:
-    for config_path in CONFIG_CANDIDATES:
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-    raise FileNotFoundError("No config.yml or config.yaml found in project root")
+    with open("config.yaml") as f:
+        config = yaml.safe_load(f)
+    
+    with open("env.yaml") as f:
+        config_env = yaml.safe_load(f)
+    
+    config.update(config_env)  # Merge config with env values if present
+    return config
 
 
 config = load_config()
-SF_SQL_FOLDER = "/Users/gelderloos/repos/proigia_dbt/target/compiled/proigia_dbt/models/dm_dash_new"
+SF_SQL_FOLDER = Path(config.get("dbt_path")) / "target/compiled/proigia_dbt/models/dm_dash_new"
 PROIGIA_DEFINITION = Path(config["proigia_defintion_path"])
-GENERATED_AGB = "77775027"
+GENERATED_AGB = config.get("generated_agb", "77775027")
 #SF_PROIGIA_DEFINITION = # this may be needed if we ever go back to writing the generated pry files to a different location than the original ones
-logger = functions.setup_logging("pry_recreator.log", log_level="warning")
+logger = functions.setup_logging("pry_recreator.log", log_level="debug")
 
-@lru_cache(maxsize=1)
 def get_database_prefixes() -> tuple[str, ...]:
-    """Read database prefixes from `databases:` in config.yml/config.yaml without YAML parsing."""
-    for config_path in CONFIG_CANDIDATES:
-        if not config_path.exists():
-            continue
-
-        lines = config_path.read_text(encoding="utf-8").splitlines()
-        in_databases_block = False
-        database_names: list[str] = []
-
-        for line in lines:
-            stripped = line.strip()
-
-            if not in_databases_block:
-                if re.match(r"^\s*databases\s*:\s*$", line):
-                    in_databases_block = True
-                continue
-
-            if not stripped or stripped.startswith("#"):
-                continue
-
-            if re.match(r"^[A-Za-z_][\w-]*\s*:", line):
-                break
-
-            match_name = re.match(r"^\s*-\s*name\s*:\s*(.+?)\s*$", line)
-            if match_name:
-                value = match_name.group(1).split("#", 1)[0].strip()
-                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-                    value = value[1:-1]
-                if value:
-                    database_names.append(value)
-
-        if database_names:
-            return tuple(database_names)
-
-    return tuple()
+    """Return database name prefixes from the `databases:` list in config.yaml."""
+    return tuple(db["name"] for db in config.get("databases", []) if db.get("name"))
 
 @lru_cache(maxsize=None)
 def resolve_report_sql_folder(report: str) -> str:
@@ -102,7 +71,7 @@ def sql_to_pry_query_block(
     if not os.path.exists(sql_file):
         logger.error(f"SQL file not found: {sql_file}")
         return ""
-    with open(sql_file, "r") as f:
+    with open(sql_file, "r", encoding="utf-8-sig") as f:
         sql_text = f.read()
     sql = sql_text.strip()
 
@@ -253,7 +222,7 @@ def pry_from_pry(
     """
     # get everything up until 'queries:' from the template pry. If there is no 'queries:' section, we will 
     # output the entire template (assumign it lives in blocks etc)
-    with open(f"{PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}.pry", "r") as f:
+    with open(f"{PROIGIA_DEFINITION}/{report_folder}/{template_pry_file}.pry", "r", encoding="utf-8-sig") as f:
         pry_template = f.read()
         if report_folder == 'blocks':
             return pry_template
@@ -347,7 +316,7 @@ def process_proigia_definition():
             else:
                 new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" SF", db_type="snowflake")
             output_path = f"{output_folder}/{template_pry_filename}_sf.pry"
-            with open(output_path, "w") as f:
+            with open(output_path, "w", encoding="utf-8") as f:
                 f.write(new_pry_content)
             logger.info(f"Generated new PRY file at: {output_path}")
 

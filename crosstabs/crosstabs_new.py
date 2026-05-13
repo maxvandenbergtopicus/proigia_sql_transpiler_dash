@@ -88,7 +88,7 @@ def cast_array_constructs_to_variant(sql: str, array_name: str = None) -> tuple[
             prefix = sql[:func_start].rstrip()
             if not prefix.lower().endswith('cast('):
                 result.append(f"CAST({func_sql} AS VARIANT)")
-                wrapped_count += 1
+                cast_count += 1
             else:
                 result.append(func_sql)
         else:
@@ -522,6 +522,17 @@ def parse_crosstab_to_macro(sql: str) -> str:
     else:
         logging.warning("Could not find ARRAY_CONSTRUCT to cast")
     
+    # Special case: 'mdarray' is a native array/variant column reference (not ARRAY_CONSTRUCT syntax).
+    # Cast it to ::variant so the pivot macro receives a VARIANT value, just like an ARRAY_CONSTRUCT column.
+    if array_name.lower() == 'mdarray' and wrapped_count == 0:
+        # Match the column reference (optionally table-qualified) but not when already cast or used as an alias
+        modified_query1 = re.sub(
+            rf'(\b[\w]+\.)?(\b{re.escape(array_name)}\b)(?!\s*::)(?!\s+AS\b)',
+            r'\1\2::variant',
+            modified_query1,
+            flags=re.IGNORECASE,
+        )
+        logging.info("Cast 'mdarray' column reference to ::variant")
     # Handle single quotes in pivot_key - if it contains single quotes, use double quotes for the string
     if "'" in pivot_key:
         pivot_key_quoted = f'"{pivot_key}"'
