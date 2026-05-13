@@ -1,0 +1,4 @@
+# Persoonlijke variabeleen 
+dbt_path: "" # Pad naar de dbt project root
+proigia_defintion_path: "" # Pad naar de proigia definitie bestanden
+generated_agb: 

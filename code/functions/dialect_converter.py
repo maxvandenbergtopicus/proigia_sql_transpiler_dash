@@ -2575,6 +2575,11 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     if 'citext' in sql.lower():
         logging.info("Converting citext to VARCHAR")
         sql = re.sub(r'\bcitext\b', 'VARCHAR', sql, flags=re.IGNORECASE)
+
+    # Pre-process: Replace ::timestamp with ::date
+    if '::timestamp' in sql.lower():
+        logging.info("Converting ::timestamp to ::date")
+        sql = re.sub(r'::timestamp\b', '::date', sql, flags=re.IGNORECASE)
     
     # Pre-process: Replace array_accum with array_agg
     if 'array_accum' in sql.lower():

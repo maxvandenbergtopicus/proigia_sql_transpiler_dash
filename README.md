@@ -28,8 +28,7 @@ Edit `config.yaml` to configure your settings:
 
 ### dbt Output Paths
 ```yaml
-dbt_output_path: C:\path\to\dbt\models\output
-dbt_macro_path: C:\path\to\dbt\macros\output
+dbt_path: C:\path\to\dbt\models\output
 proigia_defintion_path: C:\path\to\proigia_definition
 ```
 

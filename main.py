@@ -64,6 +64,10 @@ def main():
     with open("config.yaml") as f:
         config = yaml.safe_load(f)
     
+    with open("env.yaml") as f:
+        config_env = yaml.safe_load(f)
+    
+    config.update(config_env)  # Merge config with env values if present
     # Setup logging
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
@@ -75,7 +79,7 @@ def main():
     else:
         input_path = Path(config["proigia_defintion_path"])
     
-    output_dir = Path(config["dbt_output_path"])
+    output_dir = Path(config.get('dbt_path', '.')) / 'models' / 'dm_dash_new'
     seed_tables = config.get("seed_tabellen", [])
     
     if not input_path.exists():

@@ -233,7 +233,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
             logging.debug(f"Extracted {len(column_names)} columns: {column_names[:5]}...")
             
             # Create macro that returns the list
-            macro_path = Path(config.get('dbt_macro_path', 'macros'))
+            macro_path = Path(config.get('dbt_path', '.')) / 'macros' / 'dm_dash_new'
             macro_path.mkdir(parents=True, exist_ok=True)
             
             macro_file = macro_path / f"{block_name}.sql"
@@ -298,7 +298,7 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
                 created_tables.add(table_name)
         
         # All blocks become macros
-        macro_path = Path(config.get('dbt_macro_path', 'macros'))
+        macro_path = Path(config.get('dbt_path', '.')) / 'macros' / 'dm_dash_new'
         macro_path.mkdir(parents=True, exist_ok=True)
         
         macro_file = macro_path / f"{block_name}.sql"
