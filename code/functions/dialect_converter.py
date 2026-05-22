@@ -91,7 +91,11 @@ class FixedSnowflake(Snowflake):
                 # If start is a string literal, it's a regex pattern - use REGEXP_SUBSTR
                 if isinstance(start_arg, exp.Literal) and start_arg.is_string:
                     pattern = self.sql(start_arg)
-                    return f"REGEXP_SUBSTR({value}, {pattern})"
+                    # PostgreSQL SUBSTRING(val FROM pattern) returns the text matched by the
+                    # first parenthesised group. Snowflake equivalent:
+                    #   REGEXP_SUBSTR(val, pattern, 1, 1, 'e', 1)
+                    #   position=1, occurrence=1, 'e'=extract subgroup, group_num=1
+                    return f"REGEXP_SUBSTR({value}, {pattern}, 1, 1, 'e', 1)"
                 else:
                     # Numeric start position - use standard SUBSTRING
                     parts = [value, self.sql(start_arg)]
@@ -564,38 +568,70 @@ def add_order_by_to_array_agg(sql: str) -> str:
 
 def convert_postgres_regex_to_rlike(sql: str) -> str:
     """
-    Convert PostgreSQL regex match operator ~ to Snowflake RLIKE.
+    Convert PostgreSQL regex match operators ~ and ~* to Snowflake equivalents.
     Translates regex patterns from PostgreSQL to Snowflake format:
     - Replace \\d with [0-9] (digit character class)
-    - Replace ~ with RLIKE
-    
+    - ~ (case-sensitive)   → expr RLIKE 'pattern'
+    - ~* (case-insensitive) → REGEXP_LIKE(expr, 'pattern', 'i')
+
+    Anchoring:
+    PostgreSQL ~ / ~* are partial-match operators (like re.search).
+    Snowflake RLIKE / REGEXP_LIKE are full-match operators (like re.fullmatch).
+    To preserve semantics:
+    - If pattern has no leading ^, prepend .*
+    - If pattern has no trailing $, append .*
+
     Examples:
-        column ~ '^\d{2}[^a-zA-Z0-9]{1}\d{4}$'
+        column ~ '^\\d{2}[^a-zA-Z0-9]{1}\\d{4}$'
         → column RLIKE '^[0-9]{2}[^a-zA-Z0-9]{1}[0-9]{4}$'
+
+        icpc ~ '^[a-zA-Z]{1}[0-9]{2}'
+        → icpc RLIKE '^[a-zA-Z]{1}[0-9]{2}.*'
+
+        COALESCE(a,b) ~* 'vaxigrip tetra'
+        → REGEXP_LIKE(COALESCE(a,b), '.*vaxigrip tetra.*', 'i')
     """
     def translate_postgres_regex_pattern(pattern_str: str) -> str:
         """Translate PostgreSQL regex syntax to Snowflake compatible format"""
-        # Replace \d with [0-9]
         translated = pattern_str.replace(r'\d', '[0-9]')
         return translated
-    
-    # Match: expression ~ 'pattern' or expression ~ "pattern"
-    # Captures the expression, quote type, and pattern content
+
+    def anchor_pattern(pattern: str) -> str:
+        """Wrap pattern with .* on either side to preserve partial-match semantics."""
+        if not pattern.startswith('^') and not pattern.startswith('.*'):
+            pattern = '.*' + pattern
+        if not pattern.endswith('$') and not pattern.endswith('.*'):
+            pattern = pattern + '.*'
+        return pattern
+
+    # Match: expression ~* 'pattern' (case-insensitive) — must come before ~ to avoid mis-match
+    def repl_tilde_star(match):
+        expression = match.group(1)
+        quote = match.group(2)
+        pattern = anchor_pattern(translate_postgres_regex_pattern(match.group(3)))
+        return f"REGEXP_LIKE({expression}, {quote}{pattern}{quote}, 'i')"
+
+    sql = re.sub(
+        r'(\S+)[^\S\n]+~\*[^\S\n]+([\'"])([^\2]*?)\2',
+        repl_tilde_star,
+        sql,
+        flags=re.IGNORECASE
+    )
+
+    # Match: expression ~ 'pattern' (case-sensitive)
     def repl_tilde(match):
         expression = match.group(1)
-        quote = match.group(2)  # ' or "
-        pattern = match.group(3)
-        translated_pattern = translate_postgres_regex_pattern(pattern)
-        return f"{expression} RLIKE {quote}{translated_pattern}{quote}"
-    
-    # Match the ~ operator with string patterns (single or double quoted)
+        quote = match.group(2)
+        pattern = anchor_pattern(translate_postgres_regex_pattern(match.group(3)))
+        return f"{expression} RLIKE {quote}{pattern}{quote}"
+
     sql = re.sub(
-        r'(\S+(?:\s+\S+)*?)\s+~\s+([\'"])([^\2]*?)\2',
+        r'(\S+)[^\S\n]+~[^\S\n]+([\'"])([^\2]*?)\2',
         repl_tilde,
         sql,
         flags=re.IGNORECASE
     )
-    
+
     return sql
 
 
@@ -3705,50 +3741,186 @@ def convert_array_overlap_to_snowflake(sql: str) -> str:
 
 def convert_unnest_array_to_values(sql: str) -> str:
     """
-    Replace SELECT unnest(ARRAY[...] or ARRAY_CONSTRUCT(...)) col with SELECT col FROM (VALUES (...)) AS t(col)
-    Handles both single and multi-line arrays.
+    Replace SELECT unnest(ARRAY[...]) col1, unnest(ARRAY[...]) col2, ...
+    with SELECT col1, col2 FROM (VALUES (..., ...)) AS t(col1, col2).
+    Handles both single-column and multi-column parallel unnest patterns using
+    bracket-level parsing (robust to parentheses inside quoted strings).
     """
-    # Match pattern with optional AS keyword: unnest(ARRAY[...] or ARRAY_CONSTRUCT(...)) [AS] col_name
-    pattern = re.compile(r"SELECT\s+unnest\s*\(\s*(ARRAY(?:_CONSTRUCT)?)\s*[\(\[](.*?)[)\]]\s*\)\s+(?:AS\s+)?(\w+)", re.DOTALL | re.IGNORECASE)
 
-    def repl(match):
-        array_type = match.group(1).upper()  # ARRAY or ARRAY_CONSTRUCT
-        array_content = match.group(2)
-        col = match.group(3)
-        
-        # Split by commas, but respect quoted strings
-        elements = []
-        current = []
-        in_quotes = False
-        quote_char = None
-        
-        for char in array_content:
-            if char in ('"', "'") and not in_quotes:
-                in_quotes = True
-                quote_char = char
-                current.append(char)
-            elif char == quote_char and in_quotes:
-                in_quotes = False
-                quote_char = None
-                current.append(char)
-            elif char == ',' and not in_quotes:
-                element = ''.join(current).strip()
-                if element:  # Only add non-empty elements
-                    elements.append(element)
-                current = []
+    def _extract_bracket_content(s: str, pos: int):
+        """Extract content between matching brackets starting at pos (pointing at '[' or '(').
+        Returns (content_str, end_pos) where end_pos is the index after the closing bracket."""
+        open_ch = s[pos]
+        close_ch = ']' if open_ch == '[' else ')'
+        depth = 1
+        i = pos + 1
+        in_q = False
+        q_ch = None
+        while i < len(s) and depth > 0:
+            c = s[i]
+            if in_q:
+                if c == q_ch:
+                    if i + 1 < len(s) and s[i + 1] == q_ch:
+                        i += 2  # doubled-quote escape, skip both
+                        continue
+                    in_q = False
             else:
-                current.append(char)
-        
-        # Add the last element
-        element = ''.join(current).strip()
-        if element:
-            elements.append(element)
-        
-        # Create VALUES clause
-        values = ",\n    ".join(f"({e})" for e in elements)
-        return f"SELECT\n    {col}\n  FROM (VALUES\n    {values}\n  ) AS t({col})"
+                if c in ("'", '"'):
+                    in_q, q_ch = True, c
+                elif c == open_ch:
+                    depth += 1
+                elif c == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return s[pos + 1:i], i + 1
+            i += 1
+        return s[pos + 1:], len(s)
 
-    return pattern.sub(repl, sql)
+    def _split_top_level_commas(content: str) -> list:
+        """Split a string by top-level commas (not inside brackets or quotes)."""
+        parts, cur, depth, in_q, q_ch = [], [], 0, False, None
+        for c in content:
+            if in_q:
+                cur.append(c)
+                if c == q_ch:
+                    in_q = False
+            elif c in ("'", '"'):
+                in_q, q_ch = True, c
+                cur.append(c)
+            elif c in ('(', '['):
+                depth += 1
+                cur.append(c)
+            elif c in (')', ']'):
+                depth -= 1
+                cur.append(c)
+            elif c == ',' and depth == 0:
+                part = ''.join(cur).strip()
+                if part:
+                    parts.append(part)
+                cur = []
+            else:
+                cur.append(c)
+        part = ''.join(cur).strip()
+        if part:
+            parts.append(part)
+        return parts
+
+    def _parse_unnest_calls(s: str, start: int):
+        """Parse one or more comma-separated unnest(ARRAY[...]) [AS] colname expressions.
+        Returns (columns, end_pos) where columns is [(colname, [elements]), ...],
+        or (None, start) if the pattern does not match."""
+        columns = []
+        i = start
+        while True:
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # Must start with 'unnest' (case-insensitive, not part of a longer word)
+            if s[i:i + 6].lower() != 'unnest':
+                break
+            if i + 6 < len(s) and (s[i + 6].isalnum() or s[i + 6] == '_'):
+                break  # 'unnest' is part of a longer identifier
+            i += 6
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # Expect opening '(' of unnest(
+            if i >= len(s) or s[i] != '(':
+                return None, start
+            i += 1
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # Expect ARRAY_CONSTRUCT or ARRAY keyword
+            upper_rest = s[i:i + 15].upper()
+            if upper_rest.startswith('ARRAY_CONSTRUCT'):
+                i += 15
+            elif s[i:i + 5].upper() == 'ARRAY':
+                i += 5
+            else:
+                return None, start
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # Expect '[' or '(' opening the array literal
+            if i >= len(s) or s[i] not in ('[', '('):
+                return None, start
+            content, i = _extract_bracket_content(s, i)
+            elements = [e for e in _split_top_level_commas(content) if e]
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # Expect closing ')' of unnest(
+            if i >= len(s) or s[i] != ')':
+                return None, start
+            i += 1
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # Optional AS keyword
+            if s[i:i + 2].upper() == 'AS' and (i + 2 >= len(s) or not (s[i + 2].isalnum() or s[i + 2] == '_')):
+                i += 2
+                while i < len(s) and s[i] in ' \t\n\r':
+                    i += 1
+            # Column name (identifier)
+            col_start = i
+            while i < len(s) and (s[i].isalnum() or s[i] == '_'):
+                i += 1
+            col_name = s[col_start:i]
+            if not col_name:
+                return None, start
+            columns.append((col_name, elements))
+            # Skip whitespace
+            while i < len(s) and s[i] in ' \t\n\r':
+                i += 1
+            # If next char is ',' check whether next non-whitespace is another 'unnest'
+            if i < len(s) and s[i] == ',':
+                j = i + 1
+                while j < len(s) and s[j] in ' \t\n\r':
+                    j += 1
+                if s[j:j + 6].lower() == 'unnest':
+                    i += 1  # consume the comma and loop
+                    continue
+                # Comma belongs to outer query; stop here
+            break
+        return (columns, i) if columns else (None, start)
+
+    # Scan the SQL for SELECT keywords and attempt to replace unnest patterns
+    select_re = re.compile(r'\bSELECT\b', re.IGNORECASE)
+    result = []
+    i = 0
+    while i < len(sql):
+        m = select_re.search(sql, i)
+        if not m:
+            result.append(sql[i:])
+            break
+        # Append everything before this SELECT
+        result.append(sql[i:m.start()])
+        j = m.end()
+        # Skip whitespace after SELECT
+        while j < len(sql) and sql[j] in ' \t\n\r':
+            j += 1
+        # Try to parse unnest calls starting here
+        if sql[j:j + 6].lower() == 'unnest':
+            columns, end_pos = _parse_unnest_calls(sql, j)
+            if columns:
+                arrays = [c[1] for c in columns]
+                # Only proceed if all parallel arrays have the same length
+                if arrays and all(len(a) == len(arrays[0]) for a in arrays):
+                    col_names = [c[0] for c in columns]
+                    rows = []
+                    for row_i in range(len(arrays[0])):
+                        vals = ', '.join(arrays[col_i][row_i] for col_i in range(len(arrays)))
+                        rows.append(f"({vals})")
+                    values_str = ',\n    '.join(rows)
+                    cols_str = ', '.join(col_names)
+                    result.append(f"SELECT\n    {cols_str}\n  FROM (VALUES\n    {values_str}\n  ) AS t({cols_str})")
+                    i = end_pos
+                    continue
+        # Pattern not matched — keep SELECT as-is and advance past it
+        result.append(sql[m.start():m.end()])
+        i = m.end()
+    return ''.join(result)
 
 def find_matching_paren(s: str, start_pos: int) -> int:
     """Find the index of the closing parenthesis that matches the opening one at start_pos."""

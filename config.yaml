@@ -34,11 +34,13 @@ model_refs:
 # Format: "source_schema.source_table": "target_schema.target_table"
 # Supports {{agb}} placeholder in target
 table_mapping:
-  public.medewerker: "{{ source('DWH', 'medewerker_manual') }}"
-  public.patient_hashes: "{{ source('DWH', 'intercity_delivery') }}"
-  public.refuse: "{{ source('DWH', 'refuse') }}"
+  public.medewerker: "{{ source('DWH_2', 'medewerker') }}"
+  public.patient_hashes: "{{ source('DWH_2', 'patient_hashes') }}"
+  public.refuse: "{{ source('DWH_2', 'refuse') }}"
   public.get_hist_kwartaalindicatoren(CURRENT_DATE, 'kwartaal_ind_dm_pop_v3_0_indicatoren_tb' , 9): "{{ref('kwartaal_indicatoren')}}"
   public.key_value_store: "{{ source('DWH_2', 'key_value_store') }}"
+  medewerker_hisnaam: "{{ source('DWH_2', 'medewerker_hisnaam') }}"
+  functie: "{{ source('DWH_2', 'functie') }}"
 
 # List of report folders that should be materialized as materialized_view in dbt
 materialized_view_reports:

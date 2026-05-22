@@ -756,7 +756,7 @@ def replace_table_references(sql: str, external_tables=None, block_tables=None, 
     # Step 2: Replace unqualified table references
     sql = _replace_unqualified_tables(
         sql, cte_names, model_refs_lower, external_tables_lower, 
-        block_tables, is_block
+        block_tables, is_block, table_mapping_lower
     )
     
     return sql
@@ -825,7 +825,7 @@ def _replace_qualified_tables(sql: str, seed_table_lookup: dict, table_mapping_l
 
 def _replace_unqualified_tables(sql: str, cte_names: set, model_refs_lower: list, 
                                  external_tables_lower: list, block_tables: set, 
-                                 is_block: bool) -> str:
+                                 is_block: bool, table_mapping_lower: dict = None) -> str:
     """Replace unqualified table references in FROM/JOIN clauses.
     
     Args:
@@ -839,6 +839,8 @@ def _replace_unqualified_tables(sql: str, cte_names: set, model_refs_lower: list
     # Excludes: table.x, table(, table::
     table_pattern = r'\b(FROM|JOIN(?!\s+LATERAL)|LEFT\s+JOIN(?!\s+LATERAL)|RIGHT\s+JOIN(?!\s+LATERAL)|INNER\s+JOIN(?!\s+LATERAL)|OUTER\s+JOIN(?!\s+LATERAL)|FULL\s+JOIN(?!\s+LATERAL)|CROSS\s+JOIN(?!\s+LATERAL))\s+([a-zA-Z_][\w]*)\b(?!\s*\.|\s*\(|::)'
     
+    table_mapping_lower = table_mapping_lower or {}
+
     def table_replacer(match):
         keyword, table = match.group(1), match.group(2)
         table_lower = table.lower()
@@ -847,6 +849,12 @@ def _replace_unqualified_tables(sql: str, cte_names: set, model_refs_lower: list
         if _is_inside_function_call(sql, match.start()):
             logging.debug(f"Skipping {table} at {match.start()} because it is inside a function call.")
             return match.group(0)
+        
+        # Priority 0: Unqualified table_mapping entries (no schema prefix)
+        if table_lower in table_mapping_lower:
+            target = table_mapping_lower[table_lower]
+            logging.debug(f"Table mapping (unqualified): {table} -> {target}")
+            return f"{keyword} {target}"
         
         # Priority 1: Skip CTEs
         if table_lower in cte_names:
