@@ -904,12 +904,15 @@ def convert_array_remove_to_variant(sql: str) -> str:
             array_expr = sql[func_end:comma_pos].strip()
             value_expr = sql[value_start:value_end-1].strip()
 
-            if re.match(r'TO_VARIANT\s*\(', value_expr, re.IGNORECASE):
-                wrapped_value_expr = value_expr
+            # ARRAY_REMOVE(arr, NULL) is equivalent to ARRAY_COMPACT(arr) in Snowflake
+            if value_expr.upper() == 'NULL':
+                replacement = f"ARRAY_COMPACT({array_expr})"
             else:
-                wrapped_value_expr = f"TO_VARIANT({value_expr})"
-
-            replacement = f"{{{{ function('pg_array_remove') }}}}({array_expr}, {wrapped_value_expr})"
+                if re.match(r'TO_VARIANT\s*\(', value_expr, re.IGNORECASE):
+                    wrapped_value_expr = value_expr
+                else:
+                    wrapped_value_expr = f"TO_VARIANT({value_expr})"
+                replacement = f"{{{{ function('pg_array_remove') }}}}({array_expr}, {wrapped_value_expr})"
 
             sql = sql[:func_start] + replacement + sql[value_end:]
             found = True
@@ -919,6 +922,263 @@ def convert_array_remove_to_variant(sql: str) -> str:
             break  # No more unwrapped calls
     
     return sql
+
+
+def replace_uitslag_num_for_bepaling(sql: str) -> str: #TEMPFIX
+    """
+    Post-processing: in any query block whose FROM clause references the 'bepaling'
+    table, replace uitslag_num with {{ function('get_number') }}(uitslag).
+
+    bepaling.uitslag stores raw text; get_number() coerces it to a numeric value.
+    """
+
+    def _paren_depth_at(text: str, pos: int) -> int:
+        depth = 0
+        in_str = False
+        str_char = None
+        for i in range(pos):
+            ch = text[i]
+            if in_str:
+                if ch == str_char and (i == 0 or text[i - 1] != '\\'):
+                    in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+        return depth
+
+    def _collect_keywords(text: str):
+        """Yield (kind, pos, depth) for each SELECT and FROM keyword."""
+        n = len(text)
+        depth = 0
+        in_str = False
+        str_char = None
+        i = 0
+        while i < n:
+            ch = text[i]
+            if in_str:
+                if ch == str_char and (i == 0 or text[i - 1] != '\\'):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+                i += 1
+                continue
+            if ch == '(':
+                depth += 1
+                i += 1
+                continue
+            if ch == ')':
+                depth -= 1
+                i += 1
+                continue
+            for kw in ('SELECT', 'FROM'):
+                klen = len(kw)
+                if text[i:i + klen].upper() == kw:
+                    before = text[i - 1] if i > 0 else ' '
+                    after = text[i + klen] if i + klen < n else ' '
+                    if not (before.isalnum() or before == '_') and not (after.isalnum() or after == '_'):
+                        yield (kw, i, depth)
+                        break
+            i += 1
+
+    def _from_has_bepaling(text: str, from_pos: int, from_depth: int) -> bool:
+        """Return True if the FROM clause at from_pos references 'bepaling'."""
+        n = len(text)
+        i = from_pos + 4  # skip 'FROM'
+        depth = from_depth
+        in_str = False
+        str_char = None
+        clause_end = re.compile(
+            r'\b(WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|UNION|INTERSECT|EXCEPT|SELECT)\b',
+            re.IGNORECASE,
+        )
+        start = i
+        while i < n:
+            ch = text[i]
+            if in_str:
+                if ch == str_char and (i == 0 or text[i - 1] != '\\'):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+                i += 1
+                continue
+            if ch == '(':
+                depth += 1
+                i += 1
+                continue
+            if ch == ')':
+                if depth == from_depth:
+                    break  # exited enclosing scope
+                depth -= 1
+                i += 1
+                continue
+            if depth == from_depth:
+                m = clause_end.match(text, i)
+                if m:
+                    before = text[i - 1] if i > 0 else ' '
+                    if not (before.isalnum() or before == '_'):
+                        break
+            i += 1
+        from_clause = text[start:i]
+        # Only match bepaling as a direct table reference (FROM bepaling / JOIN bepaling),
+        # not when it appears as a subquery alias (") AS bepaling").
+        return bool(re.search(
+            r'(?:^|,|\bJOIN\b)\s*bepaling\b',
+            from_clause,
+            re.IGNORECASE,
+        ))
+
+    # Collect SELECT and FROM positions with their paren depths
+    selects = []  # (pos, depth)
+    froms = []    # (pos, depth)
+    for kind, pos, depth in _collect_keywords(sql):
+        if kind == 'SELECT':
+            selects.append((pos, depth))
+        else:
+            froms.append((pos, depth))
+
+    uitslag_re = re.compile(r'\buitslag_num\b', re.IGNORECASE)
+    matches = list(uitslag_re.finditer(sql))
+    if not matches:
+        return sql
+
+    to_replace = []
+    for match in matches:
+        match_pos = match.start()
+
+        # Skip aliases: occurrences directly preceded by AS (e.g. "... as uitslag_num")
+        preceding = sql[:match_pos].rstrip()
+        if re.search(r'\bAS$', preceding, re.IGNORECASE):
+            continue
+
+        # Skip ORDER BY references: the uitslag_num here refers to the already-computed
+        # alias, not the raw bepaling column. Detect by checking whether the last
+        # ORDER BY before this position comes after the last SELECT at the same depth.
+        if re.search(r'\bORDER\s+BY\b', sql[:match_pos], re.IGNORECASE):
+            last_ob = max((m.start() for m in re.finditer(r'\bORDER\s+BY\b', sql[:match_pos], re.IGNORECASE)), default=-1)
+            last_select = max((m.start() for m in re.finditer(r'\bSELECT\b', sql[:match_pos], re.IGNORECASE)), default=-1)
+            if last_ob > last_select:
+                continue
+
+        match_depth = _paren_depth_at(sql, match_pos)
+
+        # Find the innermost SELECT that precedes this position
+        governing_select = None
+        for sel_pos, sel_depth in reversed(selects):
+            if sel_pos < match_pos and sel_depth <= match_depth:
+                governing_select = (sel_pos, sel_depth)
+                break
+
+        if governing_select is None:
+            continue
+
+        sel_pos, sel_depth = governing_select
+
+        # Find the FROM that belongs to this SELECT at the same depth,
+        # occurring after uitslag_num (column list comes before FROM)
+        governing_from = None
+        for from_pos, from_depth in froms:
+            if from_pos > match_pos and from_depth == sel_depth:
+                governing_from = (from_pos, from_depth)
+                break
+
+        if governing_from is None:
+            continue
+
+        if _from_has_bepaling(sql, *governing_from):
+            # Keep SELECT depth so alias injection can be scope-aware.
+            to_replace.append((match, sel_depth))
+
+    func_call = "{{ function('get_number') }}(uitslag)"
+    for match, sel_depth in sorted(to_replace, key=lambda item: item[0].start(), reverse=True):
+        after = sql[match.end():]
+        already_aliased = re.match(r'\s+AS\s+\w', after, re.IGNORECASE)
+        match_depth = _paren_depth_at(sql, match.start())
+        # Top-level item in this SELECT list if depth equals the governing SELECT depth.
+        # Deeper means nested expression/function argument and should not receive alias.
+        is_top_level_select_item = match_depth == sel_depth
+        if is_top_level_select_item and not already_aliased:
+            replacement = f"{func_call} AS uitslag_num"
+        else:
+            replacement = func_call
+        sql = sql[:match.start()] + replacement + sql[match.end():]
+
+    return sql
+
+
+def replace_numeric_cast_with_float_in_nan_cases(sql: str) -> str:
+    """
+    Pre-processing: in any CASE...END expression that can return the literal 'NaN',
+    replace every ::numeric cast with ::float.
+
+    Snowflake only allows NaN in FLOAT columns, not in NUMBER/DECIMAL columns.
+    Changing ::numeric -> ::float here means sqlglot will emit CAST(... AS FLOAT)
+    and convert_cast_to_try_cast will leave it untouched (it only rewrites
+    NUMERIC/DECIMAL/NUMBER to TO_DECFLOAT).
+
+    Pattern recognised:
+        CASE WHEN ... THEN 'NaN' ... ELSE expr::numeric END
+    """
+    result = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        m = re.match(r'\bCASE\b', sql[i:], re.IGNORECASE)
+        if not m:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        case_start = i
+        i += m.end()
+
+        # Find the matching END keyword by tracking CASE/END nesting
+        depth = 1
+        in_str = False
+        str_char = None
+        while i < n and depth > 0:
+            ch = sql[i]
+            if in_str:
+                if ch == str_char and (i == 0 or sql[i - 1] != '\\'):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+                i += 1
+                continue
+            kw_m = re.match(r'\b(CASE|END)\b', sql[i:], re.IGNORECASE)
+            if kw_m:
+                kw = kw_m.group(1).upper()
+                if kw == 'CASE':
+                    depth += 1
+                else:
+                    depth -= 1
+                i += kw_m.end()
+                continue
+            i += 1
+
+        case_block = sql[case_start:i]
+
+        # Only modify blocks that return 'NaN' as a THEN or ELSE value
+        if re.search(r"\bTHEN\s+'NaN'", case_block, re.IGNORECASE):
+            case_block = re.sub(r'::numeric\b', '::float', case_block, flags=re.IGNORECASE)
+
+        result.append(case_block)
+
+    return ''.join(result)
+
 
 def remove_redundant_literal_and_null_casts(sql: str) -> str:
     """
@@ -982,7 +1242,9 @@ def convert_cast_to_try_cast(sql: str) -> str:
     # Date type → TO_DATE(expr)
     date_types = {'DATE': 'TO_DATE'}
 
-    target_types = numeric_types | set(date_types.keys())
+    # Order matters: numeric rewrites must run before DATE so the loop is deterministic.
+    # A set would give random iteration order across Python runs.
+    target_types = ['DECIMAL', 'NUMBER', 'NUMERIC', 'DATE']
 
     def _is_array_access_expression(expr: str) -> bool:
         """Return True for identifier[index] or identifier[index][index] style access."""
@@ -1079,15 +1341,28 @@ def wrap_round_with_number_scale(sql: str) -> str:
 
             round_start = i + match.start()
             
-            # Skip this ROUND if it's already wrapped: CAST(ROUND(...)
-            # Check if there's a CAST( immediately before this ROUND
+            # Skip this ROUND only if it's already wrapped with a NUMBER cast:
+            # CAST(ROUND(...) AS NUMBER(...))
+            # A surrounding CAST to a different type (e.g. VARCHAR) should still be wrapped.
             if round_start >= 5:
                 before_text = sql[max(0, round_start - 5):round_start].rstrip()
                 if before_text.endswith('CAST('):
-                    # Already wrapped, skip it
-                    result.append(sql[i:i + match.end()])
-                    i = i + match.end()
-                    continue
+                    # Scan forward to find ROUND's closing paren
+                    scan_pos = i + match.end()  # position just after "ROUND("
+                    scan_depth = 1
+                    while scan_pos < len(sql) and scan_depth > 0:
+                        ch = sql[scan_pos]
+                        if ch == '(':
+                            scan_depth += 1
+                        elif ch == ')':
+                            scan_depth -= 1
+                        scan_pos += 1
+                    after_round = sql[scan_pos:scan_pos + 20].lstrip()
+                    if re.match(r'AS\s+NUMBER', after_round, re.IGNORECASE):
+                        # Already wrapped with CAST(... AS NUMBER), skip it
+                        result.append(sql[i:i + match.end()])
+                        i = i + match.end()
+                        continue
             
             # Keep everything before "ROUND("
             result.append(sql[i:round_start])
@@ -2651,6 +2926,12 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
         logging.info("Converting ILIKE 'ja'/'nee' to '=' comparisons")
         sql = convert_ja_nee_ilike_to_equals(sql)
     
+    # Pre-process: In CASE expressions that return 'NaN', change ::numeric to ::float
+    # so Snowflake accepts the NaN value (only allowed in FLOAT columns, not NUMBER).
+    if "'nan'" in sql.lower() or "'NaN'" in sql:
+        logging.info("Replacing ::numeric with ::float inside CASE expressions that return 'NaN'")
+        sql = replace_numeric_cast_with_float_in_nan_cases(sql)
+
     # Pre-process: Add ::varchar to array subscript accesses without an explicit cast
      #so that identifier[N] becomes identifier[N]::varchar and is converted to
      #CAST(identifier[N-1] AS VARCHAR) in Snowflake instead of staying as VARIANT.
@@ -3082,6 +3363,13 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
             converted,
             flags=re.IGNORECASE,
         )
+
+    # Post-process: Replace uitslag_num with {{ function('get_number') }}(uitslag) in
+    # queries that select from bepaling. Done after sqlglot so Jinja {{ }} doesn't
+    # confuse the parser.
+    if 'uitslag_num' in converted.lower() and 'bepaling' in converted.lower():
+        logging.info("Replacing uitslag_num with {{ function('get_number') }}(uitslag) for bepaling queries")
+        converted = replace_uitslag_num_for_bepaling(converted)
 
     return converted
 
