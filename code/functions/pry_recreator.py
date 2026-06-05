@@ -4,7 +4,6 @@ import functions
 from pathlib import Path
 import re
 import os
-import shutil
 import yaml
 from functools import lru_cache
 
@@ -129,94 +128,96 @@ def format_queries_from_sf(sf_views: list, reportname: str) -> str:
     pry_queries = [sql_to_pry_query_block(query, reportname) for query in sf_views]
     return "\n".join(pry_queries)
 
-def suffix_name_in_pry(pry_template: str, suffix_name: str) -> str:
-    """
-    Add a suffix to the report name in the PRY template.
-
-    This function looks for a line in the PRY template that starts with `name:`
-    and appends the provided suffix to the report name.
-
-    Args:
-        pry_template: The original PRY template as a string.
-        suffix_name: The suffix to append to the report name (e.g., " SF").
-
-    Returns:
-        The modified PRY template with the suffixed report name.
-    """
-    lines = pry_template.splitlines()
-    if not lines:
-        logger.error("PRY template is empty")
-        raise ValueError("PRY template is empty")
-
-    name_line_index = None
-    bom_prefix = ""
+def _find_top_level_section_bounds(lines: list[str], section_key: str) -> tuple[int | None, int]:
+    """Return start (line with section key) and end index of a top-level YAML section."""
+    section_start = None
     for idx, line in enumerate(lines):
         normalized = line.lstrip("\ufeff")
-        if normalized.startswith("name:"):
-            name_line_index = idx
-            if line.startswith("\ufeff"):
-                bom_prefix = "\ufeff"
+        if normalized.startswith(f"{section_key}:"):
+            section_start = idx
             break
 
-    if name_line_index is None:
-        logger.error("No top-level 'name:' found in pry template")
-        raise ValueError("No top-level 'name:' found in pry template")
+    if section_start is None:
+        return None, len(lines)
 
-    def append_suffix_to_key(line: str, key: str, keep_bom: bool = False) -> str:
-        source_line = line.lstrip("\ufeff") if keep_bom else line
-        rest = source_line[len(key):]
-        rest_lstripped = rest.lstrip()
-        leading_ws = rest[:len(rest) - len(rest_lstripped)]
-        trimmed = rest_lstripped.rstrip()
-        trailing_ws = rest_lstripped[len(trimmed):]
+    section_end = len(lines)
+    for idx in range(section_start + 1, len(lines)):
+        if re.match(r"^[^\s].*:\s*$", lines[idx]):
+            section_end = idx
+            break
 
-        if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
-            current_value = trimmed[1:-1]
-            if current_value.endswith(suffix_name):
-                new_trimmed = trimmed
-            else:
-                new_trimmed = f'"{current_value}{suffix_name}"'
-        else:
-            if trimmed.endswith(suffix_name):
-                new_trimmed = trimmed
-            else:
-                new_trimmed = f"{trimmed}{suffix_name}"
+    return section_start, section_end
 
-        prefix = bom_prefix if keep_bom else ""
-        return f"{prefix}{key}{leading_ws}{new_trimmed}{trailing_ws}"
+def _split_list_items(section_lines: list[str]) -> list[list[str]]:
+    """Split a YAML list section into item blocks, preserving each item's full lines."""
+    item_starts = [i for i, line in enumerate(section_lines) if line.lstrip().startswith("- ")]
+    if not item_starts:
+        return []
 
-    lines[name_line_index] = append_suffix_to_key(lines[name_line_index], "name:", keep_bom=True)
+    items = []
+    for pos, item_start in enumerate(item_starts):
+        next_item_start = item_starts[pos + 1] if pos + 1 < len(item_starts) else len(section_lines)
+        items.append(section_lines[item_start:next_item_start])
+    return items
 
-    for idx, line in enumerate(lines):
-        if line.startswith("referencedreportname:"):
-            lines[idx] = append_suffix_to_key(line, "referencedreportname:")
+def _with_dataset_type(item_lines: list[str], dataset_type: str) -> list[str]:
+    """Ensure a YAML list item contains dataset_type, replacing existing values if needed."""
+    for idx, line in enumerate(item_lines):
+        if re.match(r"^\s*dataset_type\s*:", line):
+            indent_match = re.match(r"^(\s*)dataset_type\s*:", line)
+            indent = indent_match.group(1) if indent_match else ""
+            updated = item_lines.copy()
+            updated[idx] = f"{indent}dataset_type: {dataset_type}"
+            return updated
 
-    pry_template = "\n".join(lines)
-    return pry_template
+    item_indent = re.match(r"^(\s*)-", item_lines[0])
+    base_indent = item_indent.group(1) if item_indent else ""
+    dataset_line = f"{base_indent}  dataset_type: {dataset_type}"
 
-def extract_report_name_from_pry(pry_template: str) -> str:
-    """Extract report name from top-level `name:` metadata line."""
-    for line in pry_template.splitlines():
-        normalized = line.lstrip("\ufeff")
-        if normalized.startswith("name:"):
-            value = normalized[len("name:"):].strip()
-            if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-                return value[1:-1]
-            return value
-    return "Unknown Report"
+    insert_at = len(item_lines)
+    while insert_at > 0 and item_lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+
+    return item_lines[:insert_at] + [dataset_line] + item_lines[insert_at:]
+
+def add_dataset_type_to_reportviews(pry_template: str, dataset_type: str) -> str:
+    """Set dataset_type on each reportview item, replacing existing values when present."""
+    lines = pry_template.splitlines()
+    if not lines:
+        return pry_template
+
+    reportviews_start, reportviews_end = _find_top_level_section_bounds(lines, "reportviews")
+    if reportviews_start is None:
+        return pry_template
+
+    section = lines[reportviews_start + 1:reportviews_end]
+    items = _split_list_items(section)
+    if not items:
+        return pry_template
+
+    # Preserve any non-item lines between list items while rewriting each item block.
+    new_section = []
+    cursor = 0
+    for item_lines in items:
+        item_start = section.index(item_lines[0], cursor)
+        new_section.extend(section[cursor:item_start])
+        new_section.extend(_with_dataset_type(item_lines, dataset_type))
+        cursor = item_start + len(item_lines)
+    new_section.extend(section[cursor:])
+
+    updated_lines = lines[:reportviews_start + 1] + new_section + lines[reportviews_end:]
+    return "\n".join(updated_lines)
 
 def pry_from_pry(
     report_folder: str,
     template_pry_file: str,
-    suffix_name: str = "",
-    db_type: str = None) -> str:
+    dataset_type: str = None) -> str:
     """
     Creates a pry format string based on the original pry and the dbt models.
     Note: this can only be used in the current conversion
     Args:
         report_folder (str): The folder containing the report.
         template_pry_file (str): The original or template pry file
-        suffix_name (str): Suffix to append to the report name in the new pry (e.g. " SF"). This is optional and can be left empty if no suffix is desired. Useful if you want a separate report in the portal.
     Returns:
         str: The new pry formatted string.
     """
@@ -226,18 +227,8 @@ def pry_from_pry(
         pry_template = f.read()
         if report_folder == 'blocks':
             return pry_template
-        if suffix_name:
-            pry_template = suffix_name_in_pry(pry_template, suffix_name)
-        if db_type:
-            lines = pry_template.split("\n")
-            if not any(line.strip().startswith("db_type:") for line in lines):
-                insertion_index = 1 if len(lines) > 1 else len(lines)
-                for idx, line in enumerate(lines):
-                    if re.match(r"^\s*(reportviews|queries):\s*$", line):
-                        insertion_index = idx
-                        break
-                lines.insert(insertion_index, f"db_type: {db_type}")
-            pry_template = "\n".join(lines)
+        if dataset_type:
+            pry_template = add_dataset_type_to_reportviews(pry_template, dataset_type)
         if re.search(r"^queries:\s*$", pry_template, re.MULTILINE):
             header = pry_template.split("queries:")[0]
         else:
@@ -250,12 +241,6 @@ def pry_from_pry(
     logger.debug(f"Reportviews extracted from original pry:")
     for rv in reportviews:
         logger.debug(rv)
-    # get the report name from top-level metadata using string parsing only
-    report_name = extract_report_name_from_pry(pry_template)
-    # strip off the suffix_name from report_name
-    if suffix_name and report_name.endswith(suffix_name):
-        report_name = report_name[:-len(suffix_name)]
-    report_name = re.sub(r'[^a-zA-Z0-9_]+', '_', report_name)
     queryblock = format_queries_from_sf(reportviews, report_folder)
     # join header & querys
     new_pry = "\n".join([header.rstrip(), "queries:", queryblock])
@@ -263,59 +248,32 @@ def pry_from_pry(
 
 def process_proigia_definition():
     """
-    Process the entire Proigia definition folder, creating new PRY files for each report
-    and copying all other files to the _sf folders.
+    Process the entire Proigia definition folder and generate Snowflake PRY files
+    directly in each source report folder.
     """
     for report_folder in os.listdir(PROIGIA_DEFINITION):
         report_path = os.path.join(PROIGIA_DEFINITION, report_folder)
         if not os.path.isdir(report_path):
             continue
-        if report_folder.endswith("_sf"):
-            continue
         if report_folder in ("blocks", "scripts"):
             continue
         logger.info(f"Processing report folder: {report_folder}")
         # find all .pry files in the folder
-        template_pry_files = functions.find_pry_files(Path(report_path), ignored_keywords=[])
+        template_pry_files = functions.find_pry_files(Path(report_path), ignored_keywords=["_sf"])
         if len(template_pry_files) == 0:
             logger.warning(f"No .pry file found in {report_folder}, skipping.")
             continue
-        # create output folder if it doesn't exist yet
-        output_folder = f"{PROIGIA_DEFINITION}/{report_folder}_sf"
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # Copy all files from the source folder to the output folder (excluding .pry files)
-        logger.info(f"Copying all files from {report_folder} to {report_folder}_sf")
-        for item in os.listdir(report_path):
-            src_item = os.path.join(report_path, item)
-            dst_item = os.path.join(output_folder, item)
-            
-            # Skip .pry files - they will be generated separately with _sf suffix
-            if item.endswith('.pry'):
-                logger.debug(f"Skipping .pry file: {item}")
-                continue
-            
-            if os.path.isdir(src_item):
-                # Remove existing directory if it exists and copy the entire directory
-                if os.path.exists(dst_item):
-                    shutil.rmtree(dst_item)
-                shutil.copytree(src_item, dst_item)
-                logger.debug(f"Copied directory: {item}")
-            else:
-                # Copy individual file
-                shutil.copy2(src_item, dst_item)
-                logger.debug(f"Copied file: {item}")
-        
+
         # Now write new pry files (these will overwrite copied .pry files with updated content)
         for template_pry_file in template_pry_files:
             logger.info(f"Processing template PRY file: {template_pry_file}")
             template_pry_filename = Path(template_pry_file).stem
             is_aggregate_pry = Path(template_pry_file).name.lower().endswith("aggregate.pry")
             if is_aggregate_pry:
-                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" SF")
+                new_pry_content = pry_from_pry(report_folder, template_pry_filename)
             else:
-                new_pry_content = pry_from_pry(report_folder, template_pry_filename, suffix_name=" SF", db_type="snowflake")
-            output_path = f"{output_folder}/{template_pry_filename}_sf.pry"
+                new_pry_content = pry_from_pry(report_folder, template_pry_filename, dataset_type="snowflake")
+            output_path = f"{report_path}/{template_pry_filename}_sf.pry"
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(new_pry_content)
             logger.info(f"Generated new PRY file at: {output_path}")
