@@ -9,16 +9,24 @@ from functools import lru_cache
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_CANDIDATES = [PROJECT_ROOT / "config.yml", PROJECT_ROOT / "config.yaml"]
+ENV_CANDIDATES = [PROJECT_ROOT / "env.yml", PROJECT_ROOT / "env.yaml"]
 
 
 def load_config() -> dict:
-    with open("config.yaml") as f:
-        config = yaml.safe_load(f)
-    
-    with open("env.yaml") as f:
-        config_env = yaml.safe_load(f)
-    
-    config.update(config_env)  # Merge config with env values if present
+    config_path = next((path for path in CONFIG_CANDIDATES if path.exists()), None)
+    if config_path is None:
+        searched_paths = ", ".join(str(path) for path in CONFIG_CANDIDATES)
+        raise FileNotFoundError(f"No config file found. Tried: {searched_paths}")
+
+    with open(config_path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    env_path = next((path for path in ENV_CANDIDATES if path.exists()), None)
+    if env_path is not None:
+        with open(env_path, encoding="utf-8") as f:
+            config_env = yaml.safe_load(f) or {}
+        config.update(config_env)  # Merge config with env values if present
+
     return config
 
 
@@ -174,10 +182,8 @@ def _with_dataset_type(item_lines: list[str], dataset_type: str) -> list[str]:
     base_indent = item_indent.group(1) if item_indent else ""
     dataset_line = f"{base_indent}  dataset_type: {dataset_type}"
 
-    insert_at = len(item_lines)
-    while insert_at > 0 and item_lines[insert_at - 1].strip() == "":
-        insert_at -= 1
-
+    # Insert right after the name line
+    insert_at = 1  # After the "- name:" line
     return item_lines[:insert_at] + [dataset_line] + item_lines[insert_at:]
 
 def add_dataset_type_to_reportviews(pry_template: str, dataset_type: str) -> str:
@@ -208,6 +214,84 @@ def add_dataset_type_to_reportviews(pry_template: str, dataset_type: str) -> str
     updated_lines = lines[:reportviews_start + 1] + new_section + lines[reportviews_end:]
     return "\n".join(updated_lines)
 
+def _externals_block_to_sf_content(block_content: str) -> str:
+    """Add dataset_type to every top-level item in an externals block."""
+    lines = block_content.splitlines()
+    items = _split_list_items(lines)
+    if not items:
+        return block_content
+
+    new_lines = []
+    cursor = 0
+    for item_lines in items:
+        item_start = lines.index(item_lines[0], cursor)
+        new_lines.extend(lines[cursor:item_start])
+        new_lines.extend(_with_dataset_type(item_lines, "snowflake"))
+        cursor = item_start + len(item_lines)
+    new_lines.extend(lines[cursor:])
+    return "\n".join(new_lines)
+
+def _create_externals_sf_block(block_name: str) -> str:
+    """
+    Create or return path to the _sf variant of an externals block.
+    If the _sf variant doesn't exist, create it by adding dataset_type: snowflake to all items.
+    Returns the _sf variant filename (without .pry extension).
+    """
+    blocks_dir = PROIGIA_DEFINITION / "blocks"
+    base_path = blocks_dir / f"{block_name}.pry"
+    
+    if not base_path.exists():
+        return block_name  # Return original if base doesn't exist
+    
+    # Determine _sf variant filename
+    if block_name.endswith("_externals"):
+        sf_name = block_name + "_sf"
+    else:
+        # Shouldn't happen for externals, but handle it
+        sf_name = block_name + "_sf"
+    
+    sf_path = blocks_dir / f"{sf_name}.pry"
+    
+    # Create _sf variant if it doesn't exist
+    if not sf_path.exists():
+        base_content = base_path.read_text(encoding='utf-8-sig')
+        sf_content = _externals_block_to_sf_content(base_content)
+        sf_path.write_text(sf_content, encoding='utf-8')
+        logger.debug(f"Created _sf variant: {sf_path.name}")
+    
+    return sf_name
+
+def ensure_all_externals_sf_blocks() -> None:
+    """Create Snowflake variants for every externals block in the blocks directory."""
+    blocks_dir = PROIGIA_DEFINITION / "blocks"
+    for base_path in sorted(blocks_dir.glob("*_externals.pry")):
+        _create_externals_sf_block(base_path.stem)
+
+def _rewrite_includes_to_sf_variants(header: str) -> str:
+    """
+    Rewrite include statements to point to _sf variants of externals blocks.
+    For example: {% include 'proigia_basis_episode_seg2_externals.pry' %}
+    becomes: {% include 'proigia_basis_episode_seg2_externals_sf.pry' %}
+    """
+    # Pattern to match include statements with block names
+    # Matches: {% [with ...] include 'block_name.pry' [%} ... {%] endwith %}
+    pattern = re.compile(
+        r"(\{%\s*(?:with\s+[^%]*\%\}\s*)?include\s+')([^']+_externals)(\.pry')(\s*\%\}(?:\s*\{\%\s*endwith\s*\%\})?)"
+    )
+    
+    def replacer(match):
+        prefix = match.group(1)  # {% include '
+        block_name = match.group(2)  # block_name_externals
+        ext = match.group(3)  # .pry
+        suffix = match.group(4)  # %}
+        
+        # Create _sf variant and get the new name
+        sf_block_name = _create_externals_sf_block(block_name)
+        
+        return f"{prefix}{sf_block_name}{ext}{suffix}"
+    
+    return pattern.sub(replacer, header)
+    
 def pry_from_pry(
     report_folder: str,
     template_pry_file: str,
@@ -234,6 +318,10 @@ def pry_from_pry(
         else:
             return pry_template
     
+    # Rewrite include statements to use _sf variants when generating Snowflake files
+    if dataset_type == "snowflake":
+        header = _rewrite_includes_to_sf_variants(header)
+    
     # TODO: put database type in header
     
     # get the query names from the original pry    
@@ -251,6 +339,8 @@ def process_proigia_definition():
     Process the entire Proigia definition folder and generate Snowflake PRY files
     directly in each source report folder.
     """
+    ensure_all_externals_sf_blocks()
+
     for report_folder in os.listdir(PROIGIA_DEFINITION):
         report_path = os.path.join(PROIGIA_DEFINITION, report_folder)
         if not os.path.isdir(report_path):
