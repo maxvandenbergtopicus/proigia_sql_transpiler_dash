@@ -169,14 +169,24 @@ def _split_list_items(section_lines: list[str]) -> list[list[str]]:
     return items
 
 def _with_dataset_type(item_lines: list[str], dataset_type: str) -> list[str]:
-    """Ensure a YAML list item contains dataset_type, replacing existing values if needed."""
-    for idx, line in enumerate(item_lines):
-        if re.match(r"^\s*dataset_type\s*:", line):
-            indent_match = re.match(r"^(\s*)dataset_type\s*:", line)
-            indent = indent_match.group(1) if indent_match else ""
-            updated = item_lines.copy()
-            updated[idx] = f"{indent}dataset_type: {dataset_type}"
-            return updated
+    """Ensure a YAML list item contains exactly one dataset_type entry."""
+    dataset_line_index = None
+    dataset_line_indent = ""
+    rewritten_lines = []
+
+    for line in item_lines:
+        match = re.match(r"^(\s*)dataset_type\s*:\s*.*$", line)
+        if match:
+            if dataset_line_index is None:
+                dataset_line_index = len(rewritten_lines)
+                dataset_line_indent = match.group(1)
+            continue
+
+        rewritten_lines.append(line)
+
+    if dataset_line_index is not None:
+        rewritten_lines.insert(dataset_line_index, f"{dataset_line_indent}dataset_type: {dataset_type}")
+        return rewritten_lines
 
     item_indent = re.match(r"^(\s*)-", item_lines[0])
     base_indent = item_indent.group(1) if item_indent else ""
@@ -252,12 +262,11 @@ def _create_externals_sf_block(block_name: str) -> str:
     
     sf_path = blocks_dir / f"{sf_name}.pry"
     
-    # Create _sf variant if it doesn't exist
-    if not sf_path.exists():
-        base_content = base_path.read_text(encoding='utf-8-sig')
-        sf_content = _externals_block_to_sf_content(base_content)
-        sf_path.write_text(sf_content, encoding='utf-8')
-        logger.debug(f"Created _sf variant: {sf_path.name}")
+    # Create or update _sf variant with fixes applied
+    base_content = base_path.read_text(encoding='utf-8-sig')
+    sf_content = _externals_block_to_sf_content(base_content)
+    sf_path.write_text(sf_content, encoding='utf-8')
+    logger.debug(f"Created/updated _sf variant: {sf_path.name}")
     
     return sf_name
 
@@ -267,31 +276,44 @@ def ensure_all_externals_sf_blocks() -> None:
     for base_path in sorted(blocks_dir.glob("*_externals.pry")):
         _create_externals_sf_block(base_path.stem)
 
+def _resolve_sf_include_target(block_name: str) -> str:
+    """Resolve include target to _sf variant for externals blocks only."""
+    if block_name.endswith("_sf"):
+        return block_name
+
+    if "externals" not in block_name:
+        return block_name
+
+    return _create_externals_sf_block(block_name)
+
 def _rewrite_includes_to_sf_variants(header: str) -> str:
     """
-    Rewrite include statements to point to _sf variants of externals blocks.
-    For example: {% include 'proigia_basis_episode_seg2_externals.pry' %}
-    becomes: {% include 'proigia_basis_episode_seg2_externals_sf.pry' %}
+    Rewrite include statements to _sf variants for externals blocks only.
+    Create missing _sf externals blocks when needed.
     """
-    # Pattern to match include statements with block names
-    # Matches: {% [with ...] include 'block_name.pry' [%} ... {%] endwith %}
-    pattern = re.compile(
-        r"(\{%\s*(?:with\s+[^%]*\%\}\s*)?include\s+')([^']+_externals)(\.pry')(\s*\%\}(?:\s*\{\%\s*endwith\s*\%\})?)"
-    )
+    pattern = re.compile(r"(\{%\s*include\s+')([^']+)(\.pry')(\s*\%\})")
     
     def replacer(match):
         prefix = match.group(1)  # {% include '
-        block_name = match.group(2)  # block_name_externals
+        block_name = match.group(2)  # block_name
         ext = match.group(3)  # .pry
         suffix = match.group(4)  # %}
-        
-        # Create _sf variant and get the new name
-        sf_block_name = _create_externals_sf_block(block_name)
+
+        sf_block_name = _resolve_sf_include_target(block_name)
         
         return f"{prefix}{sf_block_name}{ext}{suffix}"
     
     return pattern.sub(replacer, header)
-    
+
+def _bump_queryorders(header: str, offset: int = 100000) -> str:
+    """Add offset to ordering metadata values and include order= values in a pry header."""
+    def bump(m):
+        return f"{m.group(1)}{int(m.group(2)) + offset}"
+    header = re.sub(r"^(\s*queryorder:\s*)(\d+)\s*$", bump, header, flags=re.MULTILINE)
+    header = re.sub(r"^(\s*displayorder:\s*)(\d+)\s*$", bump, header, flags=re.MULTILINE)
+    header = re.sub(r"(\{%\s*with\s+order=)(\d+)(\s*%\})", lambda m: f"{m.group(1)}{int(m.group(2)) + offset}{m.group(3)}", header)
+    return header
+
 def pry_from_pry(
     report_folder: str,
     template_pry_file: str,
@@ -321,6 +343,7 @@ def pry_from_pry(
     # Rewrite include statements to use _sf variants when generating Snowflake files
     if dataset_type == "snowflake":
         header = _rewrite_includes_to_sf_variants(header)
+        header = _bump_queryorders(header)
     
     # TODO: put database type in header
     
