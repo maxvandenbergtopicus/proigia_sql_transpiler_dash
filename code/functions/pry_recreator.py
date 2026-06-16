@@ -225,21 +225,25 @@ def add_dataset_type_to_reportviews(pry_template: str, dataset_type: str) -> str
     return "\n".join(updated_lines)
 
 def _externals_block_to_sf_content(block_content: str) -> str:
-    """Add dataset_type to every top-level item in an externals block."""
+    """Convert an externals block to its Snowflake variant."""
     lines = block_content.splitlines()
     items = _split_list_items(lines)
     if not items:
-        return block_content
+        updated_content = block_content
+    else:
+        new_lines = []
+        cursor = 0
+        for item_lines in items:
+            item_start = lines.index(item_lines[0], cursor)
+            new_lines.extend(lines[cursor:item_start])
+            new_lines.extend(_with_dataset_type(item_lines, "snowflake"))
+            cursor = item_start + len(item_lines)
+        new_lines.extend(lines[cursor:])
+        updated_content = "\n".join(new_lines)
 
-    new_lines = []
-    cursor = 0
-    for item_lines in items:
-        item_start = lines.index(item_lines[0], cursor)
-        new_lines.extend(lines[cursor:item_start])
-        new_lines.extend(_with_dataset_type(item_lines, "snowflake"))
-        cursor = item_start + len(item_lines)
-    new_lines.extend(lines[cursor:])
-    return "\n".join(new_lines)
+    updated_content = _rewrite_includes_to_sf_variants(updated_content)
+    updated_content = _bump_queryorders(updated_content)
+    return updated_content
 
 def _create_externals_sf_block(block_name: str) -> str:
     """
@@ -338,6 +342,9 @@ def pry_from_pry(
         if re.search(r"^queries:\s*$", pry_template, re.MULTILINE):
             header = pry_template.split("queries:")[0]
         else:
+            if dataset_type == "snowflake":
+                pry_template = _rewrite_includes_to_sf_variants(pry_template)
+                pry_template = _bump_queryorders(pry_template)
             return pry_template
     
     # Rewrite include statements to use _sf variants when generating Snowflake files
@@ -373,6 +380,11 @@ def process_proigia_definition():
         logger.info(f"Processing report folder: {report_folder}")
         # find all .pry files in the folder
         template_pry_files = functions.find_pry_files(Path(report_path), ignored_keywords=["_sf"])
+        template_pry_files = [
+            file_path
+            for file_path in template_pry_files
+            if "column_properties" not in Path(file_path).name.lower()
+        ]
         if len(template_pry_files) == 0:
             logger.warning(f"No .pry file found in {report_folder}, skipping.")
             continue
