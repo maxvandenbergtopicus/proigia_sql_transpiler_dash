@@ -49,6 +49,7 @@ materialized_view_reports:
 
 skip_files:
 - osteoporose_53530008_ind.pry
+- doorleveren_data_intercity_2.pry
 
 skip_folders:
 #- proigia_zg_criteria_v3

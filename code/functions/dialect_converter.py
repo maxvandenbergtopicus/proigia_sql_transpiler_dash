@@ -1185,30 +1185,34 @@ def remove_redundant_literal_and_null_casts(sql: str) -> str:
     Remove unnecessary casts on numeric literals and NULL values.
 
     Examples:
-        1::numeric            -> 1
+        1::float              -> 1
         -2.5::double precision -> -2.5
-        CAST(3 AS DECIMAL(10,2)) -> 3
+        CAST(3 AS INTEGER)    -> 3
         NULL::varchar         -> NULL
         CAST(NULL AS DATE)    -> NULL
 
+    NUMERIC/DECIMAL/NUMBER casts on literals are intentionally left intact so that
+    convert_cast_to_try_cast can convert them to TO_DECFLOAT(expr).
     This intentionally leaves casts on non-literal expressions untouched.
     """
-    numeric_types = (
-        r'NUMERIC|DECIMAL|NUMBER|REAL|FLOAT|FLOAT4|FLOAT8|DOUBLE\s+PRECISION|'
+    # Excludes NUMERIC/DECIMAL/NUMBER so that 14.1::numeric -> TO_DECFLOAT(14.1)
+    # via convert_cast_to_try_cast rather than being silently dropped here.
+    non_decimal_numeric_types = (
+        r'REAL|FLOAT|FLOAT4|FLOAT8|DOUBLE\s+PRECISION|'
         r'SMALLINT|INTEGER|INT|BIGINT'
     )
 
-    # Remove PostgreSQL-style casts on numeric literals.
+    # Remove PostgreSQL-style casts on numeric literals (non-decimal types only).
     sql = re.sub(
-        rf'(?<![\w\]])([+-]?\d+(?:\.\d+)?)\s*::\s*(?:{numeric_types})(?:\s*\([^)]*\))?\b',
+        rf'(?<![\w\]])([+-]?\d+(?:\.\d+)?)\s*::\s*(?:{non_decimal_numeric_types})(?:\s*\([^)]*\))?\b',
         r'\1',
         sql,
         flags=re.IGNORECASE,
     )
 
-    # Remove CAST(numeric_literal AS <numeric type>).
+    # Remove CAST(numeric_literal AS <non-decimal numeric type>).
     sql = re.sub(
-        rf'\bCAST\s*\(\s*([+-]?\d+(?:\.\d+)?)\s+AS\s+(?:{numeric_types})(?:\s*\([^)]*\))?\s*\)',
+        rf'\bCAST\s*\(\s*([+-]?\d+(?:\.\d+)?)\s+AS\s+(?:{non_decimal_numeric_types})(?:\s*\([^)]*\))?\s*\)',
         r'\1',
         sql,
         flags=re.IGNORECASE,
