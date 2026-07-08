@@ -57,23 +57,39 @@ class FixedSnowflake(Snowflake):
         }
 
         def extract_from_age_sql(self, expression: exp.Extract) -> str:
-            """Handle EXTRACT(YEAR/MONTH/DAY FROM AGE(...)) conversions using date_diff_exact UDF"""
+            """Handle EXTRACT(YEAR/MONTH/DAY FROM AGE(...)) conversions using date_diff_exact UDF
+
+            Postgres age() yields a decomposed interval: MONTH is the remainder
+            after complete years (0-11) and DAY the remainder after complete
+            months. date_diff_exact() returns the TOTAL difference per unit, so
+            MONTH and DAY must be reduced to remainders.
+            """
             unit = expression.this.this.upper()
             age_expr = expression.expression
             args = age_expr.expressions
-            
-            unit_map = {"YEAR": "year", "MONTH": "month", "DAY": "day"}
-            unit_str = unit_map.get(unit, "month")
 
             if len(args) == 2:
-                # EXTRACT(unit FROM AGE(end, start)) -> {{ function('date_diff_exact') }}('unit', start, end)
-                return f"{{{{ function('date_diff_exact') }}}}('{unit_str}', {self.sql(args[1])}, {self.sql(args[0])})"
+                # AGE(end, start)
+                start = self.sql(args[1])
+                end = self.sql(args[0])
             elif len(args) == 1:
-                # EXTRACT(unit FROM AGE(timestamp)) -> {{ function('date_diff_exact') }}('unit', timestamp, CURRENT_TIMESTAMP())
-                return f"{{{{ function('date_diff_exact') }}}}('{unit_str}', {self.sql(args[0])}, CURRENT_TIMESTAMP())"
-            
-            # Fallback
-            return f"{{{{ function('date_diff_exact') }}}}('{unit_str}', {self.sql(args[0]) if len(args) >= 1 else 'NULL'}, CURRENT_TIMESTAMP())"
+                # AGE(timestamp) -> compared against now
+                start = self.sql(args[0])
+                end = "CURRENT_TIMESTAMP()"
+            else:
+                start = "NULL"
+                end = "CURRENT_TIMESTAMP()"
+
+            def total(u):
+                return f"{{{{ function('date_diff_exact') }}}}('{u}', {start}, {end})"
+
+            if unit == "YEAR":
+                return total('year')
+            if unit == "MONTH":
+                # months remainder within the year
+                return f"MOD({total('month')}, 12)"
+            # DAY: days left after advancing start by the complete months
+            return f"DATEDIFF(DAY, DATEADD(MONTH, {total('month')}, {start}), {end})"
         
         def substring_sql(self, expression: exp.Substring) -> str:
             """Convert PostgreSQL SUBSTRING(value FROM pattern) to Snowflake REGEXP_SUBSTR(value, pattern)"""
@@ -256,15 +272,20 @@ class FixedSnowflake(Snowflake):
                         except (ValueError, ZeroDivisionError):
                             pass
                 
+                # A bare SEQ4() inside an uncorrelated LATERAL subquery does not step
+                # per generator row (every row gets the same value), so the series
+                # collapses to N identical dates. Assign a gap-free 0..N-1 index with
+                # ROW_NUMBER() in a derived table instead.
+
                 # If we successfully calculated a static rowcount, use it
                 if rowcount is not None and base_start_expr is not None and offset_value_int is not None:
                     # Use the base expression (without the offset) as the actual start
-                    # and adjust using SEQ4() starting from negative offset
+                    # and adjust using the row index starting from negative offset
                     base_start = self.sql(base_start_expr)
-                    
+
                     return (
-                        f"TABLE(GENERATOR(ROWCOUNT => {rowcount})), "
-                        f"LATERAL (SELECT DATEADD({step_unit}, -{offset_value_int} + (SEQ4() * {step_value}), {base_start}) AS VALUE)"
+                        f"(SELECT DATEADD({step_unit}, -{offset_value_int} + ((ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1) * {step_value}), {base_start}) AS VALUE "
+                        f"FROM TABLE(GENERATOR(ROWCOUNT => {rowcount})))"
                     )
                 else:
                     # Fallback: Use dynamic DATEDIFF (may fail if not constant in Snowflake)
@@ -273,8 +294,8 @@ class FixedSnowflake(Snowflake):
                     end = self.sql(end_expr) if end_expr else "0"
                     rowcount_expr = f"DATEDIFF({step_unit}, {start}, {end}) / {step_value} + 1"
                     return (
-                        f"TABLE(GENERATOR(ROWCOUNT => {rowcount_expr})), "
-                        f"LATERAL (SELECT DATEADD({step_unit}, SEQ4() * {step_value}, {start}) AS VALUE)"
+                        f"(SELECT DATEADD({step_unit}, (ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1) * {step_value}, {start}) AS VALUE "
+                        f"FROM TABLE(GENERATOR(ROWCOUNT => {rowcount_expr})))"
                     )
             else:
                 # ---- NUMERIC SERIES ----
@@ -311,11 +332,13 @@ class FixedSnowflake(Snowflake):
 
             if func_name == "AGE":
                 if len(args) == 2:
-                    # AGE(end, start) -> DATEDIFF(month, start, end) for better precision
-                    return f"DATEDIFF(year, {self.sql(args[1])}, {self.sql(args[0])})"
+                    # AGE(end, start) -> {{ function('date_diff_exact') }}('year', start, end)
+                    # Uses the exact age calculation UDF to match PostgreSQL behavior (includes months/days)
+                    return f"{{{{ function('date_diff_exact') }}}}('year', {self.sql(args[1])}, {self.sql(args[0])})"
                 elif len(args) == 1:
-                    # AGE(timestamp) -> DATEDIFF(month, timestamp, CURRENT_TIMESTAMP())
-                    return f"DATEDIFF(year, {self.sql(args[0])}, CURRENT_TIMESTAMP())"
+                    # AGE(timestamp) -> {{ function('date_diff_exact') }}('year', timestamp, CURRENT_TIMESTAMP())
+                    # Uses the exact age calculation UDF to match PostgreSQL behavior
+                    return f"{{{{ function('date_diff_exact') }}}}('year', {self.sql(args[0])}, CURRENT_TIMESTAMP())"
 
             if func_name == "ARRAYS_OVERLAP":
                 return f"ARRAYS_OVERLAP({self.sql(args[0])}, {self.sql(args[1])})"
@@ -573,6 +596,8 @@ def convert_postgres_regex_to_rlike(sql: str) -> str:
     - Replace \\d with [0-9] (digit character class)
     - ~ (case-sensitive)   → expr RLIKE 'pattern'
     - ~* (case-insensitive) → REGEXP_LIKE(expr, 'pattern', 'i')
+    - !~ (negated, case-sensitive)   → NOT expr RLIKE 'pattern'
+    - !~* (negated, case-insensitive) → NOT REGEXP_LIKE(expr, 'pattern', 'i')
 
     Anchoring:
     PostgreSQL ~ / ~* are partial-match operators (like re.search).
@@ -603,6 +628,47 @@ def convert_postgres_regex_to_rlike(sql: str) -> str:
         if not pattern.endswith('$') and not pattern.endswith('.*'):
             pattern = pattern + '.*'
         return pattern
+
+    def _peel_leading_parens(raw: str):
+        """Split off any leading '(' grouping chars from a captured \S+ token.
+
+        When the regex captures e.g. '((tekst' the leading '((' are SQL grouping
+        parentheses that belong *before* the NOT keyword, not inside the function call.
+        Function-call parens like 'COALESCE(' start with a letter so they are unaffected.
+        Returns (prefix, expression) where prefix is the stripped leading parens.
+        """
+        m = re.match(r'^(\(+)', raw)
+        if m:
+            return m.group(1), raw[m.end():]
+        return '', raw
+
+    # Match: expression !~* 'pattern' (negated, case-insensitive) — must come before ~* / ~
+    def repl_not_tilde_star(match):
+        prefix, expression = _peel_leading_parens(match.group(1))
+        quote = match.group(2)
+        pattern = anchor_pattern(translate_postgres_regex_pattern(match.group(3)))
+        return f"{prefix}NOT REGEXP_LIKE({expression}, {quote}{pattern}{quote}, 'i')"
+
+    sql = re.sub(
+        r'(\S+)[^\S\n]+!~\*[^\S\n]+([\'"])([^\2]*?)\2',
+        repl_not_tilde_star,
+        sql,
+        flags=re.IGNORECASE
+    )
+
+    # Match: expression !~ 'pattern' (negated, case-sensitive)
+    def repl_not_tilde(match):
+        prefix, expression = _peel_leading_parens(match.group(1))
+        quote = match.group(2)
+        pattern = anchor_pattern(translate_postgres_regex_pattern(match.group(3)))
+        return f"{prefix}NOT {expression} RLIKE {quote}{pattern}{quote}"
+
+    sql = re.sub(
+        r'(\S+)[^\S\n]+!~[^\S\n]+([\'"])([^\2]*?)\2',
+        repl_not_tilde,
+        sql,
+        flags=re.IGNORECASE
+    )
 
     # Match: expression ~* 'pattern' (case-insensitive) — must come before ~ to avoid mis-match
     def repl_tilde_star(match):
@@ -1266,56 +1332,63 @@ def convert_cast_to_try_cast(sql: str) -> str:
             return stripped
         return f'CAST({stripped} AS VARCHAR)'
 
-    # Process each target type
-    for dtype in target_types:
-        # Find all CAST occurrences
+    def _rewrite_for_dtype(s: str, dtype: str) -> str:
+        """Single-type pass: rewrite CAST(... AS dtype) in s, recursing into non-matching CASTs."""
         result = []
         i = 0
-        while i < len(sql):
-            # Look for CAST(
-            match = re.match(r'\bCAST\s*\(', sql[i:], re.IGNORECASE)
+        while i < len(s):
+            match = re.match(r'\bCAST\s*\(', s[i:], re.IGNORECASE)
             if match:
-                # Found CAST(, now find the matching closing parenthesis
                 start = i
+                cast_prefix = s[start : start + match.end()]  # e.g. "CAST("
                 i += match.end()
                 paren_count = 1
                 expr_start = i
-                
-                # Track parentheses to find the end of CAST
-                while i < len(sql) and paren_count > 0:
-                    if sql[i] == '(':
+                while i < len(s) and paren_count > 0:
+                    if s[i] == '(':
                         paren_count += 1
-                    elif sql[i] == ')':
+                    elif s[i] == ')':
                         paren_count -= 1
                     i += 1
-                
                 if paren_count == 0:
-                    # Extract the full CAST expression
-                    cast_content = sql[expr_start:i-1]
-                    
-                    # Check if this CAST is for our target type
+                    cast_content = s[expr_start:i-1]
                     as_pattern = rf'\s+AS\s+{dtype}(?:\s*\([^)]*\))?\s*$'
                     if re.search(as_pattern, cast_content, re.IGNORECASE):
                         as_match = re.search(as_pattern, cast_content, re.IGNORECASE)
                         expr = cast_content[:as_match.start()].strip()
-                        
                         if dtype in numeric_types:
-                            expr_for_numeric = _ensure_varchar_for_array_access(expr)
-                            result.append(f'TO_DECFLOAT({expr_for_numeric})')
+                            # If precision/scale is specified (e.g. NUMERIC(18,3)), keep as
+                            # CAST(expr AS NUMBER(p,s)) so the scale is preserved in Snowflake.
+                            # Only bare NUMERIC/DECIMAL/NUMBER without precision falls back to
+                            # TO_DECFLOAT.
+                            prec_match = re.search(
+                                rf'\s+AS\s+{dtype}\s*(\(\s*\d+\s*(?:,\s*\d+\s*)?\))\s*$',
+                                cast_content, re.IGNORECASE
+                            )
+                            if prec_match:
+                                prec_spec = prec_match.group(1)
+                                result.append(f'CAST({expr} AS NUMBER{prec_spec})')
+                            else:
+                                expr_for_numeric = _ensure_varchar_for_array_access(expr)
+                                result.append(f'TO_DECFLOAT({expr_for_numeric})')
                         else:
                             func_name = date_types[dtype]
                             result.append(f'{func_name}({expr})')
                     else:
-                        # Keep original CAST
-                        result.append(sql[start:i])
+                        # Outer CAST doesn't match – recurse into its inner content
+                        inner_processed = _rewrite_for_dtype(cast_content, dtype)
+                        result.append(f'{cast_prefix}{inner_processed})')
                 else:
                     # Malformed, keep original
-                    result.append(sql[start:i])
+                    result.append(s[start:i])
             else:
-                result.append(sql[i])
+                result.append(s[i])
                 i += 1
-        
-        sql = ''.join(result)
+        return ''.join(result)
+
+    # Process each target type
+    for dtype in target_types:
+        sql = _rewrite_for_dtype(sql, dtype)
     
     return sql
 
@@ -1672,7 +1745,7 @@ def convert_postgres_escape_strings(sql: str) -> str:
         if (i < len(sql) - 1 and 
             sql[i].upper() == 'E' and 
             sql[i+1] in ("'", '"') and
-            (i == 0 or not sql[i-1].isalnum() and sql[i-1] != '_')):
+            (i == 0 or (not sql[i-1].isalnum() and sql[i-1] != '_' and sql[i-1] not in ("'", '"')))):
             quote_char = sql[i+1]
             result.append(quote_char)  # Remove the E, keep the quote
             i += 2  # Skip past E'
@@ -3637,6 +3710,29 @@ def wrap_listagg_with_nullif(sql: str) -> str:
     i = 0
     n = len(sql)
 
+    def find_top_level_comma(text: str) -> int:
+        depth = 0
+        in_str = False
+        str_char = ''
+
+        for idx, ch in enumerate(text):
+            if in_str:
+                if ch == str_char and (idx == 0 or text[idx - 1] != '\\'):
+                    in_str = False
+                continue
+
+            if ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == ',' and depth == 0:
+                return idx
+
+        return -1
+
     while i < n:
         m = re.match(r'LISTAGG\s*\(', sql[i:], re.IGNORECASE)
         if not m:
@@ -3701,7 +3797,20 @@ def wrap_listagg_with_nullif(sql: str) -> str:
                 elif ch == ')':
                     depth2 -= 1
                 k2 += 1
-            agg_expr = sql[i:k2]
+            listagg_inner = sql[i:j]
+            listagg_open = i + m.end() - 1
+            listagg_args = sql[listagg_open + 1:j - 1]
+            comma_idx = find_top_level_comma(listagg_args)
+            if comma_idx != -1:
+                first_arg = listagg_args[:comma_idx].strip()
+                distinct_m = re.match(r'DISTINCT\s+(.+)', first_arg, re.IGNORECASE | re.DOTALL)
+                if distinct_m:
+                    distinct_expr = distinct_m.group(1).strip()
+                    agg_expr = f"{listagg_inner} WITHIN GROUP (ORDER BY {distinct_expr})"
+                else:
+                    agg_expr = sql[i:k2]
+            else:
+                agg_expr = sql[i:k2]
             j = k2
 
         result.append(f"NULLIF({agg_expr}, '')")
