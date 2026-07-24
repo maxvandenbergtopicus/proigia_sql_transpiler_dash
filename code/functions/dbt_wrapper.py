@@ -441,7 +441,10 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
         calls = _find_function_calls(sql, func_name)
         for start, end, args in reversed(calls):
             function_name = func_name.lower()
-            replacement = f"{{{{ function('{function_name}') }}}}({args.strip()})"
+            call_args = args.strip()
+            if function_name == 'override_kwartaal':
+                call_args = f"{call_args}, {{{{agb}}}}" if call_args else "{{agb}}"
+            replacement = f"{{{{ function('{function_name}') }}}}({call_args})"
             sql = sql[:start] + replacement + sql[end:]
     return sql
 

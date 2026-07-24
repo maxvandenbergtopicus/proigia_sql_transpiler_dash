@@ -57,12 +57,19 @@ class FixedSnowflake(Snowflake):
         }
 
         def extract_from_age_sql(self, expression: exp.Extract) -> str:
-            """Handle EXTRACT(YEAR/MONTH/DAY FROM AGE(...)) conversions using date_diff_exact UDF
+            """Handle EXTRACT(YEAR/MONTH/DAY FROM AGE(...)) conversions.
 
-            Postgres age() yields a decomposed interval: MONTH is the remainder
-            after complete years (0-11) and DAY the remainder after complete
-            months. date_diff_exact() returns the TOTAL difference per unit, so
-            MONTH and DAY must be reduced to remainders.
+            Emulates Postgres age() decomposition exactly. age() computes the
+            field-wise difference and, when day(end) < day(start), borrows one
+            month using the number of days in the START date's month (see
+            timestamp_age in the PG source). This differs from the previous
+            date_diff_exact/DATEADD approach by 1-3 days around unequal month
+            lengths, and by a whole month on month-end clamping edges
+            (e.g. 2025-01-31 -> 2025-04-30 is '2 mon 30 days' in PG, not '3 mon').
+
+            Emits the pg_age_part(unit, start, end) UDF, which must be deployed
+            alongside date_diff_exact. Assumes end >= start, which holds for
+            report period columns.
             """
             unit = expression.this.this.upper()
             age_expr = expression.expression
@@ -75,21 +82,12 @@ class FixedSnowflake(Snowflake):
             elif len(args) == 1:
                 # AGE(timestamp) -> compared against now
                 start = self.sql(args[0])
-                end = "CURRENT_TIMESTAMP()"
+                end = "CURRENT_DATE()"
             else:
                 start = "NULL"
-                end = "CURRENT_TIMESTAMP()"
+                end = "CURRENT_DATE()"
 
-            def total(u):
-                return f"{{{{ function('date_diff_exact') }}}}('{u}', {start}, {end})"
-
-            if unit == "YEAR":
-                return total('year')
-            if unit == "MONTH":
-                # months remainder within the year
-                return f"MOD({total('month')}, 12)"
-            # DAY: days left after advancing start by the complete months
-            return f"DATEDIFF(DAY, DATEADD(MONTH, {total('month')}, {start}), {end})"
+            return f"{{{{ function('pg_age_part') }}}}('{unit.lower()}', {start}, {end})"
         
         def substring_sql(self, expression: exp.Substring) -> str:
             """Convert PostgreSQL SUBSTRING(value FROM pattern) to Snowflake REGEXP_SUBSTR(value, pattern)"""
@@ -387,6 +385,24 @@ class FixedSnowflake(Snowflake):
                 # Fallback for non-literal patterns
                 return f"{self.sql(expression.this)} RLIKE {self.sql(expression.expression)}"
 
+        def collate_sql(self, expression: exp.Collate) -> str:
+            """Convert PostgreSQL COLLATE "name" to Snowflake COLLATE(expr, 'name').
+
+            PostgreSQL uses double-quoted identifiers for collation names (e.g. COLLATE "C").
+            sqlglot parses the collation as an Identifier node and Snowflake's default generator
+            re-emits those double quotes, producing COLLATE(col, "C") which is invalid in
+            Snowflake. We unwrap the identifier and emit a proper single-quoted string literal.
+            """
+            collation = expression.args.get("collation") or expression.expression
+            col_sql = self.sql(expression.this)
+            if isinstance(collation, exp.Identifier):
+                collation_name = collation.name
+            elif isinstance(collation, exp.Literal):
+                collation_name = collation.this
+            else:
+                collation_name = self.sql(collation).strip('"\'')
+            return f"COLLATE({col_sql}, '{collation_name}')"
+
         def cast_sql(self, expression: exp.Cast, safe_prefix=None) -> str:
             """
             Override cast_sql to suppress inline comments on the inner expression.
@@ -587,6 +603,100 @@ def add_order_by_to_array_agg(sql: str) -> str:
 
     return ''.join(result)
 
+
+def convert_postgres_regexp_replace(sql: str) -> str:
+    """
+    Convert PostgreSQL REGEXP_REPLACE(str, pattern, replacement [, flags]) to the
+    Snowflake form REGEXP_REPLACE(str, pattern, replacement, position, occurrence [, parameters]).
+
+    PostgreSQL default replaces only the FIRST occurrence; Snowflake default replaces ALL.
+    The flags argument drives the mapping:
+
+      No flags  → occurrence=1  (first only)
+      'g'       → occurrence=0  (all)
+      'i'       → occurrence=1, parameters='i'  (first, case-insensitive)
+      'gi'/'ig' → occurrence=0, parameters='i'  (all, case-insensitive)
+
+    Calls that already have 5 or 6 arguments are left untouched (already Snowflake form).
+    """
+    result = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        m = re.match(r'REGEXP_REPLACE\s*\(', sql[i:], re.IGNORECASE)
+        if not m:
+            result.append(sql[i])
+            i += 1
+            continue
+
+        func_start = i
+        paren_start = i + m.end() - 1  # position of opening '('
+
+        # Parse top-level comma-separated arguments, respecting nested parens/strings
+        args = []
+        arg_start = paren_start + 1
+        depth = 1
+        j = paren_start + 1
+        in_str = False
+        str_char = ''
+
+        while j < n and depth > 0:
+            ch = sql[j]
+            if in_str:
+                if ch == str_char and (j == 0 or sql[j - 1] != '\\'):
+                    in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                str_char = ch
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    args.append(sql[arg_start:j].strip())
+                    break
+            elif ch == ',' and depth == 1:
+                args.append(sql[arg_start:j].strip())
+                arg_start = j + 1
+            j += 1
+
+        if depth != 0:
+            # Unbalanced parentheses – leave as-is
+            result.append(sql[i])
+            i += 1
+            continue
+
+        end = j + 1  # one past the closing ')'
+
+        if len(args) == 3:
+            # No flags argument → replace first occurrence only
+            # Recurse into s to handle nested REGEXP_REPLACE calls
+            s, p, r = args
+            s = convert_postgres_regexp_replace(s)
+            result.append(f"REGEXP_REPLACE({s}, {p}, {r}, 1, 1)")
+            i = end
+        elif len(args) == 4:
+            s, p, r, flags_arg = args
+            # Recurse into s to handle nested REGEXP_REPLACE calls
+            s = convert_postgres_regexp_replace(s)
+            flags_inner = flags_arg.strip().strip("'\"").lower()
+            has_g = 'g' in flags_inner
+            has_i = 'i' in flags_inner
+            occurrence = 0 if has_g else 1
+            if has_i:
+                result.append(f"REGEXP_REPLACE({s}, {p}, {r}, 1, {occurrence}, 'i')")
+            else:
+                result.append(f"REGEXP_REPLACE({s}, {p}, {r}, 1, {occurrence})")
+            i = end
+        else:
+            # 1, 2, or 5+ args – already Snowflake form; recurse into args to handle
+            # any nested REGEXP_REPLACE calls (e.g. in the first/subject argument).
+            converted_args = [convert_postgres_regexp_replace(a) for a in args]
+            result.append(f"REGEXP_REPLACE({', '.join(converted_args)})")
+            i = end
+
+    return ''.join(result)
 
 
 def convert_postgres_regex_to_rlike(sql: str) -> str:
@@ -1897,6 +2007,20 @@ def wrap_array_to_string_with_compact(sql: str) -> str:
     return ''.join(result)
 
 
+def _has_negated_like_operator(sql: str, left_start: int) -> bool:
+    """
+    Detect whether the LIKE/ILIKE ANY/ALL expression whose left operand starts at
+    left_start came from a Postgres negated operator ("x NOT ILIKE ANY/ALL(arr)").
+
+    sqlglot renders that form as "NOT x ILIKE ANY/ALL(arr)" without parentheses,
+    while an explicit "NOT (x ILIKE ...)" keeps its parentheses. So a bare NOT
+    keyword immediately before the left expression identifies the negated operator,
+    which requires flipping the ANY/ALL quantifier when the NOT is left outside
+    the UDF call (De Morgan).
+    """
+    return re.search(r'\bNOT\s*$', sql[:left_start], re.IGNORECASE) is not None
+
+
 def convert_like_any_to_regexp_like(sql: str) -> str:
     """
     Convert LIKE/ILIKE ANY(dynamic_expr) to ILIKE_ANY/LIKE_ANY UDF calls for Snowflake.
@@ -1931,6 +2055,13 @@ def convert_like_any_to_regexp_like(sql: str) -> str:
       - LIKE wildcard % is converted to regex .* inside the UDF; _ is not currently translated.
       - LIKE ANY(ARRAY_CONSTRUCT(...)) with literal strings is handled separately upstream
         and is NOT processed by this function.
+      - Negated-operator form: Postgres "x NOT ILIKE ANY(arr)" means "at least one pattern
+        does not match" (NOT ILIKE is the operator, ANY the quantifier). sqlglot renders it
+        as "NOT x ILIKE ANY(arr)" (no parens), which would wrongly become
+        NOT ILIKE_ANY(x, arr) = "no pattern matches". De Morgan requires flipping the
+        quantifier: NOT ILIKE_ALL(x, arr). An explicit "NOT (x ILIKE ANY(arr))" keeps its
+        parens through sqlglot, so the two forms are distinguishable here: a bare NOT
+        directly before the left expression signals the negated operator.
     """
     max_iterations = 200
 
@@ -1950,7 +2081,11 @@ def convert_like_any_to_regexp_like(sql: str) -> str:
         if not left_result:
             break
         left_expr, left_start = left_result
-        udf_name = "ILIKE_ANY" if like_op == 'ILIKE' else "LIKE_ANY"
+        if _has_negated_like_operator(sql, left_start):
+            # "x NOT ILIKE ANY(arr)": the NOT stays outside, so flip ANY -> ALL.
+            udf_name = "ILIKE_ALL" if like_op == 'ILIKE' else "LIKE_ALL"
+        else:
+            udf_name = "ILIKE_ANY" if like_op == 'ILIKE' else "LIKE_ANY"
         replacement = (
             f"{{{{ function('{udf_name}') }}}}({left_expr}, "
             f"(SELECT LISTAGG(ARRAY_TO_STRING({column}, '|'), '|') {rest_of_query}))"
@@ -1973,9 +2108,145 @@ def convert_like_any_to_regexp_like(sql: str) -> str:
         if not left_result:
             break
         left_expr, left_start = left_result
-        udf_name = "ILIKE_ANY" if like_op == 'ILIKE' else "LIKE_ANY"
+        if _has_negated_like_operator(sql, left_start):
+            # "x NOT ILIKE ANY(arr)": the NOT stays outside, so flip ANY -> ALL.
+            udf_name = "ILIKE_ALL" if like_op == 'ILIKE' else "LIKE_ALL"
+        else:
+            udf_name = "ILIKE_ANY" if like_op == 'ILIKE' else "LIKE_ANY"
         replacement = f"{{{{ function('{udf_name}') }}}}({left_expr}, ARRAY_TO_STRING({array_col}, '|'))"
         sql = sql[:left_start] + replacement + sql[match.end():]
+
+    return sql
+
+
+def convert_like_all_to_regexp_like(sql: str) -> str:
+    """
+    Convert LIKE/ILIKE ALL(dynamic_expr) to ILIKE_ALL/LIKE_ALL UDF calls for Snowflake.
+
+    Snowflake has no native ILIKE ALL with dynamic array arguments.  The ILIKE_ALL / LIKE_ALL
+    UDFs accept a pipe-separated VARCHAR built with ARRAY_TO_STRING or LISTAGG and check
+    that the column matches EVERY pattern (AND logic), unlike ILIKE_ANY which uses OR.
+
+    Handles:
+      col ILIKE ALL(array_col)
+        → {{ function('ILIKE_ALL') }}(col, ARRAY_TO_STRING(array_col, '|'))
+      col LIKE ALL(array_col)
+        → {{ function('LIKE_ALL') }}(col, ARRAY_TO_STRING(array_col, '|'))
+      col ILIKE ALL((SELECT pattern_col FROM T))
+        → {{ function('ILIKE_ALL') }}(col, (SELECT LISTAGG(ARRAY_TO_STRING(pattern_col, '|'), '|') FROM T))
+      col LIKE ALL((SELECT pattern_col FROM T))
+        → {{ function('LIKE_ALL') }}(col, (SELECT LISTAGG(ARRAY_TO_STRING(pattern_col, '|'), '|') FROM T))
+
+    Companion UDFs to create in Snowflake (JavaScript, because ALL requires iterating every pattern):
+      CREATE OR REPLACE FUNCTION ILIKE_ALL(col VARCHAR, pipe_separated_patterns VARCHAR)
+        RETURNS BOOLEAN LANGUAGE JAVASCRIPT AS
+        $$
+          if (PIPE_SEPARATED_PATTERNS === null || COL === null) return null;
+          const patterns = PIPE_SEPARATED_PATTERNS.split('|').filter(p => p.length > 0);
+          if (patterns.length === 0) return null;
+          return patterns.every(p => {
+            const rx = new RegExp('^' + p.replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+            return rx.test(COL);
+          });
+        $$;
+
+      CREATE OR REPLACE FUNCTION LIKE_ALL(col VARCHAR, pipe_separated_patterns VARCHAR)
+        RETURNS BOOLEAN LANGUAGE JAVASCRIPT AS
+        $$
+          if (PIPE_SEPARATED_PATTERNS === null || COL === null) return null;
+          const patterns = PIPE_SEPARATED_PATTERNS.split('|').filter(p => p.length > 0);
+          if (patterns.length === 0) return null;
+          return patterns.every(p => {
+            const rx = new RegExp('^' + p.replace(/%/g, '.*').replace(/_/g, '.') + '$');
+            return rx.test(COL);
+          });
+        $$;
+
+    Notes:
+      - ILIKE maps to ILIKE_ALL (case-insensitive); LIKE maps to LIKE_ALL (case-sensitive).
+      - Negated-operator form: Postgres "x NOT ILIKE ALL(arr)" means "no pattern matches"
+        (NOT ILIKE is the operator, ALL the quantifier), which sqlglot renders as
+        "NOT x ILIKE ALL(arr)" without parens. Keeping the NOT outside therefore requires
+        flipping the quantifier: NOT {{ function('ILIKE_ANY') }}(x, arr). An explicit
+        "NOT (x ILIKE ALL(arr))" keeps its parens through sqlglot and correctly stays
+        NOT {{ function('ILIKE_ALL') }}(x, arr).
+    """
+    max_iterations = 200
+    op_pattern = re.compile(r'(I?LIKE)\s+ALL\s*\(', re.IGNORECASE)
+
+    for _ in range(max_iterations):
+        match = op_pattern.search(sql)
+        if not match:
+            break
+
+        like_op = match.group(1).upper()
+        udf_name = "ILIKE_ALL" if like_op == 'ILIKE' else "LIKE_ALL"
+
+        # Use paren counting to extract the full argument of ALL(...)
+        arg_start = match.end()  # position right after the opening '('
+        paren_depth = 1
+        i = arg_start
+        while i < len(sql) and paren_depth > 0:
+            if sql[i] == '(':
+                paren_depth += 1
+            elif sql[i] == ')':
+                paren_depth -= 1
+            i += 1
+        # sql[arg_start:i-1] is the raw argument (may have leading/trailing whitespace/parens)
+        raw_arg = sql[arg_start:i - 1].strip()
+        all_end = i  # position after the closing ')' of ALL(...)
+
+        # Strip redundant outer parentheses to reach the core expression
+        core = raw_arg
+        while core.startswith('(') and core.endswith(')'):
+            # Verify the parens are balanced around the whole string
+            depth = 0
+            balanced_at_start = True
+            for ch_i, ch in enumerate(core):
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                if depth == 0 and ch_i < len(core) - 1:
+                    balanced_at_start = False
+                    break
+            if balanced_at_start and depth == 0:
+                core = core[1:-1].strip()
+            else:
+                break
+
+        # Find the left-hand column expression
+        left_result = _find_left_expr_before_operator(sql, match.start())
+        if not left_result:
+            break
+        left_expr, left_start = left_result
+
+        if _has_negated_like_operator(sql, left_start):
+            # "x NOT ILIKE ALL(arr)" (Postgres: no pattern matches): the NOT stays
+            # outside the UDF call, so flip ALL -> ANY (De Morgan).
+            udf_name = "ILIKE_ANY" if like_op == 'ILIKE' else "LIKE_ANY"
+
+        # Build replacement based on whether the argument is a subquery or a column ref
+        select_m = re.match(
+            r'SELECT\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(FROM\s+.*)',
+            core,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if select_m:
+            column = select_m.group(1).strip()
+            rest_of_query = ' '.join(select_m.group(2).strip().split())
+            replacement = (
+                f"{{{{ function('{udf_name}') }}}}({left_expr}, "
+                f"(SELECT LISTAGG(ARRAY_TO_STRING({column}, '|'), '|') {rest_of_query}))"
+            )
+        elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*$', core):
+            # Simple column reference
+            replacement = f"{{{{ function('{udf_name}') }}}}({left_expr}, ARRAY_TO_STRING({core}, '|'))"
+        else:
+            # Unknown form — leave as-is to avoid mangling unrecognised patterns
+            break
+
+        sql = sql[:left_start] + replacement + sql[all_end:]
 
     return sql
 
@@ -2953,6 +3224,13 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
         logging.info("Converting PostgreSQL escape strings (E'...')")
         sql = convert_postgres_escape_strings(sql)
 
+    # Pre-process: Convert PostgreSQL REGEXP_REPLACE(s, p, r [, flags]) to Snowflake form.
+    # PostgreSQL defaults to replacing only the first occurrence; Snowflake defaults to all.
+    # Must run after escape-string normalisation so flag string literals are clean.
+    if 'regexp_replace(' in sql.lower():
+        logging.info("Converting PostgreSQL REGEXP_REPLACE flags to Snowflake position/occurrence/parameters")
+        sql = convert_postgres_regexp_replace(sql)
+
     # Pre-process: Remove redundant casts on numeric literals and NULL values.
     # Keep expression casts intact because they can affect runtime semantics.
     if '::' in sql or 'cast(' in sql.lower():
@@ -3026,10 +3304,27 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
         logging.info("Converting ::bigint to ::int")
         sql = re.sub(r'::bigint\b', '::int', sql, flags=re.IGNORECASE)
     
-    # Pre-process: Remove PostgreSQL array type casts (::text[], ::varchar[], etc.)
+    # Pre-process: Strip ::type[] casts inside ILIKE/LIKE ANY/ALL(...) before the general
+    # ::type[] → ::ARRAY conversion runs.  The cast is redundant there (it just annotates
+    # the subquery result as an array) and would otherwise be turned into CAST(... AS ARRAY)
+    # by sqlglot, which breaks the subquery-pattern regex in convert_like_any_to_regexp_like.
+    # e.g.  col ILIKE ANY((SELECT x FROM t)::text[])  →  col ILIKE ANY((SELECT x FROM t))
+    # e.g.  col ILIKE ALL((SELECT x FROM t)::text[])  →  col ILIKE ALL((SELECT x FROM t))
+    if '::' in sql and '[]' in sql and re.search(r'I?LIKE\s+(?:ANY|ALL)\s*\(', sql, re.IGNORECASE):
+        logging.info("Stripping ::type[] casts inside ILIKE/LIKE ANY/ALL(...)")
+        sql = re.sub(
+            r'(I?LIKE\s+(?:ANY|ALL)\s*\()(.*?)::\w+(?:\(\d+\))?\[\](\s*\))',
+            r'\1\2\3',
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    # Pre-process: Convert PostgreSQL array type casts (::text[], ::varchar[], etc.) to ::ARRAY
+    # These indicate that the accessed element is itself an array (e.g. col[4]::varchar[]).
+    # In Snowflake, array elements are VARIANT; casting to ARRAY preserves array semantics.
     if '::' in sql and '[]' in sql:
-        logging.info("Removing PostgreSQL array type casts")
-        sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '', sql, flags=re.IGNORECASE)
+        logging.info("Converting PostgreSQL array type casts to ::ARRAY")
+        sql = re.sub(r'::(text|varchar|character varying|integer|int|bigint|smallint|numeric|float|double precision|boolean|date|timestamp)\[\]', '::ARRAY', sql, flags=re.IGNORECASE)
     
     # Pre-process: Handle crosstab function (not supported in Snowflake)
     is_crosstab = bool(re.search(r'\bcrosstab\s*\(', sql, re.IGNORECASE))
@@ -3304,6 +3599,22 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     if re.search(r'I?LIKE\s+ANY\s*\(', converted, re.IGNORECASE):
         logging.info("Converting LIKE/ILIKE ANY(dynamic) to REGEXP_LIKE")
         converted = convert_like_any_to_regexp_like(converted)
+
+    # Post-process: Strip CAST(... AS ARRAY) wrapper inside ILIKE/LIKE ALL(...) that sqlglot
+    # may introduce when it sees a remaining ::ARRAY cast on the subquery.
+    # e.g.  col ILIKE ALL (CAST((SELECT x FROM t) AS ARRAY))  →  col ILIKE ALL ((SELECT x FROM t))
+    if re.search(r'I?LIKE\s+ALL\s*\(', converted, re.IGNORECASE):
+        converted = re.sub(
+            r'(I?LIKE\s+ALL\s*\(\s*)CAST\s*\(\s*(.*?)\s*AS\s+ARRAY\s*\)(\s*\))',
+            r'\1\2\3',
+            converted,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    # Post-process: Convert LIKE/ILIKE ALL(dynamic_expr) to ILIKE_ALL/LIKE_ALL UDF calls.
+    if re.search(r'I?LIKE\s+ALL\s*\(', converted, re.IGNORECASE):
+        logging.info("Converting LIKE/ILIKE ALL(dynamic) to ILIKE_ALL/LIKE_ALL UDF calls")
+        converted = convert_like_all_to_regexp_like(converted)
 
     # Post-process: Convert ARRAY_AGG([DISTINCT] IFF(..., expr ORDER BY ..., NULL)) to ARRAY_AGG([DISTINCT] IFF(..., expr, NULL)) WITHIN GROUP(ORDER BY ...)
     def array_agg_iff_orderby_repl(match):

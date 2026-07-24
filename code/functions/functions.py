@@ -32,15 +32,27 @@ def parse_pry_file(content: str) -> Dict[str, Any]:
             current_query = []
             in_query = True
         elif in_query:
-            # Non-indented line ends query block, unless it's Jinja template syntax
+            # A non-indented line only ends the query block when it is genuine YAML
+            # structure: a new list item ("- ") or a key-value pair ("word:").
+            # Plain SQL lines (FROM, WHERE, GROUP BY, comments, etc.) that happen to
+            # sit at column 0 due to inconsistent indentation in PRY files should be
+            # kept as part of the current query.
             if line and not line.startswith((' ', '\t')):
-                if line.strip().startswith(('{%', '{{')):
+                stripped = line.strip()
+                is_yaml_structure = (
+                    stripped.startswith('- ')
+                    or bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*:', stripped))
+                )
+                if stripped.startswith(('{%', '{{')):
                     current_query.append(line)  # Keep Jinja includes
-                else:
+                elif is_yaml_structure:
                     if current_query:
                         queries.append('\n'.join(current_query))
                         current_query = []
                     in_query = False
+                else:
+                    # Non-indented SQL line — include it as-is (no indentation to strip)
+                    current_query.append(line)
             else:
                 # Strip 4-space YAML indentation
                 current_query.append(line[4:] if line.startswith('    ') else line)
