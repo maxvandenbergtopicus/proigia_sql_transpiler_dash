@@ -401,6 +401,8 @@ class FixedSnowflake(Snowflake):
                 collation_name = collation.this
             else:
                 collation_name = self.sql(collation).strip('"\'')
+            if collation_name.upper() in ('C', 'POSIX'):
+                return col_sql
             return f"COLLATE({col_sql}, '{collation_name}')"
 
         def cast_sql(self, expression: exp.Cast, safe_prefix=None) -> str:
