@@ -3727,11 +3727,13 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
             flags=re.IGNORECASE,
         )
 
-        # Wrap column reference arguments with REPLACE(..., '/', '-') so that runtime values
-        # containing slashes (e.g. '2026/01/01') are accepted by Snowflake's TO_DATE.
-        # Only applies when a format string is present (two-argument form) and the first
-        # argument is a column reference (identifier, optionally table-qualified), not a literal.
-        logging.info("Wrapping column arguments of TO_DATE / TRY_TO_DATE with REPLACE(..., '/', '-')")
+        # Wrap column reference arguments with REPLACE(..., '/', '-') and REPLACE(..., '.', '-')
+        # so that runtime values containing slashes or dots (e.g. '2026/01/01', '09.12.2021')
+        # are accepted by Snowflake's TO_DATE, which requires the separator to match the format
+        # string literally. Only applies when a format string is present (two-argument form)
+        # and the first argument is a column reference (identifier, optionally table-qualified),
+        # not a literal.
+        logging.info("Wrapping column arguments of TO_DATE / TRY_TO_DATE with REPLACE(..., '/', '-') and REPLACE(..., '.', '-')")
 
         def _wrap_col_with_replace(m: re.Match) -> str:
             fn = m.group(1)     # TO_DATE or TRY_TO_DATE
@@ -3745,7 +3747,7 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
             fmt_inner = fmt.strip("'\"")
             if not re.search(r'[-/. ]', fmt_inner):
                 return m.group(0)
-            return f"{fn}(REPLACE({col}, '/', '-'), {fmt})"
+            return f"{fn}(REPLACE(REPLACE({col}, '/', '-'), '.', '-'), {fmt})"
 
         converted = re.sub(
             r"\b(TO_DATE|TRY_TO_DATE|DATE)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*,\s*('[^']+')\s*\)",

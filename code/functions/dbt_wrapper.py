@@ -443,9 +443,18 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
             function_name = func_name.lower()
             call_args = args.strip()
             if function_name == 'override_kwartaal':
-                call_args = f"{call_args}, {{{{agb}}}}" if call_args else "{{agb}}"
-            replacement = f"{{{{ function('{function_name}') }}}}({call_args})"
+                replacement = (
+                    f"DM_RAPPORTAGE.P{{{{var(\"agb\",\"\")}}}}.OVERRIDE_PATIENTENLIJST op\n"
+                    f"WHERE op.jaar = YEAR({call_args})\n"
+                    f"  AND op.kwartaal = QUARTER({call_args})"
+                    f"__OVERRIDE_WHERE_END__"
+                )
+            else:
+                replacement = f"{{{{ function('{function_name}') }}}}({call_args})"
             sql = sql[:start] + replacement + sql[end:]
+    # Merge a following WHERE clause into our injected WHERE using AND
+    sql = re.sub(r'__OVERRIDE_WHERE_END__\s+WHERE\b', '\n  AND', sql, flags=re.IGNORECASE)
+    sql = sql.replace('__OVERRIDE_WHERE_END__', '')
     return sql
 
 
