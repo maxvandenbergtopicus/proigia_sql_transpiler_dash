@@ -135,13 +135,13 @@ class FixedSnowflake(Snowflake):
                     tz_value = zone.this.strip("'\"").upper()
                     # Map abbreviation to IANA timezone if available
                     iana_tz = TIMEZONE_ABBREVIATION_MAP.get(tz_value, tz_value)
-                    return f"CONVERT_TIMEZONE('{iana_tz}', {timestamp_expr})"
+                    return f"TO_TIMESTAMP_NTZ(CONVERT_TIMEZONE('{iana_tz}', {timestamp_expr}))"
                 else:
                     zone_sql = self.sql(zone)
-                    return f"CONVERT_TIMEZONE({zone_sql}, {timestamp_expr})"
+                    return f"TO_TIMESTAMP_NTZ(CONVERT_TIMEZONE({zone_sql}, {timestamp_expr}))"
             
             # No zone specified - fallback
-            return f"CONVERT_TIMEZONE('UTC', {timestamp_expr})"
+            return f"TO_TIMESTAMP_NTZ(CONVERT_TIMEZONE('UTC', {timestamp_expr}))"
           
         def array_sql(self, expression: exp.Array) -> str:
             """Convert ARRAY[] syntax to ARRAY_CONSTRUCT() for Snowflake"""
