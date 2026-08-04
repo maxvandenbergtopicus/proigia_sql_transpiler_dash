@@ -104,12 +104,15 @@ class FixedSnowflake(Snowflake):
                 start_arg = args['start']
                 # If start is a string literal, it's a regex pattern - use REGEXP_SUBSTR
                 if isinstance(start_arg, exp.Literal) and start_arg.is_string:
-                    pattern = self.sql(start_arg)
+                    converted_pattern, extra_flags = self._convert_regex_for_snowflake(start_arg.this)
+                    # Re-wrap as a Literal so sqlglot handles backslash escaping consistently
+                    pattern_sql = self.sql(exp.Literal.string(converted_pattern))
+                    flags = extra_flags + 'e'
                     # PostgreSQL SUBSTRING(val FROM pattern) returns the text matched by the
                     # first parenthesised group. Snowflake equivalent:
                     #   REGEXP_SUBSTR(val, pattern, 1, 1, 'e', 1)
                     #   position=1, occurrence=1, 'e'=extract subgroup, group_num=1
-                    return f"REGEXP_SUBSTR({value}, {pattern}, 1, 1, 'e', 1)"
+                    return f"REGEXP_SUBSTR({value}, {pattern_sql}, 1, 1, '{flags}', 1)"
                 else:
                     # Numeric start position - use standard SUBSTRING
                     parts = [value, self.sql(start_arg)]
@@ -120,6 +123,28 @@ class FixedSnowflake(Snowflake):
             # No start argument - just return value
             return f"SUBSTRING({value})"
         
+        def _convert_regex_for_snowflake(self, pattern: str) -> tuple:
+            """Convert PCRE pattern to Snowflake POSIX ERE. Returns (pattern, extra_flags)."""
+            extra_flags = ''
+
+            # Extract (?i) inline case-insensitive flag — Snowflake uses the 'i' flag arg instead
+            if '(?i)' in pattern:
+                extra_flags += 'i'
+                pattern = pattern.replace('(?i)', '')
+
+            # Check if pattern has any capturing groups — unescaped ( not followed by ?
+            has_capturing = bool(re.search(r'(?<!\\)\((?!\?)', pattern))
+
+            # No capturing groups: wrap whole pattern so REGEXP_SUBSTR group 1 = full match
+            # (mirrors PostgreSQL SUBSTRING FROM behaviour with no capture group)
+            if not has_capturing:
+                pattern = f'({pattern})'
+
+            # Snowflake POSIX ERE has no non-capturing groups; replace (?:...) with (...)
+            pattern = pattern.replace('(?:', '(')
+
+            return pattern, extra_flags
+
         def attimezone_sql(self, expression: exp.AtTimeZone) -> str:
             """
             Convert PostgreSQL AT TIME ZONE to Snowflake CONVERT_TIMEZONE.
