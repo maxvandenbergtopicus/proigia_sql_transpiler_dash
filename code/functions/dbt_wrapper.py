@@ -216,6 +216,13 @@ def convert_pry_to_dbt(pry_path: Path, output_dir: Path, config, block_tables=No
     if any(p.name.lower() == 'blocks' for p in pry_path.parents):
         block_name = pry_path.stem
         
+        # Externals blocks hold reportviews metadata (- name:/type:/external: entries),
+        # not SQL, and are only ever included in the reportviews section of a PRY.
+        # They have no macro equivalent, so skip them.
+        if 'externals' in block_name.lower():
+            logging.info(f"Skipping externals block (metadata only, no macro needed): {block_name}")
+            return set()
+        
         # Check if this is a column list block (contains _ct)
         if '_ct' in block_name:
             logging.info(f"Processing column list block: {block_name}")

@@ -42,11 +42,6 @@ table_mapping:
   medewerker_hisnaam: "{{ source('DWH_2', 'medewerker_hisnaam') }}"
   functie: "{{ source('DWH_2', 'functie') }}"
 
-# List of report folders that should be materialized as materialized_view in dbt
-materialized_view_reports:
-  - proigia_zorggroep_criteria_v4_0
-  - proigia_basisrapportage
-
 skip_files:
 - osteoporose_53530008_ind.pry
 - doorleveren_data_intercity_2.pry

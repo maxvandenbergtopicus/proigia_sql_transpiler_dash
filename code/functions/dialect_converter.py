@@ -1,5 +1,6 @@
 import sys
 import re
+import json
 import logging
 import sqlglot
 from sqlglot import exp
@@ -3221,6 +3222,149 @@ def postprocess_date_arithmetic_snowflake(sql: str, month_columns: list = None) 
     
     return sql
 
+def _literal_to_python(node) -> object:
+    """Python value for a literal AST node. Raises ValueError for anything else."""
+    if isinstance(node, exp.Null):
+        return None
+    if isinstance(node, exp.Neg):
+        inner = _literal_to_python(node.this)
+        if not isinstance(inner, (int, float)):
+            raise ValueError("negation of non-numeric literal")
+        return -inner
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return node.this
+        text = str(node.this)
+        try:
+            return int(text)
+        except ValueError:
+            return float(text)
+    raise ValueError(f"not a literal: {type(node).__name__}")
+
+
+def _array_construction_elements(node):
+    """Elements of an array-construction node, or None if `node` is not one.
+
+    Handles both ARRAY[...] (exp.Array) and ARRAY_CONSTRUCT(...) (exp.Anonymous) --
+    the latter appears when convert_array_to_array_construct has already rewritten
+    the text during pre-processing.
+    """
+    if isinstance(node, exp.Array):
+        return list(node.expressions)
+    if isinstance(node, exp.Anonymous) and str(node.this).upper() == 'ARRAY_CONSTRUCT':
+        return list(node.expressions)
+    return None
+
+
+def hoist_arrays_out_of_values(expression):
+    """Move array construction out of VALUES clauses, which Snowflake rejects.
+
+    Snowflake only accepts scalar expressions inside VALUES; building an array
+    there fails to compile with
+
+        Invalid expression [ARRAY_CONSTRUCT('A01%', ...)] in VALUES clause
+
+    PostgreSQL allows it, so a reference view written as
+
+        SELECT * FROM (VALUES (1, ARRAY['A01%','A03%'], 6)) AS t(nr, icpc, amt)
+
+    is rewritten into an equivalent derived table that carries each array as a
+    JSON string literal and rebuilds it in the projection:
+
+        SELECT * FROM (
+            SELECT nr, PARSE_JSON(icpc)::ARRAY AS icpc, amt
+            FROM (VALUES (1, '["A01%","A03%"]', 6)) AS t__raw(nr, icpc, amt)
+        ) AS t
+
+    JSON is used rather than a delimited string so the rewrite is content
+    agnostic -- no separator can collide with the data, and empty strings and
+    embedded quotes survive. PARSE_JSON(x)::ARRAY is equivalent to
+    ARRAY_CONSTRUCT(...) on Snowflake for equality, element type (VARCHAR),
+    indexing, ARRAY_TO_STRING, ARRAYS_OVERLAP and NULL passthrough.
+
+    The outer alias is preserved and the inner SELECT re-aliases every column to
+    its original name, so consumers of the VALUES are unaffected. A VALUES clause
+    whose arrays contain non-literal elements is left untouched.
+    """
+    for values_node in list(expression.find_all(exp.Values)):
+        rows = values_node.expressions
+        if not rows:
+            continue
+
+        # Which columns build an array in any row?
+        array_cols = set()
+        for row in rows:
+            for idx, element in enumerate(row.expressions):
+                if _array_construction_elements(element) is not None:
+                    array_cols.add(idx)
+        if not array_cols:
+            continue
+
+        alias = values_node.args.get('alias')
+        col_names = [c.name for c in alias.columns] if alias and alias.columns else []
+        width = max(len(row.expressions) for row in rows)
+        if len(col_names) != width:
+            logging.warning(
+                "[hoist_arrays_out_of_values] VALUES with arrays has no usable column "
+                "alias list (%d aliases for %d columns); leaving it unchanged -- "
+                "Snowflake will reject it", len(col_names), width)
+            continue
+
+        # Rebuild each row, JSON-encoding the array columns. Bail on the whole
+        # VALUES if any array holds something we cannot encode faithfully.
+        new_rows = []
+        try:
+            for row in rows:
+                new_elements = []
+                for idx, element in enumerate(row.expressions):
+                    elements = _array_construction_elements(element)
+                    if elements is None:
+                        # NULL and scalars in an array column pass through as-is;
+                        # PARSE_JSON(NULL) is NULL, matching a NULL array.
+                        new_elements.append(element)
+                        continue
+                    encoded = json.dumps([_literal_to_python(e) for e in elements])
+                    new_elements.append(exp.Literal.string(encoded))
+                new_rows.append(exp.Tuple(expressions=new_elements))
+        except ValueError as exc:
+            logging.warning(
+                "[hoist_arrays_out_of_values] cannot hoist arrays out of VALUES (%s); "
+                "leaving it unchanged", exc)
+            continue
+
+        outer_name = alias.name
+        inner_name = f"{outer_name}__raw"
+        inner_values = exp.Values(
+            expressions=new_rows,
+            alias=exp.TableAlias(
+                this=exp.to_identifier(inner_name),
+                columns=[exp.to_identifier(c) for c in col_names],
+            ),
+        )
+
+        projections = []
+        for idx, col in enumerate(col_names):
+            if idx in array_cols:
+                parsed_json = exp.Anonymous(this='PARSE_JSON', expressions=[exp.column(col)])
+                projections.append(
+                    exp.Cast(this=parsed_json, to=exp.DataType.build('ARRAY')).as_(col)
+                )
+            else:
+                projections.append(exp.column(col))
+
+        inner_select = exp.Select(expressions=projections).from_(inner_values)
+        replacement = exp.Subquery(
+            this=inner_select,
+            alias=exp.TableAlias(this=exp.to_identifier(outer_name)),
+        )
+        logging.info(
+            "Hoisting array construction out of VALUES for alias '%s' (columns: %s)",
+            outer_name, ', '.join(col_names[i] for i in sorted(array_cols)))
+        values_node.replace(replacement)
+
+    return expression
+
+
 def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_array_to_string: bool = True) -> str:
     """
     Convert SQL from PostgreSQL to Snowflake dialect using sqlglot.
@@ -3382,6 +3526,9 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
     try:
         # Parse with PostgreSQL dialect
         parsed = sqlglot.parse_one(sql, read="postgres")
+        # Snowflake rejects array construction inside VALUES; rebuild those arrays
+        # in the projection instead (no-op when a VALUES has no arrays).
+        parsed = hoist_arrays_out_of_values(parsed)
         # Generate with custom Snowflake dialect
         converted = parsed.sql(dialect=FixedSnowflake, pretty=True)
         sqlglot_succeeded = True
@@ -4222,6 +4369,19 @@ def convert_postgres_cast_to_standard_cast(sql: str) -> str:
     # Use regex to replace expr::type with CAST(expr AS type)
     # Handles nested parentheses, array access, string literals, identifiers
     def cast_repl(match):
+        # A `::` directly in front of the matched expression means we are looking at the TYPE
+        # of a preceding cast, not at an expression. A type with precision (numeric(36,2))
+        # is indistinguishable from a function call, so without this guard a chained cast like
+        # `x::numeric(36,2)::varchar` would become `CAST(x AS CAST(NUMERIC(36,2)) AS VARCHAR)`.
+        prefix = match.string[:match.start()].rstrip()
+        if prefix.endswith('::'):
+            return match.group(0)
+        # Same when the token directly in front of the match is itself a cast type: what follows
+        # a type is never an expression to cast. This covers `(10,3)` in
+        # `x::numeric(10,3)::varchar` (the precision, not a parenthesised expression) and
+        # `END` in `NULL::date END::varchar` (a keyword, which must not become CAST(END AS ...)).
+        if re.sub(r'[A-Za-z_][A-Za-z0-9_]*$', '', prefix).rstrip().endswith('::'):
+            return match.group(0)
         expr = match.group(1)
         typ = match.group(2)
         # Skip interval casts - let date arithmetic processing handle them
@@ -4253,8 +4413,8 @@ def convert_postgres_cast_to_standard_cast(sql: str) -> str:
         + cast_follow_boundary,
         re.IGNORECASE,
     )
-    sql = pattern_func.sub(cast_repl, sql)
-    
+    # (applied below, after the chained-cast pass)
+
     # Then, match other patterns (quoted strings, simple parenthesis, array access, identifiers)
     pattern_other = re.compile(
         r"((?:'[^']*'|\"[^\"]*\"|\([^()]+\)|[a-zA-Z_][\w\.]*\[[^\]]+\]|[a-zA-Z_][\w\.]+))\s*::\s*"
@@ -4262,8 +4422,30 @@ def convert_postgres_cast_to_standard_cast(sql: str) -> str:
         + cast_follow_boundary,
         re.IGNORECASE,
     )
+    # Chained casts (`x::numeric(36,2)::varchar`) are converted in one match, before the single-cast
+    # patterns run. Re-running the single-cast patterns over their own output is NOT safe (it
+    # corrupts casts inside already-converted expressions), so the whole chain must be consumed at
+    # once. The type's parentheses are restricted to digits so a function call can never match.
+    type_pattern = r"[a-zA-Z_][a-zA-Z0-9_]*(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?"
+    pattern_chain = re.compile(
+        r"((?:'[^']*'|\"[^\"]*\"|\([^()]+\)|[a-zA-Z_][\w\.]*\[[^\]]+\]|[a-zA-Z_][\w\.]*))\s*::\s*"
+        + f"({type_pattern})" + r"\s*::\s*" + f"({type_pattern})"
+        + cast_follow_boundary,
+        re.IGNORECASE,
+    )
+
+    def chain_repl(match):
+        if match.string[:match.start()].rstrip().endswith('::'):
+            return match.group(0)
+        expr, typ1, typ2 = match.group(1), match.group(2), match.group(3)
+        if 'INTERVAL' in (typ1.upper(), typ2.upper()):
+            return match.group(0)
+        return f"CAST(CAST({expr} AS {typ1.upper()}) AS {typ2.upper()})"
+
+    sql = pattern_chain.sub(chain_repl, sql)
+    sql = pattern_func.sub(cast_repl, sql)
     sql = pattern_other.sub(cast_repl, sql)
-    
+
     return sql
 
 

@@ -395,9 +395,9 @@ def process_proigia_definition():
             template_pry_filename = Path(template_pry_file).stem
             is_aggregate_pry = Path(template_pry_file).name.lower().endswith("aggregate.pry")
             if is_aggregate_pry:
-                new_pry_content = pry_from_pry(report_folder, template_pry_filename)
-            else:
-                new_pry_content = pry_from_pry(report_folder, template_pry_filename, dataset_type="snowflake")
+                logger.info(f"Skipping Snowflake variant for aggregate PRY: {template_pry_file}")
+                continue
+            new_pry_content = pry_from_pry(report_folder, template_pry_filename, dataset_type="snowflake")
             output_path = f"{report_path}/{template_pry_filename}_sf.pry"
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(new_pry_content)

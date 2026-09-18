@@ -16,6 +16,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), 'code'))
 
 from functions.dialect_converter import convert_postgres_to_snowflake
+from functions.dbt_wrapper import replace_functions_with_macros, replace_functions_with_table_wrapper
 
 def test_sql_conversion():
     """Test the SQL conversion with user input."""
@@ -72,7 +73,10 @@ def test_sql_conversion():
     print()
 
     try:
-        converted = convert_postgres_to_snowflake(sql)
+        table_functions = ['override_kwartaal', 'patient_kwartaal', 'get_hist_kwartaalindicatoren']
+        converted = convert_postgres_to_snowflake(sql, function_macros=table_functions)
+        converted = replace_functions_with_macros(converted, table_functions)
+        converted = replace_functions_with_table_wrapper(converted, table_functions)
         print("Converted SQL:")
         print("-" * 30)
         print(converted)
