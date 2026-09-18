@@ -1,9 +1,11 @@
+import os
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 import yaml
 import logging
-from code.functions.dbt_wrapper import convert_pry_to_dbt
+from code.functions.dbt_wrapper import convert_pry_to_dbt, convert_pry_to_dbt_worker
 from code.functions.functions import setup_logging, find_pry_files
 
 
@@ -51,13 +53,33 @@ def process_directory(input_path: Path, output_dir: Path, config: dict, seed_tab
         except Exception as e:
             logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
 
-    # Second pass: Process regular files
+    # Second pass: Process regular files.
+    # Each regular PRY file is converted independently -- it reads only its own
+    # content plus the read-only config/block_tables/seed_tables, and writes only
+    # its own model files -- so this pass is spread over worker processes.
+    # Set `workers: 1` in config.yaml to force the sequential path.
     logging.info(f"\n=== Processing {len(regular_files)} regular files ===")
-    for pry_file in regular_files:
-        try:
-            convert_pry_to_dbt(pry_file, output_dir, config, block_tables=block_tables, seed_tables=seed_tables)
-        except Exception as e:
-            logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
+    workers = config.get("workers") or (os.cpu_count() or 1)
+    workers = max(1, min(workers, len(regular_files)))
+
+    if workers > 1:
+        logging.info(f"Converting with {workers} worker process(es)")
+        tasks = [
+            (pry_file, output_dir, config, block_tables, seed_tables)
+            for pry_file in regular_files
+        ]
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            # executor.map preserves input order, so the replayed log matches the
+            # sequential run rather than being interleaved by completion time.
+            for _tables, records in executor.map(convert_pry_to_dbt_worker, tasks, chunksize=4):
+                for levelno, message in records:
+                    logging.log(levelno, message)
+    else:
+        for pry_file in regular_files:
+            try:
+                convert_pry_to_dbt(pry_file, output_dir, config, block_tables=block_tables, seed_tables=seed_tables)
+            except Exception as e:
+                logging.error(f"[ERROR] Failed to process {pry_file.name}: {e}")
 
 
 def main():

@@ -7,6 +7,46 @@ from code.functions.functions import *
 import traceback
 
 
+def convert_pry_to_dbt_worker(task):
+    """Convert one PRY file inside a worker process.
+
+    Conversion of a single PRY file depends only on its own content plus the
+    read-only config/block_tables/seed_tables, so files can be processed in any
+    order or in parallel. Log records are captured and returned instead of being
+    emitted here, so the parent can replay them in input-file order: worker
+    processes do not share the parent's logging handlers, and replaying keeps
+    the log deterministic rather than interleaved by completion time.
+
+    Returns:
+        tuple: (created_table_names, [(levelno, message), ...])
+    """
+    pry_path, output_dir, config, block_tables, seed_tables = task
+
+    records = []
+
+    class _CollectingHandler(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelno, self.format(record)))
+
+    root = logging.getLogger()
+    root.handlers = []
+    handler = _CollectingHandler()
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+
+    try:
+        tables = convert_pry_to_dbt(
+            pry_path, output_dir, config,
+            block_tables=block_tables, seed_tables=seed_tables,
+        )
+    except Exception as e:
+        logging.error(f"[ERROR] Failed to process {pry_path.name}: {e}")
+        tables = set()
+
+    return tables, records
+
+
 def preserve_dbt_macros(sql: str) -> Tuple[str, List[str]]:
     """Preserve DBT macro calls by replacing with placeholders before SQL transpilation.
     

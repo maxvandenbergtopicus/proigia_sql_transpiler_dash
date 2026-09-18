@@ -1440,6 +1440,32 @@ def remove_redundant_literal_and_null_casts(sql: str) -> str:
 
     return sql
 
+# Hot-path patterns for convert_cast_to_try_cast, compiled once at import.
+#
+# The scanners below walk a string looking for "CAST(" at successive offsets.
+# The original code did re.match(r'\bCAST\s*\(', s[i:], re.IGNORECASE) once per
+# character, which re-sliced the string every step (O(n^2) copying) and re-hit
+# the re cache on every call. Scanning with a compiled pattern's .search(s, i)
+# is equivalent and linear: the leading \b was always satisfied at offset 0 of a
+# fresh slice (the pattern starts with a word character), so dropping it and
+# searching from i finds exactly the same next position.
+_CAST_CALL_RE = re.compile(r'CAST\s*\(', re.IGNORECASE)
+_ARRAY_ACCESS_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_.]*(?:\s*\[\s*[^\]]+\s*\])+$')
+_CAST_AS_VARCHAR_RE = re.compile(r'\bCAST\s*\(\s*.+\s+AS\s+VARCHAR\s*\)', re.IGNORECASE)
+_COLONCOLON_VARCHAR_RE = re.compile(r'::\s*VARCHAR\b', re.IGNORECASE)
+
+# Per-dtype "... AS <dtype>" tail matchers, and the precision/scale variant.
+_CAST_TARGET_TYPES = ['DECIMAL', 'NUMBER', 'NUMERIC', 'DATE']
+_CAST_AS_TAIL_RE = {
+    t: re.compile(rf'\s+AS\s+{t}(?:\s*\([^)]*\))?\s*$', re.IGNORECASE)
+    for t in _CAST_TARGET_TYPES
+}
+_CAST_AS_PREC_RE = {
+    t: re.compile(rf'\s+AS\s+{t}\s*(\(\s*\d+\s*(?:,\s*\d+\s*)?\))\s*$', re.IGNORECASE)
+    for t in _CAST_TARGET_TYPES
+}
+
+
 def convert_cast_to_try_cast(sql: str) -> str:
     """
     Convert CAST(... AS DATE) to TO_DATE(expr), and CAST(... AS DECIMAL/NUMBER/NUMERIC)
@@ -1452,11 +1478,11 @@ def convert_cast_to_try_cast(sql: str) -> str:
 
     # Order matters: numeric rewrites must run before DATE so the loop is deterministic.
     # A set would give random iteration order across Python runs.
-    target_types = ['DECIMAL', 'NUMBER', 'NUMERIC', 'DATE']
+    target_types = _CAST_TARGET_TYPES
 
     def _is_array_access_expression(expr: str) -> bool:
         """Return True for identifier[index] or identifier[index][index] style access."""
-        return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_.]*(?:\s*\[\s*[^\]]+\s*\])+$', expr.strip()))
+        return bool(_ARRAY_ACCESS_RE.match(expr.strip()))
 
     def _ensure_varchar_for_array_access(expr: str) -> str:
         """TO_DECFLOAT requires array element values to be coerced to text first."""
@@ -1464,45 +1490,49 @@ def convert_cast_to_try_cast(sql: str) -> str:
         if not _is_array_access_expression(stripped):
             return stripped
         # Avoid double-wrapping when already string-cast.
-        if re.search(r'\bCAST\s*\(\s*.+\s+AS\s+VARCHAR\s*\)', stripped, re.IGNORECASE):
+        if _CAST_AS_VARCHAR_RE.search(stripped):
             return stripped
-        if re.search(r'::\s*VARCHAR\b', stripped, re.IGNORECASE):
+        if _COLONCOLON_VARCHAR_RE.search(stripped):
             return stripped
         return f'CAST({stripped} AS VARCHAR)'
 
     def _rewrite_for_dtype(s: str, dtype: str) -> str:
         """Single-type pass: rewrite CAST(... AS dtype) in s, recursing into non-matching CASTs."""
+        as_tail_re = _CAST_AS_TAIL_RE[dtype]
+        prec_re = _CAST_AS_PREC_RE[dtype]
+        is_numeric = dtype in numeric_types
         result = []
         i = 0
-        while i < len(s):
-            match = re.match(r'\bCAST\s*\(', s[i:], re.IGNORECASE)
+        n = len(s)
+        while i < n:
+            match = _CAST_CALL_RE.search(s, i)
             if match:
-                start = i
-                cast_prefix = s[start : start + match.end()]  # e.g. "CAST("
-                i += match.end()
+                start = match.start()
+                if start > i:
+                    # Everything before the next CAST( is copied through untouched.
+                    result.append(s[i:start])
+                cast_prefix = s[start:match.end()]  # e.g. "CAST("
+                i = match.end()
                 paren_count = 1
                 expr_start = i
-                while i < len(s) and paren_count > 0:
-                    if s[i] == '(':
+                while i < n and paren_count > 0:
+                    c = s[i]
+                    if c == '(':
                         paren_count += 1
-                    elif s[i] == ')':
+                    elif c == ')':
                         paren_count -= 1
                     i += 1
                 if paren_count == 0:
                     cast_content = s[expr_start:i-1]
-                    as_pattern = rf'\s+AS\s+{dtype}(?:\s*\([^)]*\))?\s*$'
-                    if re.search(as_pattern, cast_content, re.IGNORECASE):
-                        as_match = re.search(as_pattern, cast_content, re.IGNORECASE)
+                    as_match = as_tail_re.search(cast_content)
+                    if as_match:
                         expr = cast_content[:as_match.start()].strip()
-                        if dtype in numeric_types:
+                        if is_numeric:
                             # If precision/scale is specified (e.g. NUMERIC(18,3)), keep as
                             # CAST(expr AS NUMBER(p,s)) so the scale is preserved in Snowflake.
                             # Only bare NUMERIC/DECIMAL/NUMBER without precision falls back to
                             # TO_DECFLOAT.
-                            prec_match = re.search(
-                                rf'\s+AS\s+{dtype}\s*(\(\s*\d+\s*(?:,\s*\d+\s*)?\))\s*$',
-                                cast_content, re.IGNORECASE
-                            )
+                            prec_match = prec_re.search(cast_content)
                             if prec_match:
                                 prec_spec = prec_match.group(1)
                                 result.append(f'CAST({expr} AS NUMBER{prec_spec})')
@@ -1520,14 +1550,15 @@ def convert_cast_to_try_cast(sql: str) -> str:
                     # Malformed, keep original
                     result.append(s[start:i])
             else:
-                result.append(s[i])
-                i += 1
+                # No further CAST( in the remainder: copy it through and stop.
+                result.append(s[i:])
+                break
         return ''.join(result)
 
     # Process each target type
     for dtype in target_types:
         sql = _rewrite_for_dtype(sql, dtype)
-    
+
     return sql
 
 def wrap_round_with_number_scale(sql: str) -> str:
@@ -2279,6 +2310,9 @@ def convert_like_all_to_regexp_like(sql: str) -> str:
     return sql
 
 
+_DATE_PART_DAY_RE = re.compile(r'DATE_PART\s*\(\s*["\']?day["\']?\s*,\s*', re.IGNORECASE)
+
+
 def remove_date_part_day(sql: str) -> str:
     """
     Remove DATE_PART('day', ...) or DATE_PART(day, ...) wrappers.
@@ -2288,26 +2322,32 @@ def remove_date_part_day(sql: str) -> str:
     """
     result = []
     i = 0
-    
-    while i < len(sql):
-        # Look for DATE_PART pattern (case-insensitive)
-        match = re.match(r'DATE_PART\s*\(\s*["\']?day["\']?\s*,\s*', sql[i:], re.IGNORECASE)
+    n = len(sql)
+
+    while i < n:
+        # Look for DATE_PART pattern (case-insensitive). Scanning with .search
+        # from i is equivalent to the old per-character re.match on sql[i:],
+        # without re-slicing the string at every step.
+        match = _DATE_PART_DAY_RE.search(sql, i)
         if match:
             # Found DATE_PART(day,
-            start_pos = i
-            i += match.end()
-            
+            start_pos = match.start()
+            if start_pos > i:
+                result.append(sql[i:start_pos])
+            i = match.end()
+
             # Now find the matching closing parenthesis by counting parens
             paren_count = 1
             content_start = i
-            
-            while i < len(sql) and paren_count > 0:
-                if sql[i] == '(':
+
+            while i < n and paren_count > 0:
+                c = sql[i]
+                if c == '(':
                     paren_count += 1
-                elif sql[i] == ')':
+                elif c == ')':
                     paren_count -= 1
                 i += 1
-            
+
             if paren_count == 0:
                 # Found the matching closing paren
                 content = sql[content_start:i-1]
@@ -2317,8 +2357,8 @@ def remove_date_part_day(sql: str) -> str:
                 # Unmatched parentheses, keep original
                 result.append(sql[start_pos:i])
         else:
-            result.append(sql[i])
-            i += 1
+            result.append(sql[i:])
+            break
     
     return ''.join(result)
 
@@ -5258,6 +5298,12 @@ def convert_array_generate_range_to_flatten(sql: str) -> str:
     return ''.join(result)
 
 
+_MAX_CALL_RE = re.compile(r'MAX\s*\(', re.IGNORECASE)
+_CASE_WHEN_RE = re.compile(r'CASE\s+WHEN\b', re.IGNORECASE)
+_ARRAY_CONSTRUCT_RE = re.compile(r'ARRAY_CONSTRUCT\b', re.IGNORECASE)
+_IFF_CALL_RE = re.compile(r'IFF\s*\(', re.IGNORECASE)
+
+
 def convert_max_array_to_array_agg(sql: str) -> str:
     """
     Convert MAX(CASE WHEN ... THEN ARRAY_CONSTRUCT(...) ELSE NULL END) to ARRAY_AGG(...)[0].
@@ -5277,17 +5323,21 @@ def convert_max_array_to_array_agg(sql: str) -> str:
     n = len(sql)
 
     while i < n:
-        # Look for MAX( (case-insensitive)
-        max_match = re.match(r'MAX\s*\(', sql[i:], re.IGNORECASE)
+        # Look for MAX( (case-insensitive). Jumping straight to the next MAX(
+        # with .search is equivalent to testing every offset with re.match on a
+        # fresh sql[i:] slice, but linear instead of quadratic.
+        max_match = _MAX_CALL_RE.search(sql, i)
         if not max_match:
-            result.append(sql[i])
-            i += 1
-            continue
+            result.append(sql[i:])
+            break
+        if max_match.start() > i:
+            result.append(sql[i:max_match.start()])
+            i = max_match.start()
 
         # Check that what follows the opening paren starts with CASE WHEN
-        inner_start = i + max_match.end()
+        inner_start = max_match.end()
         inner_preview = sql[inner_start:inner_start + 200].lstrip()
-        if not re.match(r'CASE\s+WHEN\b', inner_preview, re.IGNORECASE):
+        if not _CASE_WHEN_RE.match(inner_preview):
             result.append(sql[i])
             i += 1
             continue
@@ -5319,7 +5369,7 @@ def convert_max_array_to_array_agg(sql: str) -> str:
         inner_content = sql[inner_start:j - 1]
 
         # Only transform if ARRAY_CONSTRUCT is inside
-        if not re.search(r'ARRAY_CONSTRUCT\b', inner_content, re.IGNORECASE):
+        if not _ARRAY_CONSTRUCT_RE.search(inner_content):
             result.append(sql[i])
             i += 1
             continue
@@ -5349,15 +5399,18 @@ def fix_aggregate_distinct_iff(sql: str) -> str:
     n = len(sql)
 
     while i < n:
-        # Look for IFF( at the current position
-        m = re.match(r'IFF\s*\(', sql[i:], re.IGNORECASE)
+        # Jump to the next IFF( rather than testing every offset against a
+        # freshly sliced sql[i:]; .search from i finds the same position.
+        m = _IFF_CALL_RE.search(sql, i)
         if not m:
-            result.append(sql[i])
-            i += 1
-            continue
+            result.append(sql[i:])
+            break
+        if m.start() > i:
+            result.append(sql[i:m.start()])
+            i = m.start()
 
         iff_start = i
-        args_start = i + m.end()  # index right after the opening '('
+        args_start = m.end()  # index right after the opening '('
 
         # Walk through the IFF arguments using balanced-paren scanning.
         # We need to find the positions of the two top-level commas that
