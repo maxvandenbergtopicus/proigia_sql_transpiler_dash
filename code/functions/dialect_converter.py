@@ -3576,7 +3576,6 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
         logging.info(f"[Error] Failed to convert SQL with sqlglot: {e}\n")
         logging.info("Continuing with pre-processed SQL and applying post-processing steps")
         # When sqlglot fails, manually convert array indices (PostgreSQL 1-based to Snowflake 0-based)
-        logging.info("Applying array index offset (-1) for Snowflake 0-based indexing")
         converted = convert_array_indices_postgres_to_snowflake(converted)
     
     # ============================================================================
