@@ -123,6 +123,23 @@ FROM TABLE(GENERATOR(ROWCOUNT => ...)) AS g,
 LATERAL (SELECT DATEADD(...) AS a) AS s
 ```
 
+### patient_kwartaal
+`patient_kwartaal(peildatum)` (PostgreSQL) and `TABLE(DM_RAPPORTAGE.public.patient_kwartaal(...))` (Snowflake) are inlined as a derived table on `DWH.GDM_STACK.PATIENT_HISTORICAL`, with the same columns and filter as the `PATIENT_KWARTAAL` table function:
+```sql
+-- Before
+FROM patient_kwartaal (date_trunc('quarter', '${peildatum}'::date)::date) q
+
+-- After
+FROM (
+  SELECT ph.patient_id, ph.topicus_guid, ... , ph.zorgverzekeraar_naam
+  FROM DWH.GDM_STACK.PATIENT_HISTORICAL ph
+  WHERE ph.praktijk_agb = '{{var("agb","")}}'
+    AND ph.jaar = YEAR(...)
+    AND ph.kwartaal = QUARTER(...)
+) q
+```
+An optional second argument is used as the AGB instead of the `agb` var.
+
 ### Unnest Array
 Converts `unnest(ARRAY[...])` to VALUES clause:
 ```sql

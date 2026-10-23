@@ -476,6 +476,74 @@ def _find_function_calls(s: str, func_name: str) -> List[Tuple[int, int, str]]:
     return results
 
 
+def _split_args(argstr: str) -> List[str]:
+    """Split comma-separated args respecting parentheses and string literals."""
+    args, current, depth = [], '', 0
+    in_string, string_char = False, None
+    for char in argstr:
+        if char in ('"', "'"):
+            if not in_string:
+                in_string, string_char = True, char
+            elif char == string_char:
+                in_string = False
+            current += char
+        elif char == '(' and not in_string:
+            depth += 1
+            current += char
+        elif char == ')' and not in_string:
+            depth -= 1
+            current += char
+        elif char == ',' and not in_string and depth == 0:
+            args.append(current.strip())
+            current = ''
+        else:
+            current += char
+    if current.strip():
+        args.append(current.strip())
+    return args
+
+
+PATIENT_KWARTAAL_COLUMNS = [
+    'patient_id', 'topicus_guid', 'stable_patient_id', 'geslacht', 'inschrijfdatum',
+    'uitschrijfdatum', 'uitschrijfreden', 'categorie', 'zorgverzekeraar_uzovi', 'zorgverzekeraar_naam',
+]
+
+
+def _inline_patient_kwartaal(sql: str, start: int, end: int, args: str) -> Tuple[int, int, str]:
+    """Inline patient_kwartaal(peildatum[, agb]) as a derived table on DWH.GDM_STACK.PATIENT_HISTORICAL.
+
+    Mirrors DM_RAPPORTAGE.PUBLIC.PATIENT_KWARTAAL, so the report reads the history table
+    directly instead of going through the table function. A surrounding TABLE(...) and a
+    database qualifier (DM_RAPPORTAGE.public.patient_kwartaal) are absorbed as well.
+
+    Returns (start, end, replacement) for the span of sql to replace.
+    """
+    arg_list = _split_args(args)
+    peildatum = arg_list[0]
+    agb = arg_list[1] if len(arg_list) > 1 else "'{{var(\"agb\",\"\")}}'"
+
+    qualifier = re.search(r'\b[a-zA-Z_]\w*\.$', sql[:start])
+    if qualifier:
+        start = qualifier.start()
+    table_open = re.search(r'\bTABLE\s*\(\s*$', sql[:start], re.IGNORECASE)
+    table_close = re.match(r'\s*\)', sql[end:])
+    if table_open and table_close:
+        start = table_open.start()
+        end += table_close.end()
+
+    columns = ', '.join(f"ph.{col}" for col in PATIENT_KWARTAAL_COLUMNS)
+    replacement = (
+        f"(\n"
+        f"  SELECT {columns}\n"
+        f"  FROM DWH.GDM_STACK.PATIENT_HISTORICAL ph\n"
+        f"  WHERE ph.praktijk_agb = {agb}\n"
+        f"    AND ph.jaar = YEAR({peildatum})\n"
+        f"    AND ph.kwartaal = QUARTER({peildatum})\n"
+        f")"
+    )
+    return start, end, replacement
+
+
 def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
     """Replace SQL function calls with dbt function() call syntax.
 
@@ -496,6 +564,8 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
                     f"  AND op.kwartaal = QUARTER({call_args})"
                     f"__OVERRIDE_WHERE_END__"
                 )
+            elif function_name == 'patient_kwartaal':
+                start, end, replacement = _inline_patient_kwartaal(sql, start, end, call_args)
             else:
                 replacement = f"{{{{ function('{function_name}') }}}}({call_args})"
             sql = sql[:start] + replacement + sql[end:]
@@ -512,32 +582,6 @@ def replace_functions_with_dbt_macros(sql: str, macro_names: List[str]) -> str:
     Example: public.translate_labcode_answers(CAST(nhgnummer AS INT), uitslag)
              -> {{ translate_labcode_answers('CAST(nhgnummer AS INT)', 'uitslag') }}
     """
-    def _split_args(argstr: str) -> List[str]:
-        """Split comma-separated args respecting parentheses and string literals."""
-        args, current, depth = [], '', 0
-        in_string, string_char = False, None
-        for char in argstr:
-            if char in ('"', "'"):
-                if not in_string:
-                    in_string, string_char = True, char
-                elif char == string_char:
-                    in_string = False
-                current += char
-            elif char == '(' and not in_string:
-                depth += 1
-                current += char
-            elif char == ')' and not in_string:
-                depth -= 1
-                current += char
-            elif char == ',' and not in_string and depth == 0:
-                args.append(current.strip())
-                current = ''
-            else:
-                current += char
-        if current.strip():
-            args.append(current.strip())
-        return args
-
     logging.info("Replacing functions with dbt macro syntax")
     for macro_name in macro_names:
         calls = _find_function_calls(sql, macro_name)
