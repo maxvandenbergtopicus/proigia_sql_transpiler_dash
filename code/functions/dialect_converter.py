@@ -3296,6 +3296,30 @@ def _array_construction_elements(node):
     return None
 
 
+def name_unnest_alias_columns(expression):
+    """Give a bare unnest table alias an explicit column alias of the same name.
+
+    In PostgreSQL a single-array unnest with only a table alias also names its
+    output column after that alias, so this is valid:
+
+        SELECT 1 FROM unnest(v.zhr_icpc) code WHERE code NOT ILIKE 'K78%'
+
+    sqlglot translates the alias to a table alias only:
+
+        FROM TABLE(FLATTEN(INPUT => v.zhr_icpc)) AS code(seq, key, path, index, value, this)
+
+    which leaves the bare ``code`` reference unresolved in Snowflake
+    (``invalid identifier 'CODE'``). Rewriting to ``unnest(v.zhr_icpc) AS code(code)``
+    makes sqlglot rename the FLATTEN ``value`` column to ``code`` instead.
+    """
+    for unnest in expression.find_all(exp.Unnest):
+        alias = unnest.args.get('alias')
+        if len(unnest.expressions) != 1 or not alias or alias.columns or not alias.this:
+            continue
+        alias.set('columns', [exp.to_identifier(alias.name)])
+    return expression
+
+
 def hoist_arrays_out_of_values(expression):
     """Move array construction out of VALUES clauses, which Snowflake rejects.
 
@@ -3569,6 +3593,8 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
         # Snowflake rejects array construction inside VALUES; rebuild those arrays
         # in the projection instead (no-op when a VALUES has no arrays).
         parsed = hoist_arrays_out_of_values(parsed)
+        # A bare unnest alias also names its column in PostgreSQL; make that explicit.
+        parsed = name_unnest_alias_columns(parsed)
         # Generate with custom Snowflake dialect
         converted = parsed.sql(dialect=FixedSnowflake, pretty=True)
         sqlglot_succeeded = True
