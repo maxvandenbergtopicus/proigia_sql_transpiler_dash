@@ -3320,6 +3320,60 @@ def name_unnest_alias_columns(expression):
     return expression
 
 
+def exists_unnest_to_array_filter(expression):
+    """Rewrite EXISTS over a single unnest into an array FILTER, without a subquery.
+
+    Snowflake cannot evaluate a correlated EXISTS over FLATTEN in a select list
+    (``Unsupported subquery type cannot be evaluated``), so
+
+        NOT EXISTS (SELECT 1 FROM unnest(v.zhr_icpc) code WHERE code NOT ILIKE 'K78%')
+
+    becomes
+
+        COALESCE(ARRAY_SIZE(FILTER(v.zhr_icpc, code -> NOT code ILIKE 'K78%')), 0) = 0
+
+    FILTER drops elements whose predicate is NULL, like WHERE does, and the
+    COALESCE makes a NULL array count as empty, like unnest(NULL) does. Only a
+    plain SELECT over one single-array unnest whose WHERE references nothing
+    but the unnested element is rewritten; anything else is left unchanged.
+    """
+    for exists in list(expression.find_all(exp.Exists)):
+        select = exists.this
+        if not isinstance(select, exp.Select) or not select.args.get('where'):
+            continue
+        if any(select.args.get(k) for k in ('joins', 'laterals', 'group', 'having', 'order', 'limit', 'with')):
+            continue
+        from_ = select.args.get('from')
+        unnest = from_.this if from_ else None
+        if not isinstance(unnest, exp.Unnest) or len(unnest.expressions) != 1:
+            continue
+        alias = unnest.args.get('alias')
+        if not alias or not alias.name or len(alias.columns) > 1:
+            continue
+        table_alias = alias.name
+        element = alias.columns[0].name if alias.columns else table_alias
+
+        condition = select.args['where'].this.copy()
+        if condition.find(exp.Subquery, exp.Select, exp.AggFunc):
+            continue
+        columns = list(condition.find_all(exp.Column))
+        if not all(c.name == element and c.table in ('', table_alias) for c in columns):
+            continue
+        for column in columns:
+            column.replace(exp.column(element))
+
+        array_filter = exp.ArrayFilter(
+            this=unnest.expressions[0].copy(),
+            expression=exp.Lambda(this=condition, expressions=[exp.to_identifier(element)]),
+        )
+        matches = exp.Coalesce(this=exp.ArraySize(this=array_filter), expressions=[exp.Literal.number(0)])
+        if isinstance(exists.parent, exp.Not):
+            exists.parent.replace(exp.EQ(this=matches, expression=exp.Literal.number(0)))
+        else:
+            exists.replace(exp.paren(exp.GT(this=matches, expression=exp.Literal.number(0))))
+    return expression
+
+
 def hoist_arrays_out_of_values(expression):
     """Move array construction out of VALUES clauses, which Snowflake rejects.
 
@@ -3593,6 +3647,8 @@ def convert_postgres_to_snowflake(sql: str, function_macros: list = None, wrap_a
         # Snowflake rejects array construction inside VALUES; rebuild those arrays
         # in the projection instead (no-op when a VALUES has no arrays).
         parsed = hoist_arrays_out_of_values(parsed)
+        # Snowflake cannot evaluate correlated EXISTS over FLATTEN in a select list.
+        parsed = exists_unnest_to_array_filter(parsed)
         # A bare unnest alias also names its column in PostgreSQL; make that explicit.
         parsed = name_unnest_alias_columns(parsed)
         # Generate with custom Snowflake dialect
