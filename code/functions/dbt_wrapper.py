@@ -566,6 +566,12 @@ def replace_functions_with_macros(sql: str, function_names: List[str]) -> str:
                 )
             elif function_name == 'patient_kwartaal':
                 start, end, replacement = _inline_patient_kwartaal(sql, start, end, call_args)
+            elif function_name == 'get_hist_kwartaalindicatoren':
+                # De functie blijft bestaan in SF, maar heeft daar een 4e parameter (agb) nodig.
+                # Alleen toevoegen als die er nog niet is (de PG-variant heeft 3 argumenten).
+                if len(_split_args(call_args)) == 3:
+                    call_args = f"{call_args}, '{{{{var(\"agb\",\"\")}}}}'"
+                replacement = f"{{{{ function('{function_name}') }}}}({call_args})"
             else:
                 replacement = f"{{{{ function('{function_name}') }}}}({call_args})"
             sql = sql[:start] + replacement + sql[end:]
